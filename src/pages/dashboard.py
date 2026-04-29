@@ -240,8 +240,10 @@ def dashboard_page():
 
             if estado == "GENERADO_Y_ACTUALIZADO":
                 emoji = "✅"
-            else:
+            elif estado.startswith("Esperando"):
                 emoji = "⏳"
+            else:
+                emoji = "⚙️"
 
             status_box.markdown(
                 f"""

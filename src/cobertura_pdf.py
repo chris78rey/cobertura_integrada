@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import os
+import random
 import re
 import subprocess
 import time
@@ -920,6 +921,25 @@ def generar_coberturas_automaticas_desde_mes(
                         "FECHA_PROCESO": timestamp,
                     }
                 )
+
+            # Pausa controlada entre registros para no saturar servicios
+            espera = random.uniform(2, 4)
+
+            if index < total and progress_callback:
+                progress_callback(
+                    index,
+                    total,
+                    {
+                        "fe_pla_aniomes": fe_pla,
+                        "dig_tramite": tramite,
+                        "dig_cedula": cedula,
+                        "dig_fecha_hasta": fecha_hasta,
+                        "estado": f"Esperando {espera:.1f}s antes del siguiente registro...",
+                    },
+                )
+
+            if index < total:
+                time.sleep(espera)
 
     return {
         "ok": True,
