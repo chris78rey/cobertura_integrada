@@ -723,6 +723,7 @@ def generar_coberturas_automaticas_desde_mes(
     username: str,
     password: str,
     fe_pla_aniomes_desde: str = "202604",
+    output_dir: str | Path | None = None,
     progress_callback: Callable[[int, int, dict[str, str]], None] | None = None,
 ) -> dict[str, Any]:
     """
@@ -735,7 +736,11 @@ def generar_coberturas_automaticas_desde_mes(
     No modifica DIG_PLANILLADO.
     """
 
-    output_root = _get_output_root()
+    if output_dir is not None:
+        output_root = Path(output_dir).expanduser().resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+    else:
+        output_root = _get_output_root()
     node_project_dir = _get_node_project_dir()
 
     registros = _obtener_registros_automaticos(

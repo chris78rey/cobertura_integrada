@@ -2,11 +2,15 @@ from pathlib import Path
 
 import streamlit as st
 
+from src.app_config import (
+    leer_config,
+    guardar_config,
+    obtener_pdf_output_dir,
+    validar_directorio_salida,
+)
 from src.cobertura_pdf import (
-    generar_hojas_cobertura_por_id,
     generar_coberturas_automaticas_desde_mes,
 )
-from src.config import get_jdbc_jar, get_oracle_targets
 
 
 def _reset_all():
@@ -69,6 +73,13 @@ def _render_css():
             margin-bottom: 1.2rem;
         }
 
+        .config-label {
+            font-weight: 700;
+            font-size: 0.95rem;
+            color: #0f172a;
+            margin-bottom: 0.3rem;
+        }
+
         .status-success {
             background: #ecfdf5;
             border: 1px solid #bbf7d0;
@@ -121,6 +132,49 @@ def _render_css():
         """,
         unsafe_allow_html=True,
     )
+
+
+def _render_config_section() -> str | None:
+    """
+    Renderiza la sección de configuración de directorio de salida.
+    Devuelve la ruta válida actual o None si hay error.
+    """
+    config = leer_config()
+    ruta_actual = config.get("pdf_output_dir", "/home/crrb/coberturas_generadas/")
+
+    st.markdown("### Configuración de salida de PDFs")
+
+    nueva_ruta = st.text_input(
+        "Directorio de salida",
+        value=ruta_actual,
+        key="pdf_output_dir_input",
+    )
+
+    guardar = st.button(
+        "Guardar ruta",
+        key="guardar_ruta_button",
+        use_container_width=True,
+    )
+
+    if guardar:
+        resultado = validar_directorio_salida(nueva_ruta)
+
+        if resultado["ok"]:
+            guardar_config({"pdf_output_dir": str(resultado["path"])})
+            st.success(f"Ruta guardada: {resultado['path']}")
+            return str(resultado["path"])
+        else:
+            st.error(resultado["error"])
+            return None
+
+    validacion = validar_directorio_salida(nueva_ruta)
+
+    if not validacion["ok"]:
+        st.warning(validacion["error"])
+        st.caption("Corrija la ruta antes de generar coberturas.")
+        return None
+
+    return str(validacion["path"])
 
 
 def _render_auto_result():
@@ -193,6 +247,12 @@ def dashboard_page():
 
     st.markdown('<div class="simple-card">', unsafe_allow_html=True)
 
+    # Sección de configuración de ruta
+    pdf_output_dir = _render_config_section()
+    ruta_valida = pdf_output_dir is not None
+
+    st.markdown("---")
+
     col1, col2 = st.columns([2, 1])
 
     with col1:
@@ -200,6 +260,7 @@ def dashboard_page():
             "Generar coberturas automáticas",
             key="generar_auto_button",
             use_container_width=True,
+            disabled=not ruta_valida,
         )
 
     with col2:
@@ -217,7 +278,7 @@ def dashboard_page():
     status_box = st.empty()
     detail_box = st.empty()
 
-    if generar:
+    if generar and pdf_output_dir:
         st.session_state.current_result = None
         st.session_state.current_error = None
 
@@ -266,6 +327,7 @@ def dashboard_page():
             result = generar_coberturas_automaticas_desde_mes(
                 username=st.session_state.oracle_user,
                 password=st.session_state.oracle_password,
+                output_dir=pdf_output_dir,
                 progress_callback=on_progress,
             )
 
