@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+import psutil
+
 from src.oracle_jdbc import oracle_connect
 
 
@@ -153,6 +155,67 @@ def _get_output_root() -> Path:
 
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+STOP_FLAG = Path("config/stop_cobertura.flag")
+
+
+def _get_stop_flag() -> Path:
+    base = Path(__file__).resolve().parent.parent
+    return base / "config" / "stop_cobertura.flag"
+
+
+def proceso_debe_parar() -> bool:
+    return _get_stop_flag().exists()
+
+
+def medir_carga_sistema(output_root: Path) -> dict:
+    cpu = psutil.cpu_percent(interval=0.3)
+    memoria = psutil.virtual_memory().percent
+    disco = psutil.disk_usage(str(output_root)).percent
+
+    return {
+        "cpu": cpu,
+        "memoria": memoria,
+        "disco": disco,
+    }
+
+
+def calcular_espera_dinamica(
+    output_root: Path,
+    segundos_pdf: float = 0,
+    errores_consecutivos: int = 0,
+) -> tuple[float, str]:
+    carga = medir_carga_sistema(output_root)
+
+    cpu = carga["cpu"]
+    memoria = carga["memoria"]
+    disco = carga["disco"]
+
+    if disco >= 95:
+        return random.uniform(20, 30), (
+            f"Carga cr\u00edtica: disco {disco:.1f}%. "
+            "Se baja fuertemente el ritmo."
+        )
+
+    if cpu >= 90 or memoria >= 90 or errores_consecutivos >= 5:
+        return random.uniform(10, 20), (
+            f"Carga alta: CPU {cpu:.1f}%, RAM {memoria:.1f}%, "
+            f"errores consecutivos {errores_consecutivos}. "
+            "Se reduce el ritmo."
+        )
+
+    if cpu >= 75 or memoria >= 80 or segundos_pdf >= 15 or errores_consecutivos >= 3:
+        return random.uniform(5, 8), (
+            f"Carga media: CPU {cpu:.1f}%, RAM {memoria:.1f}%, "
+            f"\u00faltimo PDF {segundos_pdf:.1f}s. "
+            "Se aplica espera moderada."
+        )
+
+    return random.uniform(2, 4), (
+        f"Carga normal: CPU {cpu:.1f}%, RAM {memoria:.1f}%. "
+        "Ritmo normal."
+    )
 
 
 def contar_registros_cobertura(
@@ -697,7 +760,7 @@ def _obtener_registros_automaticos(
 
 def _expandir_cedulas_para_cobertura(registro: dict[str, str]) -> list[dict[str, str]]:
     """
-    Dado un registro de DIGITALIZACION, devuelve una lista con las cÃ©dulas
+    Dado un registro de DIGITALIZACION, devuelve una lista con las cédulas
     que necesitan cobertura: titular + dependientes si DIG_MENOR_EDAD='S'.
     """
     cedulas: list[dict[str, str]] = []
@@ -800,7 +863,7 @@ def generar_coberturas_automaticas_desde_mes(
                     },
                 )
 
-            # Expandir cÃ©dulas a generar (titular + dependientes)
+            # Expandir cédulas a generar (titular + dependientes)
             cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
             pdfs_generados: list[Path] = []
             error_en_pdf = ""
@@ -819,6 +882,9 @@ def generar_coberturas_automaticas_desde_mes(
                     pdfs_generados.append(pdf_path)
                     continue
 
+                # Medir tiempo de generaci\u00f3n del PDF
+                inicio_pdf = time.monotonic()
+
                 result_node = _run_node_pdf_generator(
                     node_project_dir=node_project_dir,
                     cedula=c,
@@ -833,9 +899,10 @@ def generar_coberturas_automaticas_desde_mes(
                 if result_node["ok"] and pdf_path.exists():
                     pdfs_generados.append(pdf_path)
                 else:
-                    error_en_pdf = str(result_node.get("error") or f"Error generando PDF para cÃ©dula {c}")
+                    error_en_pdf = str(result_node.get("error") or f"Error generando PDF para cédula {c}")
                     break
 
+                ultimo_segundos_pdf = time.monotonic() - inicio_pdf
                 time.sleep(1.0)
 
             # Actualizar Oracle solo si todos los PDFs se generaron
@@ -847,6 +914,7 @@ def generar_coberturas_automaticas_desde_mes(
                 if update_result["ok"] and update_result["affected"] > 0:
                     generados += 1
                     actualizados += 1
+                    errores_consecutivos = 0
 
                     writer.writerow(
                         {
@@ -878,6 +946,7 @@ def generar_coberturas_automaticas_desde_mes(
                         )
                 else:
                     errores += 1
+                    errores_consecutivos += 1
                     err_msg = update_result.get("error") or "No se pudo actualizar Oracle"
                     errors_list.append(
                         {
@@ -903,6 +972,7 @@ def generar_coberturas_automaticas_desde_mes(
                     )
             else:
                 errores += 1
+                errores_consecutivos += 1
                 err_msg = error_en_pdf or "PDF_NO_EXISTE"
                 errors_list.append(
                     {
@@ -927,8 +997,12 @@ def generar_coberturas_automaticas_desde_mes(
                     }
                 )
 
-            # Pausa controlada entre registros para no saturar servicios
-            espera = random.uniform(2, 4)
+            # Pausa dinámica según carga del sistema
+            espera, motivo_espera = calcular_espera_dinamica(
+                output_root=output_root,
+                segundos_pdf=ultimo_segundos_pdf,
+                errores_consecutivos=errores_consecutivos,
+            )
 
             if index < total and progress_callback:
                 progress_callback(
@@ -939,12 +1013,17 @@ def generar_coberturas_automaticas_desde_mes(
                         "dig_tramite": tramite,
                         "dig_cedula": cedula,
                         "dig_fecha_hasta": fecha_hasta,
-                        "estado": f"Esperando {espera:.1f}s antes del siguiente registro...",
+                        "estado": f"{motivo_espera} Esperando {espera:.1f}s antes del siguiente registro...",
                     },
                 )
 
+            # Espera cortada para que el botón de parar responda
             if index < total:
-                time.sleep(espera)
+                inicio_espera = time.monotonic()
+                while time.monotonic() - inicio_espera < espera:
+                    if _get_stop_flag().exists():
+                        break
+                    time.sleep(0.5)
 
     return {
         "ok": True,

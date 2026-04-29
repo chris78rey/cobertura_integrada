@@ -25,6 +25,18 @@ def _reset_all():
     st.session_state.input_reset_counter = st.session_state.get("input_reset_counter", 0) + 1
 
 
+def _limpiar_bandera_parada():
+    flag = Path(__file__).resolve().parent.parent.parent / "config" / "stop_cobertura.flag"
+    if flag.exists():
+        flag.unlink()
+
+
+def _crear_bandera_parada():
+    flag = Path(__file__).resolve().parent.parent.parent / "config" / "stop_cobertura.flag"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("STOP", encoding="utf-8")
+
+
 def _init_state():
     if "input_reset_counter" not in st.session_state:
         st.session_state.input_reset_counter = 0
@@ -253,7 +265,7 @@ def dashboard_page():
 
     st.markdown("---")
 
-    col1, col2 = st.columns([2, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
         generar = st.button(
@@ -264,15 +276,30 @@ def dashboard_page():
         )
 
     with col2:
+        parar = st.button(
+            "Parar proceso",
+            key="parar_auto_button",
+            use_container_width=True,
+        )
+
+    with col3:
         limpiar = st.button(
             "Limpiar",
             key="limpiar_auto_button",
             use_container_width=True,
         )
 
+    if parar:
+        _crear_bandera_parada()
+        st.warning("Se solicitó detener el proceso. Terminará la fila actual y no tomará una nueva.")
+
     if limpiar:
+        _limpiar_bandera_parada()
         _reset_all()
         st.rerun()
+
+    if generar:
+        _limpiar_bandera_parada()
 
     progress_bar = st.empty()
     status_box = st.empty()

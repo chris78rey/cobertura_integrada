@@ -3,3 +3,4 @@ pandas
 python-dotenv
 jaydebeapi
 JPype1
+psutil
