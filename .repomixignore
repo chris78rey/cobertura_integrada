@@ -1,0 +1,38 @@
+# Credenciales y configuración sensible
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+
+# Oracle / JDBC / binarios
+jdbc/**
+**/*.jar
+
+# Dependencias
+node_modules/**
+.venv/**
+venv/**
+__pycache__/**
+*.pyc
+
+# Salidas generadas
+output/**
+outputs/**
+salida_coberturas/**
+coberturas_generadas/**
+*.pdf
+*.zip
+*.svg
+*.json
+
+# Logs
+logs/**
+*.log
+
+# Git / temporales
+.git/**
+.cache/**
+.tmp/**
+dist/**
+build/**

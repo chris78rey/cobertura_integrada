@@ -1,63 +1,31 @@
 from pathlib import Path
-import time
 
 import streamlit as st
 
-from src.async_jobs import submit_job, render_current_job
-from src.cobertura_pdf import (
-    contar_registros_cobertura,
-    generar_hojas_cobertura_por_id,
-)
-
-
-DEFAULT_SEARCH_TIMEOUT_SECONDS = 60
-DEFAULT_GENERATE_TIMEOUT_SECONDS = 3600
-AUTO_REFRESH_SECONDS = 2
-
-
-def _clear_job_state():
-    for key in [
-        "current_future",
-        "current_job_name",
-        "current_result",
-        "current_error",
-        "current_timeout_seconds",
-        "current_started_at_utc",
-        "current_timed_out_ui",
-    ]:
-        if key in st.session_state:
-            del st.session_state[key]
-
-
-def _clear_search_state():
-    for key in [
-        "codigo_buscado",
-        "codigo_encontrado",
-        "codigo_total_registros",
-        "codigo_validado",
-    ]:
-        if key in st.session_state:
-            del st.session_state[key]
+from src.cobertura_pdf import generar_hojas_cobertura_por_id
 
 
 def _reset_all():
-    _clear_job_state()
-    _clear_search_state()
-    st.session_state.input_reset_counter += 1
+    for key in [
+        "current_result",
+        "current_error",
+        "input_reset_counter",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+    st.session_state.input_reset_counter = st.session_state.get("input_reset_counter", 0) + 1
 
 
 def _init_state():
-    defaults = {
-        "codigo_buscado": "",
-        "codigo_encontrado": False,
-        "codigo_total_registros": 0,
-        "codigo_validado": False,
-        "input_reset_counter": 0,
-    }
+    if "input_reset_counter" not in st.session_state:
+        st.session_state.input_reset_counter = 0
 
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+    if "current_result" not in st.session_state:
+        st.session_state.current_result = None
+
+    if "current_error" not in st.session_state:
+        st.session_state.current_error = None
 
 
 def _render_css():
@@ -97,30 +65,6 @@ def _render_css():
             margin-bottom: 1.2rem;
         }
 
-        .status-ok {
-            background: #ecfdf5;
-            border: 1px solid #bbf7d0;
-            color: #166534;
-            border-radius: 18px;
-            padding: 1rem;
-            font-weight: 800;
-            text-align: center;
-            margin-top: 1rem;
-            margin-bottom: 1rem;
-        }
-
-        .status-warn {
-            background: #fff7ed;
-            border: 1px solid #fed7aa;
-            color: #9a3412;
-            border-radius: 18px;
-            padding: 1rem;
-            font-weight: 750;
-            text-align: center;
-            margin-top: 1rem;
-            margin-bottom: 1rem;
-        }
-
         .status-success {
             background: #ecfdf5;
             border: 1px solid #bbf7d0;
@@ -129,6 +73,18 @@ def _render_css():
             padding: 1rem;
             text-align: center;
             font-weight: 850;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .status-info {
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1d4ed8;
+            border-radius: 18px;
+            padding: 1rem;
+            text-align: center;
+            font-weight: 800;
             margin-top: 1rem;
             margin-bottom: 1rem;
         }
@@ -145,29 +101,20 @@ def _render_css():
             font-weight: 850 !important;
             padding: 0.85rem 1rem !important;
         }
+
+        div[data-testid="stDownloadButton"] > button {
+            background: #16a34a !important;
+            color: white !important;
+            border: 0 !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _get_ready_result() -> dict | None:
-    result = st.session_state.get("current_result")
-
-    if not result:
-        return None
-
-    if not isinstance(result, dict):
-        return None
-
-    if not result.get("ok"):
-        return None
-
-    return result
-
-
 def _render_result():
-    result = _get_ready_result()
+    result = st.session_state.get("current_result")
 
     if not result:
         return
@@ -185,19 +132,24 @@ def _render_result():
         unsafe_allow_html=True,
     )
 
-    st.info(f"Carpeta principal: {result.get('output_root')}")
+    zip_path_value = result.get("zip_path")
 
-    manifest_path = Path(result.get("manifest_path", ""))
+    if zip_path_value:
+        zip_path = Path(zip_path_value)
 
-    if manifest_path.exists():
-        with manifest_path.open("rb") as file:
-            st.download_button(
-                "Descargar manifiesto CSV",
-                data=file,
-                file_name=manifest_path.name,
-                mime="text/csv",
-                use_container_width=True,
-            )
+        if zip_path.exists():
+            with zip_path.open("rb") as file:
+                st.download_button(
+                    "Descargar ZIP de coberturas",
+                    data=file,
+                    file_name=zip_path.name,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+        else:
+            st.warning("El ZIP fue generado, pero no se encontró el archivo en disco.")
+    else:
+        st.warning("No se generó ZIP porque no hubo PDFs disponibles.")
 
     errors = result.get("errors") or []
 
@@ -212,14 +164,6 @@ def _render_result():
                 st.code(item.get("error", ""))
 
 
-def _auto_refresh_if_running():
-    future = st.session_state.get("current_future")
-
-    if future and future.running():
-        time.sleep(AUTO_REFRESH_SECONDS)
-        st.rerun()
-
-
 def dashboard_page():
     _init_state()
     _render_css()
@@ -228,8 +172,8 @@ def dashboard_page():
         """
         <div class="main-title">Generar hojas de cobertura</div>
         <div class="main-subtitle">
-            Ingrese el código de generación. El sistema creará una carpeta por planilla
-            y guardará dentro la hoja de cobertura de cada cédula.
+            Ingrese el código de generación. El sistema generará los PDFs,
+            mostrará el avance y dejará listo un ZIP para descargar.
         </div>
         """,
         unsafe_allow_html=True,
@@ -237,44 +181,29 @@ def dashboard_page():
 
     st.markdown('<div class="simple-card">', unsafe_allow_html=True)
 
-    future = st.session_state.get("current_future")
-    proceso_en_ejecucion = bool(future and future.running())
-    resultado_listo = _get_ready_result() is not None
-
     input_key = f"cobertura_id_generacion_input_{st.session_state.input_reset_counter}"
 
     codigo_generacion = st.text_input(
         "Código de generación",
         placeholder="Ejemplo: 12345",
         key=input_key,
-        disabled=proceso_en_ejecucion,
     )
 
     overwrite = st.checkbox(
-        "Sobrescribir PDFs si ya existen",
+        "Regenerar PDFs aunque ya existan",
         value=False,
-        disabled=proceso_en_ejecucion,
     )
 
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2 = st.columns([2, 1])
 
     with col1:
-        buscar = st.button(
-            "Buscar",
-            key="buscar_coberturas_button",
+        generar = st.button(
+            "Generar ZIP",
+            key="generar_zip_coberturas_button",
             use_container_width=True,
-            disabled=proceso_en_ejecucion,
         )
 
     with col2:
-        generar = st.button(
-            "Generar PDFs",
-            key="generar_coberturas_button",
-            use_container_width=True,
-            disabled=proceso_en_ejecucion or resultado_listo,
-        )
-
-    with col3:
         limpiar = st.button(
             "Limpiar",
             key="limpiar_coberturas_button",
@@ -285,90 +214,78 @@ def dashboard_page():
         _reset_all()
         st.rerun()
 
-    if buscar:
-        _clear_job_state()
-        _clear_search_state()
-
-        codigo_limpio = codigo_generacion.strip()
-
-        if not codigo_limpio:
-            st.warning("Ingrese el código de generación.")
-        else:
-            with st.spinner("Buscando registros en Oracle..."):
-                try:
-                    search_result = contar_registros_cobertura(
-                        st.session_state.oracle_user,
-                        st.session_state.oracle_password,
-                        codigo_limpio,
-                        DEFAULT_SEARCH_TIMEOUT_SECONDS,
-                    )
-
-                    total = int(search_result["rows"])
-                    encontrado = bool(search_result["found"])
-
-                    st.session_state.codigo_buscado = codigo_limpio
-                    st.session_state.codigo_validado = True
-                    st.session_state.codigo_encontrado = encontrado
-                    st.session_state.codigo_total_registros = total
-
-                    st.rerun()
-
-                except Exception as exc:
-                    st.session_state.codigo_validado = False
-                    st.session_state.codigo_encontrado = False
-                    st.session_state.codigo_total_registros = 0
-                    st.error("No se pudo realizar la búsqueda.")
-                    st.code(str(exc))
+    progress_bar = st.empty()
+    status_box = st.empty()
+    detail_box = st.empty()
 
     if generar:
-        _clear_job_state()
+        st.session_state.current_result = None
+        st.session_state.current_error = None
 
         codigo_limpio = codigo_generacion.strip()
 
         if not codigo_limpio:
             st.warning("Ingrese el código de generación.")
         else:
-            submit_job(
-                "Generando hojas de cobertura",
-                generar_hojas_cobertura_por_id,
-                st.session_state.oracle_user,
-                st.session_state.oracle_password,
-                codigo_limpio,
-                overwrite,
-                timeout_seconds=DEFAULT_GENERATE_TIMEOUT_SECONDS,
-            )
-            st.rerun()
+            progress_widget = progress_bar.progress(0)
 
-    if st.session_state.codigo_validado:
-        if st.session_state.codigo_encontrado:
-            st.markdown(
-                f"""
-                <div class="status-ok">
-                    Código encontrado<br>
-                    Registros disponibles: {st.session_state.codigo_total_registros}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
+            status_box.markdown(
                 """
-                <div class="status-warn">
-                    No se encontraron registros para ese código.
+                <div class="status-info">
+                    Iniciando proceso...
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-    if future:
-        render_current_job()
+            def on_progress(done: int, total: int, item: dict[str, str]):
+                percent = int((done / total) * 100) if total else 0
+                progress_widget.progress(percent)
 
-    current_error = st.session_state.get("current_error")
+                status_box.markdown(
+                    f"""
+                    <div class="status-info">
+                        Procesando PDF {done} de {total}<br>
+                        Avance: {percent}%
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-    if current_error:
-        st.error("No se pudo generar la cobertura.")
-        with st.expander("Ver detalle técnico"):
-            st.code(current_error)
+                detail_box.info(
+                    f"Planilla: {item.get('planilla')} | "
+                    f"Cédula: {item.get('cedula')} | "
+                    f"Fecha: {item.get('fecha')}"
+                )
+
+            try:
+                result = generar_hojas_cobertura_por_id(
+                    username=st.session_state.oracle_user,
+                    password=st.session_state.oracle_password,
+                    id_generacion=codigo_limpio,
+                    overwrite=overwrite,
+                    progress_callback=on_progress,
+                    crear_zip=True,
+                )
+
+                progress_widget.progress(100)
+
+                status_box.markdown(
+                    """
+                    <div class="status-success">
+                        Proceso terminado. ZIP listo para descargar.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                detail_box.empty()
+                st.session_state.current_result = result
+
+            except Exception as exc:
+                st.session_state.current_error = str(exc)
+                st.error("No se pudo generar el ZIP.")
+                st.code(str(exc))
 
     _render_result()
 
@@ -387,5 +304,3 @@ def dashboard_page():
         st.session_state.db_user = None
         _reset_all()
         st.rerun()
-
-    _auto_refresh_if_running()
