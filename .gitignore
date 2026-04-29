@@ -5,3 +5,4 @@ __pycache__/
 salida_coberturas/
 logs/
 config/stop_cobertura.flag
+*.bak
