@@ -814,18 +814,6 @@ def generar_coberturas_automaticas_desde_mes(
         output_root = _get_output_root()
     node_project_dir = _get_node_project_dir()
 
-    registros = _obtener_registros_automaticos(
-        username=username,
-        password=password,
-        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-    )
-
-    logger.event(
-        "DB_QUERY_FINISHED",
-        total_registros=len(registros),
-        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-    )
-
     from src.oracle_jdbc import actualizar_cobertura_por_id_tramite
     from src.observability import RunLogger, build_run_id, mask_cedula
 
@@ -838,6 +826,32 @@ def generar_coberturas_automaticas_desde_mes(
         output_root=str(output_root),
         node_project_dir=str(node_project_dir),
     )
+
+    logger.event(
+        "DB_QUERY_START",
+        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+    )
+
+    try:
+        registros = _obtener_registros_automaticos(
+            username=username,
+            password=password,
+            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+        )
+
+        logger.event(
+            "DB_QUERY_FINISHED",
+            total_registros=len(registros),
+            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "DB_QUERY_ERROR",
+            exc,
+            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+        )
+        raise
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     manifest_path = output_root / f"manifest_cobertura_automatica_{fe_pla_aniomes_desde}_{timestamp}.csv"
