@@ -812,7 +812,7 @@ def generar_coberturas_automaticas_desde_mes(
                 planilla_dir = output_root / _safe_name(tramite)
                 planilla_dir.mkdir(parents=True, exist_ok=True)
 
-                output_name = f"CC_{c}_{fecha_hasta.replace('-', '')}"
+                output_name = "CC"
                 pdf_path = planilla_dir / f"{output_name}.pdf"
 
                 if pdf_path.exists():
