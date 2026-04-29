@@ -822,6 +822,7 @@ def generar_coberturas_automaticas_desde_mes(
     actualizados = 0
     errores = 0
     errors_list: list[dict[str, str]] = []
+    errores_consecutivos = 0
 
     with manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(
@@ -848,6 +849,8 @@ def generar_coberturas_automaticas_desde_mes(
             id_generacion = reg.get("dig_id_generacion", "")
             cedula = reg.get("dig_cedula", "")
             fecha_hasta = reg.get("dig_fecha_hasta", "")
+
+            ultimo_segundos_pdf = 0.0
 
             if progress_callback:
                 progress_callback(
@@ -896,13 +899,15 @@ def generar_coberturas_automaticas_desde_mes(
                     delay_seconds=1.0,
                 )
 
+                # Medir siempre el tiempo, salga bien o mal
+                ultimo_segundos_pdf = time.monotonic() - inicio_pdf
+
                 if result_node["ok"] and pdf_path.exists():
                     pdfs_generados.append(pdf_path)
                 else:
                     error_en_pdf = str(result_node.get("error") or f"Error generando PDF para cédula {c}")
                     break
 
-                ultimo_segundos_pdf = time.monotonic() - inicio_pdf
                 time.sleep(1.0)
 
             # Actualizar Oracle solo si todos los PDFs se generaron
