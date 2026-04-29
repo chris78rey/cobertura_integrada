@@ -601,3 +601,334 @@ def generar_hojas_cobertura_por_id(
         "folders": sorted(folders_created),
         "errors": errors,
     }
+
+
+def _obtener_registros_automaticos(
+    username: str,
+    password: str,
+    fe_pla_aniomes_desde: str = "202604",
+    timeout_seconds: int = 300,
+    fetch_size: int = 5000,
+) -> list[dict[str, str]]:
+    conn = None
+    prepared_statement = None
+    result_set = None
+
+    sql = """
+        SELECT
+            DIG_TRAMITE,
+            TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD') AS FECHA_HASTA,
+            DIG_CEDULA,
+            DIG_MENOR_EDAD,
+            DIG_DEPENDIENTE_01,
+            DIG_DEPENDIENTE_02,
+            DIG_PLANILLADO,
+            DIG_COBERTURA,
+            DIG_ID_GENERACION,
+            DIG_ID_TIPO,
+            DIG_NUMERO_SOLICITUD,
+            DIG_BLOQUEO_SGH,
+            DIG_ID_TRAMITE,
+            DIG_USUARIO,
+            FE_PLA_ANIOMES
+        FROM DIGITALIZACION.DIGITALIZACION
+        WHERE FE_PLA_ANIOMES >= ?
+          AND DIG_COBERTURA = 'N'
+          AND DIG_PLANILLADO = 'S'
+        ORDER BY FE_PLA_ANIOMES, DIG_TRAMITE, DIG_ID_TRAMITE
+    """
+
+    registros: list[dict[str, str]] = []
+
+    try:
+        conn = oracle_connect(username, password)
+        java_conn = conn.jconn
+
+        prepared_statement = java_conn.prepareStatement(sql)
+        prepared_statement.setString(1, fe_pla_aniomes_desde)
+        prepared_statement.setQueryTimeout(int(timeout_seconds))
+        prepared_statement.setFetchSize(int(fetch_size))
+
+        result_set = prepared_statement.executeQuery()
+
+        while result_set.next():
+            registros.append(
+                {
+                    "dig_tramite": str(result_set.getString(1) or "").strip(),
+                    "dig_fecha_hasta": str(result_set.getString(2) or "").strip(),
+                    "dig_cedula": str(result_set.getString(3) or "").strip(),
+                    "dig_menor_edad": str(result_set.getString(4) or "").strip(),
+                    "dig_dependiente_01": str(result_set.getString(5) or "").strip(),
+                    "dig_dependiente_02": str(result_set.getString(6) or "").strip(),
+                    "dig_planillado": str(result_set.getString(7) or "").strip(),
+                    "dig_cobertura": str(result_set.getString(8) or "").strip(),
+                    "dig_id_generacion": str(result_set.getString(9) or "").strip(),
+                    "dig_id_tipo": str(result_set.getString(10) or "").strip(),
+                    "dig_numero_solicitud": str(result_set.getString(11) or "").strip(),
+                    "dig_bloqueo_sgh": str(result_set.getString(12) or "").strip(),
+                    "dig_id_tramite": str(result_set.getString(13) or "").strip(),
+                    "dig_usuario": str(result_set.getString(14) or "").strip(),
+                    "fe_pla_aniomes": str(result_set.getString(15) or "").strip(),
+                }
+            )
+
+        return registros
+
+    finally:
+        if result_set:
+            try:
+                result_set.close()
+            except Exception:
+                pass
+
+        if prepared_statement:
+            try:
+                prepared_statement.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _expandir_cedulas_para_cobertura(registro: dict[str, str]) -> list[dict[str, str]]:
+    """
+    Dado un registro de DIGITALIZACION, devuelve una lista con las cÃ©dulas
+    que necesitan cobertura: titular + dependientes si DIG_MENOR_EDAD='S'.
+    """
+    cedulas: list[dict[str, str]] = []
+
+    titular = registro.get("dig_cedula", "").strip()
+    if titular:
+        cedulas.append({"cedula": titular, "tipo": "TITULAR"})
+
+    if registro.get("dig_menor_edad", "").strip() == "S":
+        d1 = registro.get("dig_dependiente_01", "").strip()
+        d2 = registro.get("dig_dependiente_02", "").strip()
+
+        if d1:
+            cedulas.append({"cedula": d1, "tipo": "DEPENDIENTE_01"})
+
+        if d2 and d2 != d1:
+            cedulas.append({"cedula": d2, "tipo": "DEPENDIENTE_02"})
+
+    return cedulas
+
+
+def generar_coberturas_automaticas_desde_mes(
+    username: str,
+    password: str,
+    fe_pla_aniomes_desde: str = "202604",
+    progress_callback: Callable[[int, int, dict[str, str]], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Flujo automÃ¡tico:
+    1. Consulta registros con FE_PLA_ANIOMES >= x, COBERTURA='N', PLANILLADO='S'
+    2. Por cada fila: genera PDF de cobertura para titular y dependientes
+    3. Solo si el PDF existe fÃ­sicamente, actualiza DIG_COBERTURA='S'
+    4. Genera manifiesto CSV de auditorÃ­a
+
+    No modifica DIG_PLANILLADO.
+    """
+
+    output_root = _get_output_root()
+    node_project_dir = _get_node_project_dir()
+
+    registros = _obtener_registros_automaticos(
+        username=username,
+        password=password,
+        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+    )
+
+    from src.oracle_jdbc import actualizar_cobertura_por_id_tramite
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    manifest_path = output_root / f"manifest_cobertura_automatica_{fe_pla_aniomes_desde}_{timestamp}.csv"
+
+    total = len(registros)
+    generados = 0
+    actualizados = 0
+    errores = 0
+    errors_list: list[dict[str, str]] = []
+
+    with manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=[
+                "FE_PLA_ANIOMES",
+                "DIG_TRAMITE",
+                "DIG_ID_TRAMITE",
+                "DIG_ID_GENERACION",
+                "DIG_CEDULA",
+                "DIG_FECHA_HASTA",
+                "PDF_PATH",
+                "ESTADO",
+                "ERROR",
+                "FECHA_PROCESO",
+            ],
+        )
+        writer.writeheader()
+
+        for index, reg in enumerate(registros, start=1):
+            fe_pla = reg.get("fe_pla_aniomes", "")
+            tramite = reg.get("dig_tramite", "")
+            dig_id_tramite = reg.get("dig_id_tramite", "")
+            id_generacion = reg.get("dig_id_generacion", "")
+            cedula = reg.get("dig_cedula", "")
+            fecha_hasta = reg.get("dig_fecha_hasta", "")
+
+            if progress_callback:
+                progress_callback(
+                    index,
+                    total,
+                    {
+                        "fe_pla_aniomes": fe_pla,
+                        "dig_tramite": tramite,
+                        "dig_id_tramite": dig_id_tramite,
+                        "dig_cedula": cedula,
+                        "dig_fecha_hasta": fecha_hasta,
+                        "estado": "INICIANDO",
+                    },
+                )
+
+            # Expandir cÃ©dulas a generar (titular + dependientes)
+            cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
+            pdfs_generados: list[Path] = []
+            error_en_pdf = ""
+
+            for item_cedula in cedulas_a_generar:
+                c = item_cedula["cedula"]
+
+                # Carpeta por trÃ¡mite
+                planilla_dir = output_root / _safe_name(tramite)
+                planilla_dir.mkdir(parents=True, exist_ok=True)
+
+                output_name = f"CC_{c}_{fecha_hasta.replace('-', '')}"
+                pdf_path = planilla_dir / f"{output_name}.pdf"
+
+                if pdf_path.exists():
+                    pdfs_generados.append(pdf_path)
+                    continue
+
+                result_node = _run_node_pdf_generator(
+                    node_project_dir=node_project_dir,
+                    cedula=c,
+                    fecha_pdf=fecha_hasta,
+                    output_dir=planilla_dir,
+                    output_name=output_name,
+                    single_timeout_seconds=120,
+                    max_retries=2,
+                    delay_seconds=1.0,
+                )
+
+                if result_node["ok"] and pdf_path.exists():
+                    pdfs_generados.append(pdf_path)
+                else:
+                    error_en_pdf = str(result_node.get("error") or f"Error generando PDF para cÃ©dula {c}")
+                    break
+
+                time.sleep(1.0)
+
+            # Actualizar Oracle solo si todos los PDFs se generaron
+            if pdfs_generados and not error_en_pdf:
+                update_result = actualizar_cobertura_por_id_tramite(
+                    username, password, dig_id_tramite
+                )
+
+                if update_result["ok"] and update_result["affected"] > 0:
+                    generados += 1
+                    actualizados += 1
+
+                    writer.writerow(
+                        {
+                            "FE_PLA_ANIOMES": fe_pla,
+                            "DIG_TRAMITE": tramite,
+                            "DIG_ID_TRAMITE": dig_id_tramite,
+                            "DIG_ID_GENERACION": id_generacion,
+                            "DIG_CEDULA": cedula,
+                            "DIG_FECHA_HASTA": fecha_hasta,
+                            "PDF_PATH": str(pdfs_generados[0]),
+                            "ESTADO": "GENERADO_Y_ACTUALIZADO",
+                            "ERROR": "",
+                            "FECHA_PROCESO": timestamp,
+                        }
+                    )
+
+                    if progress_callback:
+                        progress_callback(
+                            index,
+                            total,
+                            {
+                                "fe_pla_aniomes": fe_pla,
+                                "dig_tramite": tramite,
+                                "dig_id_tramite": dig_id_tramite,
+                                "dig_cedula": cedula,
+                                "dig_fecha_hasta": fecha_hasta,
+                                "estado": "GENERADO_Y_ACTUALIZADO",
+                            },
+                        )
+                else:
+                    errores += 1
+                    err_msg = update_result.get("error") or "No se pudo actualizar Oracle"
+                    errors_list.append(
+                        {
+                            "dig_tramite": tramite,
+                            "dig_id_tramite": dig_id_tramite,
+                            "cedula": cedula,
+                            "error": err_msg,
+                        }
+                    )
+                    writer.writerow(
+                        {
+                            "FE_PLA_ANIOMES": fe_pla,
+                            "DIG_TRAMITE": tramite,
+                            "DIG_ID_TRAMITE": dig_id_tramite,
+                            "DIG_ID_GENERACION": id_generacion,
+                            "DIG_CEDULA": cedula,
+                            "DIG_FECHA_HASTA": fecha_hasta,
+                            "PDF_PATH": str(pdfs_generados[0]),
+                            "ESTADO": "ERROR_ACTUALIZANDO_ORACLE",
+                            "ERROR": err_msg,
+                            "FECHA_PROCESO": timestamp,
+                        }
+                    )
+            else:
+                errores += 1
+                err_msg = error_en_pdf or "PDF_NO_EXISTE"
+                errors_list.append(
+                    {
+                        "dig_tramite": tramite,
+                        "dig_id_tramite": dig_id_tramite,
+                        "cedula": cedula,
+                        "error": err_msg,
+                    }
+                )
+                writer.writerow(
+                    {
+                        "FE_PLA_ANIOMES": fe_pla,
+                        "DIG_TRAMITE": tramite,
+                        "DIG_ID_TRAMITE": dig_id_tramite,
+                        "DIG_ID_GENERACION": id_generacion,
+                        "DIG_CEDULA": cedula,
+                        "DIG_FECHA_HASTA": fecha_hasta,
+                        "PDF_PATH": "",
+                        "ESTADO": "ERROR_GENERANDO_PDF",
+                        "ERROR": err_msg,
+                        "FECHA_PROCESO": timestamp,
+                    }
+                )
+
+    return {
+        "ok": True,
+        "fe_pla_aniomes_desde": fe_pla_aniomes_desde,
+        "total": total,
+        "generados": generados,
+        "actualizados": actualizados,
+        "errores": errores,
+        "output_root": str(output_root),
+        "manifest_path": str(manifest_path),
+        "errors": errors_list,
+    }

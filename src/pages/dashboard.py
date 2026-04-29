@@ -2,7 +2,11 @@ from pathlib import Path
 
 import streamlit as st
 
-from src.cobertura_pdf import generar_hojas_cobertura_por_id
+from src.cobertura_pdf import (
+    generar_hojas_cobertura_por_id,
+    generar_coberturas_automaticas_desde_mes,
+)
+from src.config import get_jdbc_jar, get_oracle_targets
 
 
 def _reset_all():
@@ -33,8 +37,8 @@ def _render_css():
         """
         <style>
         .block-container {
-            max-width: 760px;
-            padding-top: 2rem;
+            max-width: 860px;
+            padding-top: 1.5rem;
         }
 
         section[data-testid="stSidebar"] {
@@ -46,14 +50,14 @@ def _render_css():
             font-size: 2rem;
             font-weight: 850;
             color: #0f172a;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.25rem;
         }
 
         .main-subtitle {
             text-align: center;
             color: #64748b;
             font-size: 1rem;
-            margin-bottom: 2rem;
+            margin-bottom: 1.5rem;
         }
 
         .simple-card {
@@ -89,10 +93,16 @@ def _render_css():
             margin-bottom: 1rem;
         }
 
-        .stTextInput input {
-            font-size: 1.15rem !important;
-            border-radius: 16px !important;
-            padding: 0.85rem !important;
+        .status-warn {
+            background: #fff7ed;
+            border: 1px solid #fed7aa;
+            color: #9a3412;
+            border-radius: 18px;
+            padding: 1rem;
+            font-weight: 750;
+            text-align: center;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
         }
 
         .stButton > button {
@@ -113,53 +123,54 @@ def _render_css():
     )
 
 
-def _render_result():
+def _render_auto_result():
     result = st.session_state.get("current_result")
 
     if not result:
         return
 
+    total = result.get("total", 0)
+    generados = result.get("generados", 0)
+    actualizados = result.get("actualizados", 0)
+    errores = result.get("errores", 0)
+
     st.markdown(
         f"""
         <div class="status-success">
             Proceso finalizado<br>
-            Total: {result.get("total", 0)} |
-            Generados: {result.get("generated", 0)} |
-            Omitidos: {result.get("skipped", 0)} |
-            Errores: {result.get("failed", 0)}
+            Total encontrados: {total} |
+            Generados correctamente: {generados} |
+            Actualizados en Oracle: {actualizados} |
+            Errores: {errores}
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    zip_path_value = result.get("zip_path")
+    manifest_path_value = result.get("manifest_path")
 
-    if zip_path_value:
-        zip_path = Path(zip_path_value)
+    if manifest_path_value:
+        manifest_path = Path(manifest_path_value)
 
-        if zip_path.exists():
-            with zip_path.open("rb") as file:
+        if manifest_path.exists():
+            with manifest_path.open("rb") as file:
                 st.download_button(
-                    "Descargar ZIP de coberturas",
+                    "Descargar manifiesto CSV",
                     data=file,
-                    file_name=zip_path.name,
-                    mime="application/zip",
+                    file_name=manifest_path.name,
+                    mime="text/csv",
                     use_container_width=True,
                 )
-        else:
-            st.warning("El ZIP fue generado, pero no se encontró el archivo en disco.")
-    else:
-        st.warning("No se generó ZIP porque no hubo PDFs disponibles.")
 
     errors = result.get("errors") or []
 
     if errors:
-        with st.expander("Ver errores"):
+        with st.expander(f"Ver {len(errors)} errores"):
             for item in errors:
                 st.write(
-                    f"Planilla: `{item.get('planilla')}` | "
-                    f"Cédula: `{item.get('cedula')}` | "
-                    f"Fecha: `{item.get('fecha')}`"
+                    f"Trámite: `{item.get('dig_tramite')}` | "
+                    f"ID Trámite: `{item.get('dig_id_tramite')}` | "
+                    f"Cédula: `{item.get('cedula')}`"
                 )
                 st.code(item.get("error", ""))
 
@@ -170,10 +181,11 @@ def dashboard_page():
 
     st.markdown(
         """
-        <div class="main-title">Generar hojas de cobertura</div>
+        <div class="main-title">Cobertura automática MSP</div>
         <div class="main-subtitle">
-            Ingrese el código de generación. El sistema generará los PDFs,
-            mostrará el avance y dejará listo un ZIP para descargar.
+            Genera coberturas desde FE_PLA_ANIOMES &ge; 202604,
+            solo registros con DIG_COBERTURA='N' y DIG_PLANILLADO='S'.
+            Actualiza DIG_COBERTURA='S' solo si el PDF existe.
         </div>
         """,
         unsafe_allow_html=True,
@@ -181,32 +193,19 @@ def dashboard_page():
 
     st.markdown('<div class="simple-card">', unsafe_allow_html=True)
 
-    input_key = f"cobertura_id_generacion_input_{st.session_state.input_reset_counter}"
-
-    codigo_generacion = st.text_input(
-        "Código de generación",
-        placeholder="Ejemplo: 12345",
-        key=input_key,
-    )
-
-    overwrite = st.checkbox(
-        "Regenerar PDFs aunque ya existan",
-        value=False,
-    )
-
     col1, col2 = st.columns([2, 1])
 
     with col1:
         generar = st.button(
-            "Generar ZIP",
-            key="generar_zip_coberturas_button",
+            "Generar coberturas automáticas",
+            key="generar_auto_button",
             use_container_width=True,
         )
 
     with col2:
         limpiar = st.button(
             "Limpiar",
-            key="limpiar_coberturas_button",
+            key="limpiar_auto_button",
             use_container_width=True,
         )
 
@@ -222,72 +221,80 @@ def dashboard_page():
         st.session_state.current_result = None
         st.session_state.current_error = None
 
-        codigo_limpio = codigo_generacion.strip()
+        progress_widget = progress_bar.progress(0)
 
-        if not codigo_limpio:
-            st.warning("Ingrese el código de generación.")
-        else:
-            progress_widget = progress_bar.progress(0)
+        status_box.markdown(
+            """
+            <div class="status-info">
+                Iniciando proceso...
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        def on_progress(done: int, total: int, item: dict[str, str]):
+            percent = int((done / total) * 100) if total else 0
+            progress_widget.progress(percent)
+
+            estado = item.get("estado", "")
+
+            if estado == "GENERADO_Y_ACTUALIZADO":
+                emoji = "✅"
+            else:
+                emoji = "⏳"
 
             status_box.markdown(
-                """
+                f"""
                 <div class="status-info">
-                    Iniciando proceso...
+                    {emoji} Procesando {done} de {total}<br>
+                    Avance: {percent}%
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-            def on_progress(done: int, total: int, item: dict[str, str]):
-                percent = int((done / total) * 100) if total else 0
-                progress_widget.progress(percent)
+            detail_box.info(
+                f"Mes: {item.get('fe_pla_aniomes')} | "
+                f"Trámite: {item.get('dig_tramite')} | "
+                f"Cédula: {item.get('dig_cedula')} | "
+                f"Estado: {estado}"
+            )
 
-                status_box.markdown(
-                    f"""
-                    <div class="status-info">
-                        Procesando PDF {done} de {total}<br>
-                        Avance: {percent}%
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+        try:
+            result = generar_coberturas_automaticas_desde_mes(
+                username=st.session_state.oracle_user,
+                password=st.session_state.oracle_password,
+                progress_callback=on_progress,
+            )
 
-                detail_box.info(
-                    f"Planilla: {item.get('planilla')} | "
-                    f"Cédula: {item.get('cedula')} | "
-                    f"Fecha: {item.get('fecha')}"
-                )
+            progress_widget.progress(100)
 
-            try:
-                result = generar_hojas_cobertura_por_id(
-                    username=st.session_state.oracle_user,
-                    password=st.session_state.oracle_password,
-                    id_generacion=codigo_limpio,
-                    overwrite=overwrite,
-                    progress_callback=on_progress,
-                    crear_zip=True,
-                )
+            status_box.markdown(
+                """
+                <div class="status-success">
+                    Proceso terminado. Manifiesto listo para descargar.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-                progress_widget.progress(100)
+            detail_box.empty()
+            st.session_state.current_result = result
 
-                status_box.markdown(
-                    """
-                    <div class="status-success">
-                        Proceso terminado. ZIP listo para descargar.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+        except Exception as exc:
+            st.session_state.current_error = str(exc)
+            status_box.markdown(
+                """
+                <div class="status-warn">
+                    Error durante el proceso.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.error("No se pudo completar el proceso automático.")
+            st.code(str(exc))
 
-                detail_box.empty()
-                st.session_state.current_result = result
-
-            except Exception as exc:
-                st.session_state.current_error = str(exc)
-                st.error("No se pudo generar el ZIP.")
-                st.code(str(exc))
-
-    _render_result()
+    _render_auto_result()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -298,9 +305,6 @@ def dashboard_page():
         key="minimal_logout_button",
         use_container_width=True,
     ):
-        st.session_state.auth_ok = False
-        st.session_state.oracle_user = None
-        st.session_state.oracle_password = None
-        st.session_state.db_user = None
-        _reset_all()
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
         st.rerun()

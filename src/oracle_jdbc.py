@@ -196,6 +196,74 @@ def query_dataframe(
             except Exception:
                 pass
 
+def actualizar_cobertura_por_id_tramite(
+    username: str,
+    password: str,
+    dig_id_tramite: str,
+) -> dict:
+    """
+    Actualiza DIG_COBERTURA='S' solo si estÃ¡ en 'N' y DIG_PLANILLADO='S'.
+
+    UPDATE seguro por DIG_ID_TRAMITE + condiciones originales
+    para evitar sobreescrituras accidentales.
+    """
+
+    conn = None
+    prepared_statement = None
+
+    sql = """
+        UPDATE DIGITALIZACION.DIGITALIZACION
+        SET DIG_COBERTURA = 'S'
+        WHERE DIG_ID_TRAMITE = ?
+          AND DIG_COBERTURA = 'N'
+          AND DIG_PLANILLADO = 'S'
+    """
+
+    try:
+        conn = oracle_connect(username, password)
+        java_conn = conn.jconn
+        java_conn.setAutoCommit(False)
+
+        prepared_statement = java_conn.prepareStatement(sql)
+        prepared_statement.setString(1, dig_id_tramite)
+
+        affected = prepared_statement.executeUpdate()
+
+        java_conn.commit()
+
+        return {
+            "ok": True,
+            "affected": affected,
+            "error": None,
+        }
+
+    except Exception as exc:
+        if conn:
+            try:
+                conn.jconn.rollback()
+            except Exception:
+                pass
+
+        return {
+            "ok": False,
+            "affected": 0,
+            "error": str(exc),
+        }
+
+    finally:
+        if prepared_statement:
+            try:
+                prepared_statement.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # =========================
 # FIN
 # =========================
