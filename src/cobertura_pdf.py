@@ -82,6 +82,12 @@ def _next_cc_output_name(
         index += 1
 
 
+def _nombre_cc_por_secuencia(indice: int, total: int) -> str:
+    if total <= 1:
+        return "CC"
+    return f"CC_{indice:02d}"
+
+
 def _crear_zip_coberturas(
     zip_path: Path,
     files: list[Path],
@@ -661,6 +667,8 @@ def generar_hojas_cobertura_por_id(
         "failed": failed,
         "output_root": str(output_root),
         "manifest_path": str(manifest_path),
+        "run_log_path": logger.paths()["run_log_path"],
+        "error_log_path": logger.paths()["error_log_path"],
         "zip_path": zip_path,
         "folders": sorted(folders_created),
         "errors": errors,
@@ -790,7 +798,7 @@ def generar_coberturas_automaticas_desde_mes(
     progress_callback: Callable[[int, int, dict[str, str]], None] | None = None,
 ) -> dict[str, Any]:
     """
-    Flujo automÃ¡tico:
+    Flujo automático:
     1. Consulta registros con FE_PLA_ANIOMES >= x, COBERTURA='N', PLANILLADO='S'
     2. Por cada fila: genera PDF de cobertura para titular y dependientes
     3. Solo si el PDF existe fÃ­sicamente, actualiza DIG_COBERTURA='S'
@@ -812,7 +820,24 @@ def generar_coberturas_automaticas_desde_mes(
         fe_pla_aniomes_desde=fe_pla_aniomes_desde,
     )
 
+    logger.event(
+        "DB_QUERY_FINISHED",
+        total_registros=len(registros),
+        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+    )
+
     from src.oracle_jdbc import actualizar_cobertura_por_id_tramite
+    from src.observability import RunLogger, build_run_id, mask_cedula
+
+    run_id = build_run_id("cobertura_auto")
+    logger = RunLogger(run_id)
+
+    logger.event(
+        "RUN_START",
+        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+        output_root=str(output_root),
+        node_project_dir=str(node_project_dir),
+    )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     manifest_path = output_root / f"manifest_cobertura_automatica_{fe_pla_aniomes_desde}_{timestamp}.csv"
@@ -828,6 +853,7 @@ def generar_coberturas_automaticas_desde_mes(
         writer = csv.DictWriter(
             csv_file,
             fieldnames=[
+                "RUN_ID",
                 "FE_PLA_ANIOMES",
                 "DIG_TRAMITE",
                 "DIG_ID_TRAMITE",
@@ -835,7 +861,13 @@ def generar_coberturas_automaticas_desde_mes(
                 "DIG_CEDULA",
                 "DIG_FECHA_HASTA",
                 "PDF_PATH",
+                "PDF_SIZE_BYTES",
                 "ESTADO",
+                "PASO",
+                "ORACLE_AFFECTED",
+                "SEGUNDOS_PDF",
+                "ESPERA_SEGUNDOS",
+                "ERRORES_CONSECUTIVOS",
                 "ERROR",
                 "FECHA_PROCESO",
             ],
@@ -851,6 +883,17 @@ def generar_coberturas_automaticas_desde_mes(
             fecha_hasta = reg.get("dig_fecha_hasta", "")
 
             ultimo_segundos_pdf = 0.0
+
+            logger.event(
+                "ROW_START",
+                index=index,
+                total=total,
+                fe_pla_aniomes=fe_pla,
+                dig_tramite=tramite,
+                dig_id_tramite=dig_id_tramite,
+                dig_id_generacion=id_generacion,
+                dig_cedula=mask_cedula(cedula),
+            )
 
             if progress_callback:
                 progress_callback(
@@ -871,21 +914,50 @@ def generar_coberturas_automaticas_desde_mes(
             pdfs_generados: list[Path] = []
             error_en_pdf = ""
 
-            for item_cedula in cedulas_a_generar:
+            # Carpeta por trámite
+            planilla_dir = output_root / _safe_name(tramite)
+            planilla_dir.mkdir(parents=True, exist_ok=True)
+
+            cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
+            total_pdfs_tramite = len(cedulas_a_generar)
+            pdfs_generados: list[Path] = []
+            error_en_pdf = ""
+
+            for secuencia_pdf, item_cedula in enumerate(cedulas_a_generar, start=1):
                 c = item_cedula["cedula"]
+                tipo_persona = item_cedula.get("tipo", "")
 
-                # Carpeta por trÃ¡mite
-                planilla_dir = output_root / _safe_name(tramite)
-                planilla_dir.mkdir(parents=True, exist_ok=True)
+                output_name = _nombre_cc_por_secuencia(
+                    indice=secuencia_pdf,
+                    total=total_pdfs_tramite,
+                )
 
-                output_name = f"CC_{_safe_name(c)}"
                 pdf_path = planilla_dir / f"{output_name}.pdf"
 
-                if pdf_path.exists():
+                logger.event(
+                    "PDF_GENERATION_START",
+                    index=index,
+                    fe_pla_aniomes=fe_pla,
+                    dig_tramite=tramite,
+                    dig_id_tramite=dig_id_tramite,
+                    cedula=mask_cedula(c),
+                    tipo_persona=tipo_persona,
+                    output_name=output_name,
+                    pdf_path=str(pdf_path),
+                )
+
+                if pdf_path.exists() and pdf_path.stat().st_size > 0:
                     pdfs_generados.append(pdf_path)
+                    pdf_size = pdf_path.stat().st_size
+                    logger.event(
+                        "PDF_ALREADY_EXISTS",
+                        index=index,
+                        dig_tramite=tramite,
+                        pdf_path=str(pdf_path),
+                        pdf_size_bytes=pdf_size,
+                    )
                     continue
 
-                # Medir tiempo de generaci\u00f3n del PDF
                 inicio_pdf = time.monotonic()
 
                 result_node = _run_node_pdf_generator(
@@ -899,21 +971,63 @@ def generar_coberturas_automaticas_desde_mes(
                     delay_seconds=1.0,
                 )
 
-                # Medir siempre el tiempo, salga bien o mal
                 ultimo_segundos_pdf = time.monotonic() - inicio_pdf
+                pdf_size = pdf_path.stat().st_size if pdf_path.exists() else 0
 
-                if result_node["ok"] and pdf_path.exists():
+                if result_node["ok"] and pdf_path.exists() and pdf_size > 0:
                     pdfs_generados.append(pdf_path)
+                    logger.event(
+                        "PDF_GENERATION_END",
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        cedula=mask_cedula(c),
+                        tipo_persona=tipo_persona,
+                        ok=True,
+                        pdf_exists=True,
+                        pdf_size_bytes=pdf_size,
+                        pdf_path=str(pdf_path),
+                        segundos_pdf=round(ultimo_segundos_pdf, 3),
+                    )
                 else:
-                    error_en_pdf = str(result_node.get("error") or f"Error generando PDF para cédula {c}")
+                    error_en_pdf = str(
+                        result_node.get("error")
+                        or f"No se generó correctamente {pdf_path.name} para cédula {c}"
+                    )
+                    logger.event(
+                        "PDF_GENERATION_ERROR",
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        cedula=mask_cedula(c),
+                        pdf_path=str(pdf_path),
+                        segundos_pdf=round(ultimo_segundos_pdf, 3),
+                        error=error_en_pdf,
+                    )
                     break
 
-                time.sleep(1.0)
-
-            # Actualizar Oracle solo si todos los PDFs se generaron
+                time.sleep(1.0)            # Actualizar Oracle solo si todos los PDFs se generaron
             if pdfs_generados and not error_en_pdf:
+                logger.event(
+                    "ORACLE_UPDATE_START",
+                    index=index,
+                    dig_tramite=tramite,
+                    dig_id_tramite=dig_id_tramite,
+                    nuevo_valor="DIG_COBERTURA=S",
+                )
+
                 update_result = actualizar_cobertura_por_id_tramite(
                     username, password, dig_id_tramite
+                )
+
+                logger.event(
+                    "ORACLE_UPDATE_END",
+                    index=index,
+                    dig_tramite=tramite,
+                    dig_id_tramite=dig_id_tramite,
+                    ok=bool(update_result.get("ok")),
+                    affected=update_result.get("affected", 0),
+                    error=update_result.get("error", ""),
                 )
 
                 if update_result["ok"] and update_result["affected"] > 0:
@@ -923,6 +1037,7 @@ def generar_coberturas_automaticas_desde_mes(
 
                     writer.writerow(
                         {
+                            "RUN_ID": run_id,
                             "FE_PLA_ANIOMES": fe_pla,
                             "DIG_TRAMITE": tramite,
                             "DIG_ID_TRAMITE": dig_id_tramite,
@@ -930,7 +1045,13 @@ def generar_coberturas_automaticas_desde_mes(
                             "DIG_CEDULA": cedula,
                             "DIG_FECHA_HASTA": fecha_hasta,
                             "PDF_PATH": str(pdfs_generados[0]),
+                            "PDF_SIZE_BYTES": pdf_size,
                             "ESTADO": "GENERADO_Y_ACTUALIZADO",
+                            "PASO": "OK",
+                            "ORACLE_AFFECTED": update_result.get("affected", 0),
+                            "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
+                            "ESPERA_SEGUNDOS": "",
+                            "ERRORES_CONSECUTIVOS": "",
                             "ERROR": "",
                             "FECHA_PROCESO": timestamp,
                         }
@@ -963,6 +1084,7 @@ def generar_coberturas_automaticas_desde_mes(
                     )
                     writer.writerow(
                         {
+                            "RUN_ID": run_id,
                             "FE_PLA_ANIOMES": fe_pla,
                             "DIG_TRAMITE": tramite,
                             "DIG_ID_TRAMITE": dig_id_tramite,
@@ -970,7 +1092,13 @@ def generar_coberturas_automaticas_desde_mes(
                             "DIG_CEDULA": cedula,
                             "DIG_FECHA_HASTA": fecha_hasta,
                             "PDF_PATH": str(pdfs_generados[0]),
+                            "PDF_SIZE_BYTES": pdf_size,
                             "ESTADO": "ERROR_ACTUALIZANDO_ORACLE",
+                            "PASO": "ORACLE_UPDATE",
+                            "ORACLE_AFFECTED": 0,
+                            "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
+                            "ESPERA_SEGUNDOS": "",
+                            "ERRORES_CONSECUTIVOS": "",
                             "ERROR": err_msg,
                             "FECHA_PROCESO": timestamp,
                         }
@@ -989,6 +1117,7 @@ def generar_coberturas_automaticas_desde_mes(
                 )
                 writer.writerow(
                     {
+                        "RUN_ID": run_id,
                         "FE_PLA_ANIOMES": fe_pla,
                         "DIG_TRAMITE": tramite,
                         "DIG_ID_TRAMITE": dig_id_tramite,
@@ -996,7 +1125,13 @@ def generar_coberturas_automaticas_desde_mes(
                         "DIG_CEDULA": cedula,
                         "DIG_FECHA_HASTA": fecha_hasta,
                         "PDF_PATH": "",
+                        "PDF_SIZE_BYTES": 0,
                         "ESTADO": "ERROR_GENERANDO_PDF",
+                        "PASO": "PDF_GENERATION",
+                        "ORACLE_AFFECTED": 0,
+                        "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
+                        "ESPERA_SEGUNDOS": "",
+                        "ERRORES_CONSECUTIVOS": "",
                         "ERROR": err_msg,
                         "FECHA_PROCESO": timestamp,
                     }
@@ -1007,6 +1142,16 @@ def generar_coberturas_automaticas_desde_mes(
                 output_root=output_root,
                 segundos_pdf=ultimo_segundos_pdf,
                 errores_consecutivos=errores_consecutivos,
+            )
+
+            logger.event(
+                "THROTTLE_WAIT",
+                index=index,
+                dig_tramite=tramite,
+                espera_segundos=round(espera, 2),
+                motivo=motivo_espera,
+                errores_consecutivos=errores_consecutivos,
+                ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
             )
 
             if index < total and progress_callback:
@@ -1030,8 +1175,18 @@ def generar_coberturas_automaticas_desde_mes(
                         break
                     time.sleep(0.5)
 
+    logger.event(
+        "RUN_END",
+        total=total,
+        generados=generados,
+        actualizados=actualizados,
+        errores=errores,
+        manifest_path=str(manifest_path),
+    )
+
     return {
         "ok": True,
+        "run_id": run_id,
         "fe_pla_aniomes_desde": fe_pla_aniomes_desde,
         "total": total,
         "generados": generados,

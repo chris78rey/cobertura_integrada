@@ -228,6 +228,33 @@ def _render_auto_result():
                     use_container_width=True,
                 )
 
+    for label, key_name in [
+        ("Descargar log t\u00e9cnico JSONL", "run_log_path"),
+        ("Descargar log de errores JSONL", "error_log_path"),
+    ]:
+        value = result.get(key_name)
+        if value:
+            log_path = Path(value)
+            if log_path.exists():
+                with log_path.open("rb") as file:
+                    st.download_button(
+                        label,
+                        data=file,
+                        file_name=log_path.name,
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+
+    run_log_path = result.get("run_log_path")
+    if run_log_path and Path(run_log_path).exists():
+        with st.expander("Ver \u00faltimos eventos t\u00e9cnicos"):
+            lines = Path(run_log_path).read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines()[-30:]
+            for line in lines:
+                st.code(line, language="json")
+
     errors = result.get("errors") or []
 
     if errors:

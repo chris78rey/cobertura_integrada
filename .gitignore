@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 .env
 salida_coberturas/
+logs/
+config/stop_cobertura.flag
