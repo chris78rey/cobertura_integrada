@@ -30,6 +30,25 @@ def _validate_id_generacion(value: str) -> str:
     return clean_value
 
 
+def _validar_dig_tramite_opcional(value: str | None) -> str:
+    """
+    Valida DIG_TRAMITE opcional.
+    Si viene vacío, no filtra por trámite.
+    Si viene con valor, solo permite números para evitar filtros peligrosos.
+    """
+    tramite = str(value or "").strip()
+
+    if not tramite:
+        return ""
+
+    if not re.fullmatch(r"\d{1,30}", tramite):
+        raise RuntimeError(
+            "DIG_TRAMITE inválido. Debe contener solo números. Ejemplo válido: 5899568."
+        )
+
+    return tramite
+
+
 def _safe_name(value: str) -> str:
     value = str(value or "").strip()
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
@@ -228,6 +247,29 @@ def _get_output_root() -> Path:
 
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _validar_fe_pla_aniomes_desde_backend(valor: str) -> str:
+    """
+    Valida FE_PLA_ANIOMES desde backend.
+    Evita valores vacíos, mal escritos o meses imposibles.
+    Formato permitido: YYYYMM. Ejemplo: 202604.
+    """
+    mes = str(valor or "").strip()
+
+    if not re.fullmatch(r"\d{6}", mes):
+        raise ValueError(
+            "FE_PLA_ANIOMES desde debe tener formato YYYYMM. Ejemplo válido: 202604."
+        )
+
+    numero_mes = int(mes[4:6])
+
+    if numero_mes < 1 or numero_mes > 12:
+        raise ValueError(
+            "FE_PLA_ANIOMES tiene un mes inválido. Debe estar entre 01 y 12. Ejemplo válido: 202604."
+        )
+
+    return mes
 
 
 STOP_FLAG = Path("config/stop_cobertura.flag")
@@ -764,37 +806,84 @@ def generar_hojas_cobertura_por_id(
 def _obtener_registros_automaticos(
     username: str,
     password: str,
-    fe_pla_aniomes_desde: str = "202604",
+    fe_pla_aniomes_desde: str = "",
+    dig_tramite: str = "",
+    excluir_dig_id_tramite: set[str] | None = None,
+    batch_size: int = 100,
     timeout_seconds: int = 300,
-    fetch_size: int = 5000,
+    fetch_size: int = 500,
 ) -> list[dict[str, str]]:
+    """
+    Obtiene solo un lote de registros pendientes.
+
+    Importante:
+    - No trae toda la tabla DIGITALIZACION.
+    - Permite reconsultar Oracle varias veces durante el proceso.
+    - Permite que entren registros nuevos mientras el proceso sigue vivo.
+    - Excluye en esta corrida los DIG_ID_TRAMITE que ya fallaron para evitar ciclo infinito.
+    """
+
     conn = None
     prepared_statement = None
     result_set = None
 
+    dig_tramite = _validar_dig_tramite_opcional(dig_tramite)
+
+    excluir_dig_id_tramite = excluir_dig_id_tramite or set()
+    excluir_lista = [str(x).strip() for x in excluir_dig_id_tramite if str(x).strip()]
+
+    # Protección Oracle: NOT IN no debe crecer sin control.
+    # Como los registros exitosos cambian a DIG_COBERTURA='S',
+    # normalmente aquí solo entran los fallidos de esta corrida.
+    excluir_lista = excluir_lista[:900]
+
     sql = """
-        SELECT
-            DIG_TRAMITE,
-            TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD') AS FECHA_HASTA,
-            DIG_CEDULA,
-            DIG_MENOR_EDAD,
-            DIG_DEPENDIENTE_01,
-            DIG_DEPENDIENTE_02,
-            DIG_PLANILLADO,
-            DIG_COBERTURA,
-            DIG_ID_GENERACION,
-            DIG_ID_TIPO,
-            DIG_NUMERO_SOLICITUD,
-            DIG_BLOQUEO_SGH,
-            DIG_ID_TRAMITE,
-            DIG_USUARIO,
-            FE_PLA_ANIOMES
-        FROM DIGITALIZACION.DIGITALIZACION
-        WHERE FE_PLA_ANIOMES >= ?
-          AND DIG_COBERTURA = 'N'
-          AND DIG_PLANILLADO = 'S'
-        ORDER BY FE_PLA_ANIOMES, DIG_TRAMITE, DIG_ID_TRAMITE
+        SELECT *
+        FROM (
+            SELECT
+                DIG_TRAMITE,
+                TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD') AS FECHA_HASTA,
+                DIG_CEDULA,
+                DIG_MENOR_EDAD,
+                DIG_DEPENDIENTE_01,
+                DIG_DEPENDIENTE_02,
+                DIG_PLANILLADO,
+                DIG_COBERTURA,
+                DIG_ID_GENERACION,
+                DIG_ID_TIPO,
+                DIG_NUMERO_SOLICITUD,
+                DIG_BLOQUEO_SGH,
+                DIG_ID_TRAMITE,
+                DIG_USUARIO,
+                FE_PLA_ANIOMES
+            FROM DIGITALIZACION.DIGITALIZACION
+            WHERE FE_PLA_ANIOMES >= ?
+              AND DIG_COBERTURA = 'N'
+              AND DIG_PLANILLADO = 'S'
     """
+
+    params: list[str | int] = [fe_pla_aniomes_desde]
+
+    if dig_tramite:
+        sql += """
+              AND TO_CHAR(DIG_TRAMITE) = ?
+        """
+        params.append(dig_tramite)
+
+    if excluir_lista:
+        placeholders = ",".join(["?"] * len(excluir_lista))
+        sql += f"""
+              AND TO_CHAR(DIG_ID_TRAMITE) NOT IN ({placeholders})
+        """
+        params.extend(excluir_lista)
+
+    sql += """
+            ORDER BY FE_PLA_ANIOMES, DIG_TRAMITE, DIG_ID_TRAMITE
+        )
+        WHERE ROWNUM <= ?
+    """
+
+    params.append(int(batch_size))
 
     registros: list[dict[str, str]] = []
 
@@ -803,7 +892,13 @@ def _obtener_registros_automaticos(
         java_conn = conn.jconn
 
         prepared_statement = java_conn.prepareStatement(sql)
-        prepared_statement.setString(1, fe_pla_aniomes_desde)
+
+        for index, value in enumerate(params, start=1):
+            if isinstance(value, int):
+                prepared_statement.setInt(index, value)
+            else:
+                prepared_statement.setString(index, str(value))
+
         prepared_statement.setQueryTimeout(int(timeout_seconds))
         prepared_statement.setFetchSize(int(fetch_size))
 
@@ -879,9 +974,13 @@ def _expandir_cedulas_para_cobertura(registro: dict[str, str]) -> list[dict[str,
 def generar_coberturas_automaticas_desde_mes(
     username: str,
     password: str,
-    fe_pla_aniomes_desde: str = "202604",
+    fe_pla_aniomes_desde: str = "",
+    dig_tramite: str = "",
     output_dir: str | Path | None = None,
     progress_callback: Callable[[int, int, dict[str, str]], None] | None = None,
+    batch_size: int = 100,
+    rondas_vacias_maximas: int = 3,
+    espera_ronda_vacia_segundos: float = 5.0,
 ) -> dict[str, Any]:
     """
     Flujo automático:
@@ -892,6 +991,15 @@ def generar_coberturas_automaticas_desde_mes(
 
     No modifica DIG_PLANILLADO.
     """
+
+    if not fe_pla_aniomes_desde:
+        fe_pla_aniomes_desde = os.getenv("AUTO_FE_PLA_ANIOMES_DESDE", "202604")
+
+    fe_pla_aniomes_desde = _validar_fe_pla_aniomes_desde_backend(
+        fe_pla_aniomes_desde
+    )
+
+    dig_tramite = _validar_dig_tramite_opcional(dig_tramite)
 
     if output_dir is not None:
         output_root = Path(output_dir).expanduser().resolve()
@@ -914,40 +1022,27 @@ def generar_coberturas_automaticas_desde_mes(
     )
 
     logger.event(
-        "DB_QUERY_START",
+        "DB_DYNAMIC_QUERY_MODE_START",
         fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+        dig_tramite=dig_tramite,
+        batch_size=batch_size,
+        rondas_vacias_maximas=rondas_vacias_maximas,
+        espera_ronda_vacia_segundos=espera_ronda_vacia_segundos,
     )
 
-    try:
-        registros = _obtener_registros_automaticos(
-            username=username,
-            password=password,
-            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-        )
-
-        logger.event(
-            "DB_QUERY_FINISHED",
-            total_registros=len(registros),
-            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-        )
-
-    except Exception as exc:
-        logger.error(
-            "DB_QUERY_ERROR",
-            exc,
-            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-        )
-        raise
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    manifest_path = output_root / f"manifest_cobertura_automatica_{fe_pla_aniomes_desde}_{timestamp}.csv"
+    filtro_nombre = f"tramite_{dig_tramite}" if dig_tramite else f"mes_{fe_pla_aniomes_desde}"
+    manifest_path = output_root / f"manifest_cobertura_automatica_{filtro_nombre}_{timestamp}.csv"
 
-    total = len(registros)
     generados = 0
     actualizados = 0
     errores = 0
     errors_list: list[dict[str, str]] = []
     errores_consecutivos = 0
+    procesados_global = 0
+    lote_numero = 0
+    rondas_vacias = 0
+    dig_id_tramite_fallidos_en_corrida: set[str] = set()
 
     with manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(
@@ -983,7 +1078,99 @@ def generar_coberturas_automaticas_desde_mes(
         )
         writer.writeheader()
 
-        for index, reg in enumerate(registros, start=1):
+        while True:
+            if _get_stop_flag().exists():
+                logger.event(
+                    "STOP_REQUEST_DETECTED_BEFORE_QUERY",
+                    procesados_global=procesados_global,
+                )
+                break
+
+            lote_numero += 1
+
+            logger.event(
+                "DB_BATCH_QUERY_START",
+                lote_numero=lote_numero,
+                procesados_global=procesados_global,
+                fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+                dig_tramite=dig_tramite,
+                excluidos_por_error=len(dig_id_tramite_fallidos_en_corrida),
+            )
+
+            try:
+                registros = _obtener_registros_automaticos(
+                    username=username,
+                    password=password,
+                    fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+                    dig_tramite=dig_tramite,
+                    excluir_dig_id_tramite=dig_id_tramite_fallidos_en_corrida,
+                    batch_size=batch_size,
+                )
+            except Exception as exc:
+                logger.error(
+                    "DB_BATCH_QUERY_ERROR",
+                    exc,
+                    lote_numero=lote_numero,
+                    procesados_global=procesados_global,
+                    fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+                    dig_tramite=dig_tramite,
+                )
+                raise
+
+            total = len(registros)
+
+            logger.event(
+                "DB_BATCH_QUERY_FINISHED",
+                lote_numero=lote_numero,
+                total_lote=total,
+                procesados_global=procesados_global,
+            )
+
+            if total == 0:
+                rondas_vacias += 1
+
+                logger.event(
+                    "DB_EMPTY_ROUND",
+                    ronda_vacia=rondas_vacias,
+                    rondas_vacias_maximas=rondas_vacias_maximas,
+                    espera_segundos=espera_ronda_vacia_segundos,
+                    procesados_global=procesados_global,
+                )
+
+                if progress_callback:
+                    progress_callback(
+                        procesados_global,
+                        max(procesados_global, 1),
+                        {
+                            "fe_pla_aniomes": "",
+                            "dig_tramite": "",
+                            "dig_cedula": "",
+                            "dig_fecha_hasta": "",
+                            "estado": (
+                                f"Sin pendientes. Ronda vacía {rondas_vacias}/"
+                                f"{rondas_vacias_maximas}. "
+                                f"Esperando nuevos registros..."
+                            ),
+                            "procesados_global": str(procesados_global),
+                            "lote_numero": str(lote_numero),
+                        },
+                    )
+
+                if rondas_vacias >= rondas_vacias_maximas:
+                    break
+
+                inicio_espera_vacia = time.monotonic()
+                while time.monotonic() - inicio_espera_vacia < espera_ronda_vacia_segundos:
+                    if _get_stop_flag().exists():
+                        break
+                    time.sleep(0.5)
+
+                continue
+
+            rondas_vacias = 0
+
+            for index, reg in enumerate(registros, start=1):
+                procesados_global += 1
             fe_pla = reg.get("fe_pla_aniomes", "")
             tramite = reg.get("dig_tramite", "")
             dig_id_tramite = reg.get("dig_id_tramite", "")
@@ -1196,6 +1383,8 @@ def generar_coberturas_automaticas_desde_mes(
                     errores += 1
                     errores_consecutivos += 1
                     err_msg = update_result.get("error") or "No se pudo actualizar Oracle"
+                    if dig_id_tramite:
+                        dig_id_tramite_fallidos_en_corrida.add(dig_id_tramite)
                     errors_list.append(
                         {
                             "dig_tramite": tramite,
@@ -1260,9 +1449,23 @@ def generar_coberturas_automaticas_desde_mes(
                         break
                     time.sleep(0.5)
 
+                if _get_stop_flag().exists():
+                    logger.event(
+                        "STOP_REQUEST_DETECTED_AFTER_ROW",
+                        lote_numero=lote_numero,
+                        procesados_global=procesados_global,
+                    )
+                    break
+
+            # Fin del lote.
+            # Se vuelve al while principal para consultar otra vez Oracle.
+            # Aquí es donde entran los registros nuevos creados durante el proceso.
+            if _get_stop_flag().exists():
+                break
+
     logger.event(
         "RUN_END",
-        total=total,
+        total=procesados_global,
         generados=generados,
         actualizados=actualizados,
         errores=errores,
@@ -1273,7 +1476,8 @@ def generar_coberturas_automaticas_desde_mes(
         "ok": True,
         "run_id": run_id,
         "fe_pla_aniomes_desde": fe_pla_aniomes_desde,
-        "total": total,
+        "dig_tramite": dig_tramite,
+        "total": procesados_global,
         "generados": generados,
         "actualizados": actualizados,
         "errores": errores,

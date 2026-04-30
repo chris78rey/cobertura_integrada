@@ -1,3 +1,5 @@
+import os
+import re
 from pathlib import Path
 
 import streamlit as st
@@ -286,15 +288,48 @@ def _render_auto_result():
                     st.code(item.get("error", ""))
 
 
+def _obtener_mes_desde_por_defecto() -> str:
+    """
+    Mantiene compatibilidad con .env.
+    Si no existe AUTO_FE_PLA_ANIOMES_DESDE, usa 202604.
+    """
+    mes = os.getenv("AUTO_FE_PLA_ANIOMES_DESDE", "202604").strip()
+
+    if not mes:
+        return "202604"
+
+    return mes
+
+
+def _validar_fe_pla_aniomes_desde(valor: str) -> tuple[bool, str, str]:
+    """
+    Valida el mes desde para evitar consultas accidentales o valores mal escritos.
+    Formato permitido: YYYYMM. Ejemplo: 202604.
+    """
+    mes = str(valor or "").strip()
+
+    if not re.fullmatch(r"\d{6}", mes):
+        return False, mes, "El mes desde debe tener formato YYYYMM. Ejemplo válido: 202604."
+
+    numero_mes = int(mes[4:6])
+
+    if numero_mes < 1 or numero_mes > 12:
+        return False, mes, "El mes debe estar entre 01 y 12. Ejemplo válido: 202604."
+
+    return True, mes, ""
+
+
 def dashboard_page():
     _init_state()
     _render_css()
+
+    mes_por_defecto = _obtener_mes_desde_por_defecto()
 
     st.markdown(
         """
         <div class="main-title">Cobertura automática MSP</div>
         <div class="main-subtitle">
-            Genera coberturas desde FE_PLA_ANIOMES &ge; 202604,
+            Genera coberturas desde el mes seleccionado en pantalla,
             solo registros con DIG_COBERTURA='N' y DIG_PLANILLADO='S'.
             Actualiza DIG_COBERTURA='S' solo si el PDF existe.
         </div>
@@ -310,6 +345,70 @@ def dashboard_page():
 
     st.markdown("---")
 
+    # Filtro de procesamiento
+    st.markdown("### Filtro de procesamiento")
+
+    modo_procesamiento = st.radio(
+        "Seleccione cómo desea procesar",
+        options=[
+            "Procesar por mes desde",
+            "Procesar por trámite específico",
+        ],
+        horizontal=True,
+        key="modo_procesamiento_cobertura",
+    )
+
+    dig_tramite_input = ""
+    tramite_valido = True
+
+    if modo_procesamiento == "Procesar por trámite específico":
+        dig_tramite_input = st.text_input(
+            "Número de trámite",
+            value="",
+            max_chars=30,
+            key="dig_tramite_input",
+            help="Ejemplo: 5899568. Solo se procesará ese DIG_TRAMITE.",
+        ).strip()
+
+        if dig_tramite_input and not dig_tramite_input.isdigit():
+            st.error("El trámite debe contener solo números.")
+            tramite_valido = False
+        elif not dig_tramite_input:
+            st.warning("Ingrese un número de trámite para continuar.")
+            tramite_valido = False
+        else:
+            st.info(f"Se procesará únicamente el trámite {dig_tramite_input}.")
+            tramite_valido = True
+    else:
+        tramite_valido = True
+
+    st.markdown("---")
+
+    mes_key = f"fe_pla_aniomes_desde_input_{st.session_state.input_reset_counter}"
+
+    fe_pla_aniomes_input = st.text_input(
+        "Mes desde",
+        value=mes_por_defecto,
+        max_chars=6,
+        key=mes_key,
+        help="Formato YYYYMM. Ejemplo: 202604 procesa FE_PLA_ANIOMES >= 202604.",
+    )
+
+    mes_valido, fe_pla_aniomes_desde, error_mes = _validar_fe_pla_aniomes_desde(
+        fe_pla_aniomes_input
+    )
+
+    if mes_valido:
+        st.caption(
+            f"Se procesarán registros con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}."
+        )
+    else:
+        st.error(error_mes)
+
+    st.markdown("---")
+
+    puede_generar = ruta_valida and mes_valido and tramite_valido
+
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
@@ -317,7 +416,7 @@ def dashboard_page():
             "Generar coberturas automáticas",
             key="generar_auto_button",
             use_container_width=True,
-            disabled=not ruta_valida,
+            disabled=not puede_generar,
         )
 
     with col2:
@@ -350,7 +449,7 @@ def dashboard_page():
     status_box = st.empty()
     detail_box = st.empty()
 
-    if generar and pdf_output_dir:
+    if generar and pdf_output_dir and tramite_valido and mes_valido:
         st.session_state.current_result = None
         st.session_state.current_error = None
 
@@ -378,18 +477,31 @@ def dashboard_page():
             else:
                 emoji = "⚙️"
 
+            procesados_global = item.get("procesados_global", "")
+            lote_numero = item.get("lote_numero", "")
+
+            if procesados_global:
+                texto_progreso = f"Procesados en esta corrida: {procesados_global}"
+            else:
+                texto_progreso = f"Procesando lote actual: {done} de {total}"
+
+            if lote_numero:
+                texto_progreso += f"<br>Lote consultado: {lote_numero}"
+
             status_box.markdown(
                 f"""
                 <div class="status-info">
-                    {emoji} Procesando {done} de {total}<br>
-                    Avance: {percent}%
+                    {emoji} {texto_progreso}<br>
+                    Avance del lote actual: {percent}%
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
             detail_box.info(
-                f"Mes: {item.get('fe_pla_aniomes')} | "
+                f"Modo: {modo_procesamiento} | "
+                f"Mes desde: {fe_pla_aniomes_desde} | "
+                f"Mes registro: {item.get('fe_pla_aniomes')} | "
                 f"Trámite: {item.get('dig_tramite')} | "
                 f"Cédula: {item.get('dig_cedula')} | "
                 f"Estado: {estado}"
@@ -399,6 +511,8 @@ def dashboard_page():
             result = generar_coberturas_automaticas_desde_mes(
                 username=st.session_state.oracle_user,
                 password=st.session_state.oracle_password,
+                fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+                dig_tramite=dig_tramite_input,
                 output_dir=pdf_output_dir,
                 progress_callback=on_progress,
             )
