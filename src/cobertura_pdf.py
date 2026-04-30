@@ -192,6 +192,16 @@ def calcular_espera_dinamica(
     segundos_pdf: float = 0,
     errores_consecutivos: int = 0,
 ) -> tuple[float, str]:
+    """
+    Calcula una espera din\u00e1mica, pero con l\u00edmite absoluto entre 1 y 7 segundos.
+
+    Regla oficial:
+    - Ritmo r\u00e1pido: 1 a 2 segundos.
+    - Ritmo normal: 1 a 4 segundos.
+    - Carga media: 4 a 5.5 segundos.
+    - Carga alta o errores repetidos: 5.5 a 7 segundos.
+    - Nunca superar 7 segundos.
+    """
     carga = medir_carga_sistema(output_root)
 
     cpu = carga["cpu"]
@@ -199,26 +209,26 @@ def calcular_espera_dinamica(
     disco = carga["disco"]
 
     if disco >= 95:
-        return random.uniform(20, 30), (
+        return random.uniform(6, 7), (
             f"Carga cr\u00edtica: disco {disco:.1f}%. "
-            "Se baja fuertemente el ritmo."
+            "Se mantiene ritmo muy conservador sin superar 7 segundos."
         )
 
     if cpu >= 90 or memoria >= 90 or errores_consecutivos >= 5:
-        return random.uniform(10, 20), (
+        return random.uniform(5.5, 7), (
             f"Carga alta: CPU {cpu:.1f}%, RAM {memoria:.1f}%, "
             f"errores consecutivos {errores_consecutivos}. "
-            "Se reduce el ritmo."
+            "Se baja el ritmo dentro del l\u00edmite de 7 segundos."
         )
 
     if cpu >= 75 or memoria >= 80 or segundos_pdf >= 15 or errores_consecutivos >= 3:
-        return random.uniform(5, 8), (
+        return random.uniform(4, 5.5), (
             f"Carga media: CPU {cpu:.1f}%, RAM {memoria:.1f}%, "
             f"\u00faltimo PDF {segundos_pdf:.1f}s. "
             "Se aplica espera moderada."
         )
 
-    return random.uniform(2, 4), (
+    return random.uniform(1, 4), (
         f"Carga normal: CPU {cpu:.1f}%, RAM {memoria:.1f}%. "
         "Ritmo normal."
     )
