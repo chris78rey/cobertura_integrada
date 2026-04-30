@@ -6,3 +6,4 @@ salida_coberturas/
 logs/
 config/stop_cobertura.flag
 *.bak
+node_modules/
