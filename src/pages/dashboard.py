@@ -373,7 +373,7 @@ def dashboard_page():
 
             if estado == "GENERADO_Y_ACTUALIZADO":
                 emoji = "✅"
-            elif estado.startswith("Esperando"):
+            elif "Esperando" in estado:
                 emoji = "⏳"
             else:
                 emoji = "⚙️"

@@ -992,6 +992,8 @@ def generar_coberturas_automaticas_desde_mes(
             fecha_hasta = reg.get("dig_fecha_hasta", "")
 
             ultimo_segundos_pdf = 0.0
+            espera = 0.0
+            motivo_espera = "Sin espera calculada"
 
             logger.event(
                 "ROW_START",
@@ -1207,31 +1209,51 @@ def generar_coberturas_automaticas_desde_mes(
                         }
                     )
 
-            logger.event(
-                "THROTTLE_WAIT",
-                index=index,
-                dig_tramite=tramite,
-                espera_segundos=round(espera, 2),
-                motivo=motivo_espera,
-                errores_consecutivos=errores_consecutivos,
-                ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
-            )
+            if index < total:
+                try:
+                    espera, motivo_espera = calcular_espera_dinamica(
+                        output_root=output_root,
+                        segundos_pdf=ultimo_segundos_pdf,
+                        errores_consecutivos=errores_consecutivos,
+                    )
+                    espera = max(1.0, min(float(espera), 7.0))
+                except Exception as exc:
+                    espera = 2.0
+                    motivo_espera = "No se pudo calcular la espera din\u00e1mica. Se aplica espera segura de 2 segundos."
+                    logger.error(
+                        "THROTTLE_CALC_ERROR",
+                        exc,
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        errores_consecutivos=errores_consecutivos,
+                        ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
+                    )
 
-            if index < total and progress_callback:
-                progress_callback(
-                    index,
-                    total,
-                    {
-                        "fe_pla_aniomes": fe_pla,
-                        "dig_tramite": tramite,
-                        "dig_cedula": cedula,
-                        "dig_fecha_hasta": fecha_hasta,
-                        "estado": f"{motivo_espera} Esperando {espera:.1f}s antes del siguiente registro...",
-                    },
+                logger.event(
+                    "THROTTLE_WAIT",
+                    index=index,
+                    dig_tramite=tramite,
+                    espera_segundos=round(espera, 2),
+                    motivo=motivo_espera,
+                    errores_consecutivos=errores_consecutivos,
+                    ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
                 )
 
-            # Espera cortada para que el botón de parar responda
-            if index < total:
+                if progress_callback:
+                    progress_callback(
+                        index,
+                        total,
+                        {
+                            "fe_pla_aniomes": fe_pla,
+                            "dig_tramite": tramite,
+                            "dig_cedula": cedula,
+                            "dig_fecha_hasta": fecha_hasta,
+                            "estado": f"{motivo_espera} Esperando {espera:.1f}s antes del siguiente registro...",
+                        },
+                    )
+
+                # Espera cortada para que el bot\u00f3n de parar responda
                 inicio_espera = time.monotonic()
                 while time.monotonic() - inicio_espera < espera:
                     if _get_stop_flag().exists():
