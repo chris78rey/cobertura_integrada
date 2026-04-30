@@ -857,9 +857,9 @@ def _obtener_registros_automaticos(
                 DIG_USUARIO,
                 FE_PLA_ANIOMES
             FROM DIGITALIZACION.DIGITALIZACION
-            WHERE FE_PLA_ANIOMES >= ?
-              AND DIG_COBERTURA = 'N'
-              AND DIG_PLANILLADO = 'S'
+            WHERE TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
+              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+              AND TRIM(DIG_PLANILLADO) = 'S'
     """
 
     params: list[str | int] = [fe_pla_aniomes_desde]
@@ -971,6 +971,75 @@ def _expandir_cedulas_para_cobertura(registro: dict[str, str]) -> list[dict[str,
     return cedulas
 
 
+def _contar_pendientes_automaticos(
+    username: str,
+    password: str,
+    fe_pla_aniomes_desde: str,
+    dig_tramite: str = "",
+    timeout_seconds: int = 60,
+) -> int:
+    """
+    Cuenta pendientes directamente desde la app.
+    Sirve para comprobar que la aplicación ve los mismos pendientes que Oracle.
+    """
+    conn = None
+    prepared_statement = None
+    result_set = None
+
+    sql = """
+        SELECT COUNT(*)
+        FROM DIGITALIZACION.DIGITALIZACION
+        WHERE TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
+          AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+          AND TRIM(DIG_PLANILLADO) = 'S'
+    """
+
+    params = [fe_pla_aniomes_desde]
+
+    if dig_tramite:
+        sql += """
+          AND TO_CHAR(DIG_TRAMITE) = ?
+        """
+        params.append(dig_tramite)
+
+    try:
+        conn = oracle_connect(username, password)
+        java_conn = conn.jconn
+
+        prepared_statement = java_conn.prepareStatement(sql)
+
+        for index, value in enumerate(params, start=1):
+            prepared_statement.setString(index, str(value))
+
+        prepared_statement.setQueryTimeout(int(timeout_seconds))
+
+        result_set = prepared_statement.executeQuery()
+
+        if result_set.next():
+            return int(result_set.getInt(1))
+
+        return 0
+
+    finally:
+        if result_set:
+            try:
+                result_set.close()
+            except Exception:
+                pass
+
+        if prepared_statement:
+            try:
+                prepared_statement.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def generar_coberturas_automaticas_desde_mes(
     username: str,
     password: str,
@@ -1013,6 +1082,32 @@ def generar_coberturas_automaticas_desde_mes(
 
     run_id = build_run_id("cobertura_auto")
     logger = RunLogger(run_id)
+
+    pendientes_previo = _contar_pendientes_automaticos(
+        username=username,
+        password=password,
+        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+        dig_tramite=dig_tramite,
+    )
+
+    logger.event(
+        "DB_PRECOUNT_FINISHED",
+        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+        pendientes=pendientes_previo,
+    )
+
+    if progress_callback:
+        progress_callback(
+            0,
+            max(pendientes_previo, 1),
+            {
+                "fe_pla_aniomes": fe_pla_aniomes_desde,
+                "dig_tramite": "",
+                "dig_cedula": "",
+                "dig_fecha_hasta": "",
+                "estado": f"Pendientes detectados por la aplicación: {pendientes_previo}",
+            },
+        )
 
     logger.event(
         "RUN_START",
@@ -1119,6 +1214,30 @@ def generar_coberturas_automaticas_desde_mes(
 
             total = len(registros)
 
+            if pendientes_previo > 0 and total == 0:
+                raise RuntimeError(
+                    "Inconsistencia crítica: Oracle reporta pendientes, pero la consulta de trabajo devolvió 0 registros. "
+                    f"Pendientes detectados por la app: {pendientes_previo}. "
+                    "Revisar ORACLE_TARGETS, usuario Oracle, filtro de trámite, FE_PLA_ANIOMES y versión/carpeta desde donde corre Streamlit."
+                )
+
+            if total == 0 and procesados_global == 0:
+                return {
+                    "ok": False,
+                    "sin_pendientes": True,
+                    "run_id": run_id,
+                    "fe_pla_aniomes_desde": fe_pla_aniomes_desde,
+                    "dig_tramite": dig_tramite,
+                    "total": 0,
+                    "generados": 0,
+                    "actualizados": 0,
+                    "errores": 0,
+                    "output_root": str(output_root),
+                    "manifest_path": str(manifest_path),
+                    "errors": [],
+                    "mensaje": "No se encontraron registros pendientes desde la aplicación.",
+                }
+
             logger.event(
                 "DB_BATCH_QUERY_FINISHED",
                 lote_numero=lote_numero,
@@ -1171,262 +1290,30 @@ def generar_coberturas_automaticas_desde_mes(
 
             for index, reg in enumerate(registros, start=1):
                 procesados_global += 1
-            fe_pla = reg.get("fe_pla_aniomes", "")
-            tramite = reg.get("dig_tramite", "")
-            dig_id_tramite = reg.get("dig_id_tramite", "")
-            id_generacion = reg.get("dig_id_generacion", "")
-            cedula = reg.get("dig_cedula", "")
-            fecha_hasta = reg.get("dig_fecha_hasta", "")
 
-            ultimo_segundos_pdf = 0.0
-            espera = 0.0
-            motivo_espera = "Sin espera calculada"
+                # Usar clave compuesta si DIG_ID_TRAMITE está vacío
+                dig_id_tramite = reg.get("dig_id_tramite", "").strip()
+                dig_id_generacion = reg.get("dig_id_generacion", "").strip()
+                clave_exclusion = dig_id_tramite if dig_id_tramite else f"GEN_{dig_id_generacion}"
+                fe_pla = reg.get("fe_pla_aniomes", "")
+                tramite = reg.get("dig_tramite", "")
+                id_generacion = reg.get("dig_id_generacion", "")
+                cedula = reg.get("dig_cedula", "")
+                fecha_hasta = reg.get("dig_fecha_hasta", "")
 
-            logger.event(
-                "ROW_START",
-                index=index,
-                total=total,
-                fe_pla_aniomes=fe_pla,
-                dig_tramite=tramite,
-                dig_id_tramite=dig_id_tramite,
-                dig_id_generacion=id_generacion,
-                dig_cedula=mask_cedula(cedula),
-            )
-
-            if progress_callback:
-                progress_callback(
-                    index,
-                    total,
-                    {
-                        "fe_pla_aniomes": fe_pla,
-                        "dig_tramite": tramite,
-                        "dig_id_tramite": dig_id_tramite,
-                        "dig_cedula": cedula,
-                        "dig_fecha_hasta": fecha_hasta,
-                        "estado": "INICIANDO",
-                    },
-                )
-
-            # Expandir cédulas a generar (titular + dependientes)
-            cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
-            pdfs_generados: list[Path] = []
-            error_en_pdf = ""
-
-            # Carpeta por trámite
-            planilla_dir = output_root / _safe_name(tramite)
-            planilla_dir.mkdir(parents=True, exist_ok=True)
-
-            cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
-            total_pdfs_tramite = len(cedulas_a_generar)
-            pdfs_generados: list[Path] = []
-            error_en_pdf = ""
-            error_en_pdf_detalle: dict[str, str] = {}
-
-            for secuencia_pdf, item_cedula in enumerate(cedulas_a_generar, start=1):
-                c = item_cedula["cedula"]
-                tipo_persona = item_cedula.get("tipo", "")
-
-                output_name = _nombre_cc_por_secuencia(
-                    indice=secuencia_pdf,
-                    total=total_pdfs_tramite,
-                )
-
-                pdf_path = planilla_dir / f"{output_name}.pdf"
+                ultimo_segundos_pdf = 0.0
+                espera = 0.0
+                motivo_espera = "Sin espera calculada"
 
                 logger.event(
-                    "PDF_GENERATION_START",
+                    "ROW_START",
                     index=index,
+                    total=total,
                     fe_pla_aniomes=fe_pla,
                     dig_tramite=tramite,
                     dig_id_tramite=dig_id_tramite,
-                    cedula=mask_cedula(c),
-                    tipo_persona=tipo_persona,
-                    output_name=output_name,
-                    pdf_path=str(pdf_path),
-                )
-
-                if pdf_path.exists() and pdf_path.stat().st_size > 0:
-                    pdfs_generados.append(pdf_path)
-                    pdf_size = pdf_path.stat().st_size
-                    logger.event(
-                        "PDF_ALREADY_EXISTS",
-                        index=index,
-                        dig_tramite=tramite,
-                        pdf_path=str(pdf_path),
-                        pdf_size_bytes=pdf_size,
-                    )
-                    continue
-
-                inicio_pdf = time.monotonic()
-
-                result_node = _run_node_pdf_generator(
-                    node_project_dir=node_project_dir,
-                    cedula=c,
-                    fecha_pdf=fecha_hasta,
-                    output_dir=planilla_dir,
-                    output_name=output_name,
-                    single_timeout_seconds=120,
-                    max_retries=2,
-                    delay_seconds=1.0,
-                )
-
-                ultimo_segundos_pdf = time.monotonic() - inicio_pdf
-                pdf_size = pdf_path.stat().st_size if pdf_path.exists() else 0
-
-                if result_node["ok"] and pdf_path.exists() and pdf_size > 0:
-                    pdfs_generados.append(pdf_path)
-                    logger.event(
-                        "PDF_GENERATION_END",
-                        index=index,
-                        dig_tramite=tramite,
-                        dig_id_tramite=dig_id_tramite,
-                        cedula=mask_cedula(c),
-                        tipo_persona=tipo_persona,
-                        ok=True,
-                        pdf_exists=True,
-                        pdf_size_bytes=pdf_size,
-                        pdf_path=str(pdf_path),
-                        segundos_pdf=round(ultimo_segundos_pdf, 3),
-                    )
-                else:
-                    error_en_pdf_detalle = _diagnosticar_fallo_pdf(
-                        result_node=result_node,
-                        pdf_path=pdf_path,
-                        cedula=c,
-                        fecha=fecha_hasta,
-                    )
-
-                    error_en_pdf = error_en_pdf_detalle["error_tecnico"] or error_en_pdf_detalle["causa"]
-
-                    logger.error(
-                        "PDF_GENERATION_ERROR",
-                        error_en_pdf,
-                        index=index,
-                        dig_tramite=tramite,
-                        dig_id_tramite=dig_id_tramite,
-                        cedula=mask_cedula(c),
-                        tipo_persona=tipo_persona,
-                        pdf_path=str(pdf_path),
-                        segundos_pdf=round(ultimo_segundos_pdf, 3),
-                        error_categoria=error_en_pdf_detalle["categoria"],
-                        causa_probable=error_en_pdf_detalle["causa"],
-                        sugerencia_revision=error_en_pdf_detalle["sugerencia"],
-                        node_attempts=error_en_pdf_detalle["attempts"],
-                        node_returncode=error_en_pdf_detalle["returncode"],
-                        node_stderr=error_en_pdf_detalle["stderr"],
-                        node_stdout=error_en_pdf_detalle["stdout"],
-                    )
-                    break
-                logger.event(
-                    "ORACLE_UPDATE_START",
-                    index=index,
-                    dig_tramite=tramite,
-                    dig_id_tramite=dig_id_tramite,
-                    nuevo_valor="DIG_COBERTURA=S",
-                )
-
-                update_result = actualizar_cobertura_por_id_tramite(
-                    username, password, dig_id_tramite
-                )
-
-                logger.event(
-                    "ORACLE_UPDATE_END",
-                    index=index,
-                    dig_tramite=tramite,
-                    dig_id_tramite=dig_id_tramite,
-                    ok=bool(update_result.get("ok")),
-                    affected=update_result.get("affected", 0),
-                    error=update_result.get("error", ""),
-                )
-
-                if update_result["ok"] and update_result["affected"] > 0:
-                    generados += 1
-                    actualizados += 1
-                    errores_consecutivos = 0
-
-                    writer.writerow(
-                        {
-                            "RUN_ID": run_id,
-                            "FE_PLA_ANIOMES": fe_pla,
-                            "DIG_TRAMITE": tramite,
-                            "DIG_ID_TRAMITE": dig_id_tramite,
-                            "DIG_ID_GENERACION": id_generacion,
-                            "DIG_CEDULA": cedula,
-                            "DIG_FECHA_HASTA": fecha_hasta,
-                            "PDF_PATH": str(pdfs_generados[0]),
-                            "PDF_SIZE_BYTES": pdf_size,
-                            "ESTADO": "GENERADO_Y_ACTUALIZADO",
-                            "PASO": "OK",
-                            "ORACLE_AFFECTED": update_result.get("affected", 0),
-                            "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
-                            "ESPERA_SEGUNDOS": "",
-                            "ERRORES_CONSECUTIVOS": "",
-                            "ERROR": "",
-                            "FECHA_PROCESO": timestamp,
-                        }
-                    )
-
-                    if progress_callback:
-                        progress_callback(
-                            index,
-                            total,
-                            {
-                                "fe_pla_aniomes": fe_pla,
-                                "dig_tramite": tramite,
-                                "dig_id_tramite": dig_id_tramite,
-                                "dig_cedula": cedula,
-                                "dig_fecha_hasta": fecha_hasta,
-                                "estado": "GENERADO_Y_ACTUALIZADO",
-                            },
-                        )
-                else:
-                    errores += 1
-                    errores_consecutivos += 1
-                    err_msg = update_result.get("error") or "No se pudo actualizar Oracle"
-                    if dig_id_tramite:
-                        dig_id_tramite_fallidos_en_corrida.add(dig_id_tramite)
-                    errors_list.append(
-                        {
-                            "dig_tramite": tramite,
-                            "dig_id_tramite": dig_id_tramite,
-                            "cedula": error_en_pdf_detalle.get("cedula", cedula),
-                            "pdf_esperado": error_en_pdf_detalle.get("pdf_esperado", ""),
-                            "categoria": error_en_pdf_detalle.get("categoria", "ERROR_GENERANDO_PDF"),
-                            "causa": error_en_pdf_detalle.get("causa", err_msg),
-                            "sugerencia": error_en_pdf_detalle.get("sugerencia", ""),
-                            "error": err_msg,
-                        }
-                    )
-
-            if index < total:
-                try:
-                    espera, motivo_espera = calcular_espera_dinamica(
-                        output_root=output_root,
-                        segundos_pdf=ultimo_segundos_pdf,
-                        errores_consecutivos=errores_consecutivos,
-                    )
-                    espera = max(1.0, min(float(espera), 7.0))
-                except Exception as exc:
-                    espera = 2.0
-                    motivo_espera = "No se pudo calcular la espera din\u00e1mica. Se aplica espera segura de 2 segundos."
-                    logger.error(
-                        "THROTTLE_CALC_ERROR",
-                        exc,
-                        index=index,
-                        dig_tramite=tramite,
-                        dig_id_tramite=dig_id_tramite,
-                        errores_consecutivos=errores_consecutivos,
-                        ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
-                    )
-
-                logger.event(
-                    "THROTTLE_WAIT",
-                    index=index,
-                    dig_tramite=tramite,
-                    espera_segundos=round(espera, 2),
-                    motivo=motivo_espera,
-                    errores_consecutivos=errores_consecutivos,
-                    ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
+                    dig_id_generacion=id_generacion,
+                    dig_cedula=mask_cedula(cedula),
                 )
 
                 if progress_callback:
@@ -1436,26 +1323,264 @@ def generar_coberturas_automaticas_desde_mes(
                         {
                             "fe_pla_aniomes": fe_pla,
                             "dig_tramite": tramite,
+                            "dig_id_tramite": dig_id_tramite,
                             "dig_cedula": cedula,
                             "dig_fecha_hasta": fecha_hasta,
-                            "estado": f"{motivo_espera} Esperando {espera:.1f}s antes del siguiente registro...",
+                            "estado": "INICIANDO",
                         },
                     )
 
-                # Espera cortada para que el bot\u00f3n de parar responda
-                inicio_espera = time.monotonic()
-                while time.monotonic() - inicio_espera < espera:
-                    if _get_stop_flag().exists():
-                        break
-                    time.sleep(0.5)
+                # Expandir cédulas a generar (titular + dependientes)
+                cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
+                pdfs_generados: list[Path] = []
+                error_en_pdf = ""
 
-                if _get_stop_flag().exists():
-                    logger.event(
-                        "STOP_REQUEST_DETECTED_AFTER_ROW",
-                        lote_numero=lote_numero,
-                        procesados_global=procesados_global,
+                # Carpeta por trámite
+                planilla_dir = output_root / _safe_name(tramite)
+                planilla_dir.mkdir(parents=True, exist_ok=True)
+
+                cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
+                total_pdfs_tramite = len(cedulas_a_generar)
+                pdfs_generados: list[Path] = []
+                error_en_pdf = ""
+                error_en_pdf_detalle: dict[str, str] = {}
+
+                for secuencia_pdf, item_cedula in enumerate(cedulas_a_generar, start=1):
+                    c = item_cedula["cedula"]
+                    tipo_persona = item_cedula.get("tipo", "")
+
+                    output_name = _nombre_cc_por_secuencia(
+                        indice=secuencia_pdf,
+                        total=total_pdfs_tramite,
                     )
-                    break
+
+                    pdf_path = planilla_dir / f"{output_name}.pdf"
+
+                    logger.event(
+                        "PDF_GENERATION_START",
+                        index=index,
+                        fe_pla_aniomes=fe_pla,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        cedula=mask_cedula(c),
+                        tipo_persona=tipo_persona,
+                        output_name=output_name,
+                        pdf_path=str(pdf_path),
+                    )
+
+                    if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                        pdfs_generados.append(pdf_path)
+                        pdf_size = pdf_path.stat().st_size
+                        logger.event(
+                            "PDF_ALREADY_EXISTS",
+                            index=index,
+                            dig_tramite=tramite,
+                            pdf_path=str(pdf_path),
+                            pdf_size_bytes=pdf_size,
+                        )
+                        continue
+
+                    inicio_pdf = time.monotonic()
+
+                    result_node = _run_node_pdf_generator(
+                        node_project_dir=node_project_dir,
+                        cedula=c,
+                        fecha_pdf=fecha_hasta,
+                        output_dir=planilla_dir,
+                        output_name=output_name,
+                        single_timeout_seconds=120,
+                        max_retries=2,
+                        delay_seconds=1.0,
+                    )
+
+                    ultimo_segundos_pdf = time.monotonic() - inicio_pdf
+                    pdf_size = pdf_path.stat().st_size if pdf_path.exists() else 0
+
+                    if result_node["ok"] and pdf_path.exists() and pdf_size > 0:
+                        pdfs_generados.append(pdf_path)
+                        logger.event(
+                            "PDF_GENERATION_END",
+                            index=index,
+                            dig_tramite=tramite,
+                            dig_id_tramite=dig_id_tramite,
+                            cedula=mask_cedula(c),
+                            tipo_persona=tipo_persona,
+                            ok=True,
+                            pdf_exists=True,
+                            pdf_size_bytes=pdf_size,
+                            pdf_path=str(pdf_path),
+                            segundos_pdf=round(ultimo_segundos_pdf, 3),
+                        )
+                    else:
+                        error_en_pdf_detalle = _diagnosticar_fallo_pdf(
+                            result_node=result_node,
+                            pdf_path=pdf_path,
+                            cedula=c,
+                            fecha=fecha_hasta,
+                        )
+
+                        error_en_pdf = error_en_pdf_detalle["error_tecnico"] or error_en_pdf_detalle["causa"]
+
+                        logger.error(
+                            "PDF_GENERATION_ERROR",
+                            error_en_pdf,
+                            index=index,
+                            dig_tramite=tramite,
+                            dig_id_tramite=dig_id_tramite,
+                            cedula=mask_cedula(c),
+                            tipo_persona=tipo_persona,
+                            pdf_path=str(pdf_path),
+                            segundos_pdf=round(ultimo_segundos_pdf, 3),
+                            error_categoria=error_en_pdf_detalle["categoria"],
+                            causa_probable=error_en_pdf_detalle["causa"],
+                            sugerencia_revision=error_en_pdf_detalle["sugerencia"],
+                            node_attempts=error_en_pdf_detalle["attempts"],
+                            node_returncode=error_en_pdf_detalle["returncode"],
+                            node_stderr=error_en_pdf_detalle["stderr"],
+                            node_stdout=error_en_pdf_detalle["stdout"],
+                        )
+                        break
+                    logger.event(
+                        "ORACLE_UPDATE_START",
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        nuevo_valor="DIG_COBERTURA=S",
+                    )
+
+                    update_result = actualizar_cobertura_por_id_tramite(
+                        username, password, dig_id_tramite,
+                        dig_id_generacion=id_generacion,
+                        dig_cedula=cedula,
+                    )
+
+                    logger.event(
+                        "ORACLE_UPDATE_END",
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        ok=bool(update_result.get("ok")),
+                        affected=update_result.get("affected", 0),
+                        error=update_result.get("error", ""),
+                    )
+
+                    if update_result["ok"] and update_result["affected"] > 0:
+                        generados += 1
+                        actualizados += 1
+                        errores_consecutivos = 0
+
+                        writer.writerow(
+                            {
+                                "RUN_ID": run_id,
+                                "FE_PLA_ANIOMES": fe_pla,
+                                "DIG_TRAMITE": tramite,
+                                "DIG_ID_TRAMITE": dig_id_tramite,
+                                "DIG_ID_GENERACION": id_generacion,
+                                "DIG_CEDULA": cedula,
+                                "DIG_FECHA_HASTA": fecha_hasta,
+                                "PDF_PATH": str(pdfs_generados[0]),
+                                "PDF_SIZE_BYTES": pdf_size,
+                                "ESTADO": "GENERADO_Y_ACTUALIZADO",
+                                "PASO": "OK",
+                                "ORACLE_AFFECTED": update_result.get("affected", 0),
+                                "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
+                                "ESPERA_SEGUNDOS": "",
+                                "ERRORES_CONSECUTIVOS": "",
+                                "ERROR": "",
+                                "FECHA_PROCESO": timestamp,
+                            }
+                        )
+
+                        if progress_callback:
+                            progress_callback(
+                                index,
+                                total,
+                                {
+                                    "fe_pla_aniomes": fe_pla,
+                                    "dig_tramite": tramite,
+                                    "dig_id_tramite": dig_id_tramite,
+                                    "dig_cedula": cedula,
+                                    "dig_fecha_hasta": fecha_hasta,
+                                    "estado": "GENERADO_Y_ACTUALIZADO",
+                                },
+                            )
+                    else:
+                        errores += 1
+                        errores_consecutivos += 1
+                        err_msg = update_result.get("error") or "No se pudo actualizar Oracle"
+                        if clave_exclusion:
+                            dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
+                        errors_list.append(
+                            {
+                                "dig_tramite": tramite,
+                                "dig_id_tramite": dig_id_tramite,
+                                "cedula": error_en_pdf_detalle.get("cedula", cedula),
+                                "pdf_esperado": error_en_pdf_detalle.get("pdf_esperado", ""),
+                                "categoria": error_en_pdf_detalle.get("categoria", "ERROR_GENERANDO_PDF"),
+                                "causa": error_en_pdf_detalle.get("causa", err_msg),
+                                "sugerencia": error_en_pdf_detalle.get("sugerencia", ""),
+                                "error": err_msg,
+                            }
+                        )
+
+                if index < total:
+                    try:
+                        espera, motivo_espera = calcular_espera_dinamica(
+                            output_root=output_root,
+                            segundos_pdf=ultimo_segundos_pdf,
+                            errores_consecutivos=errores_consecutivos,
+                        )
+                        espera = max(1.0, min(float(espera), 7.0))
+                    except Exception as exc:
+                        espera = 2.0
+                        motivo_espera = "No se pudo calcular la espera din\u00e1mica. Se aplica espera segura de 2 segundos."
+                        logger.error(
+                            "THROTTLE_CALC_ERROR",
+                            exc,
+                            index=index,
+                            dig_tramite=tramite,
+                            dig_id_tramite=dig_id_tramite,
+                            errores_consecutivos=errores_consecutivos,
+                            ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
+                        )
+
+                    logger.event(
+                        "THROTTLE_WAIT",
+                        index=index,
+                        dig_tramite=tramite,
+                        espera_segundos=round(espera, 2),
+                        motivo=motivo_espera,
+                        errores_consecutivos=errores_consecutivos,
+                        ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
+                    )
+
+                    if progress_callback:
+                        progress_callback(
+                            index,
+                            total,
+                            {
+                                "fe_pla_aniomes": fe_pla,
+                                "dig_tramite": tramite,
+                                "dig_cedula": cedula,
+                                "dig_fecha_hasta": fecha_hasta,
+                                "estado": f"{motivo_espera} Esperando {espera:.1f}s antes del siguiente registro...",
+                            },
+                        )
+
+                    # Espera cortada para que el bot\u00f3n de parar responda
+                    inicio_espera = time.monotonic()
+                    while time.monotonic() - inicio_espera < espera:
+                        if _get_stop_flag().exists():
+                            break
+                        time.sleep(0.5)
+
+                    if _get_stop_flag().exists():
+                        logger.event(
+                            "STOP_REQUEST_DETECTED_AFTER_ROW",
+                            lote_numero=lote_numero,
+                            procesados_global=procesados_global,
+                        )
+                        break
 
             # Fin del lote.
             # Se vuelve al while principal para consultar otra vez Oracle.

@@ -1,6 +1,12 @@
+import json
 import os
 import re
+import subprocess
+import sys
+from collections import Counter, deque
 from pathlib import Path
+
+import pandas as pd
 
 import streamlit as st
 
@@ -12,6 +18,13 @@ from src.app_config import (
 )
 from src.cobertura_pdf import (
     generar_coberturas_automaticas_desde_mes,
+)
+from src.cobertura_runner import ejecutar_coberturas_con_lock
+from src.auto_resume_state import (
+    registrar_job_activo,
+    marcar_job_completado,
+    marcar_job_reintento,
+    marcar_job_detenido_por_usuario,
 )
 
 
@@ -191,6 +204,232 @@ def _render_config_section() -> str | None:
     return str(validacion["path"])
 
 
+def _ejecutar_sync_coberturas_repo(
+    origen_root: str,
+    dig_tramite: str = "",
+) -> dict:
+    """
+    Ejecuta la sincronización hacia el repositorio oficial y muestra en Streamlit
+    el bloque vivo de los últimos 100 resultados.
+
+    Muestra:
+    - Trámite
+    - Archivo
+    - Estado
+    - Destino
+
+    El CSV y SQLite siguen guardando todo el histórico completo.
+    """
+    project_root = Path("/data_nuevo/cobertura_integrada")
+    script_path = project_root / "scripts" / "sync_coberturas_repo.py"
+
+    if not script_path.exists():
+        return {
+            "ok": False,
+            "already_running": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": f"No existe el script de sync: {script_path}",
+            "manifest_path": "",
+        }
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(script_path),
+        "--origen-root",
+        str(Path(origen_root).resolve()),
+        "--repo-root",
+        "/data_nuevo/repo_grande/data/datos",
+        "--logs-dir",
+        "/data_nuevo/cobertura_integrada/logs",
+        "--state-db",
+        "/data_nuevo/cobertura_integrada/logs/cobertura_repo_sync.sqlite",
+        "--apply",
+        "--emit-json-events",
+        "--batch-ui-size",
+        "100",
+    ]
+
+    if dig_tramite:
+        cmd.extend(["--tramite", dig_tramite])
+
+    st.markdown("### Sincronización hacia repositorio oficial")
+
+    sync_status = st.empty()
+    sync_metrics = st.empty()
+    sync_table = st.empty()
+    sync_log = st.empty()
+
+    ultimos_100 = deque(maxlen=100)
+    contador_estados = Counter()
+    stdout_lines: list[str] = []
+    manifest_path = ""
+    run_id = ""
+
+    def render_tabla():
+        if not ultimos_100:
+            return
+
+        df = pd.DataFrame(list(ultimos_100))
+
+        sync_table.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    def render_metricas():
+        total_eventos = sum(contador_estados.values())
+
+        col1, col2, col3, col4 = sync_metrics.columns(4)
+
+        col1.metric("Resultados sync", total_eventos)
+        col2.metric("Copiados", contador_estados.get("COPIADO", 0))
+        col3.metric(
+            "Ya existían",
+            contador_estados.get("OMITIDO_YA_EXISTE_IDENTICO", 0)
+            + contador_estados.get("OMITIDO_YA_EXISTE_DIFERENTE", 0),
+        )
+        col4.metric(
+            "Con observación",
+            contador_estados.get("DESTINO_NO_ENCONTRADO", 0)
+            + contador_estados.get("DESTINO_AMBIGUO", 0)
+            + contador_estados.get("ERROR_COPIA", 0)
+            + contador_estados.get("ERROR_HASH", 0)
+            + contador_estados.get("SIN_PDFS_CC", 0)
+            + contador_estados.get("ORIGEN_NO_EXISTE", 0),
+        )
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(project_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+
+        sync_status.markdown(
+            """
+            <div class="status-info">
+                Sincronización iniciada. Mostrando los últimos 100 resultados...
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        assert process.stdout is not None
+
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\n")
+            stdout_lines.append(line)
+
+            if not line.startswith("SYNC_EVENT_JSON "):
+                continue
+
+            try:
+                payload = json.loads(line.replace("SYNC_EVENT_JSON ", "", 1))
+            except Exception:
+                continue
+
+            event_type = payload.get("event_type", "")
+
+            if event_type == "RUN_START":
+                run_id = payload.get("run_id", "")
+                sync_status.info(f"Sync iniciado. Run ID: {run_id}")
+
+            elif event_type == "INDEX_FINISHED":
+                sync_status.info(
+                    "Índice destino construido. "
+                    f"Trámites origen: {payload.get('tramites_origen', 0)} | "
+                    f"Carpetas destino indexadas: {payload.get('carpetas_destino_indexadas', 0)}"
+                )
+
+            elif event_type == "TRAMITE_START":
+                sync_log.caption(
+                    f"Revisando trámite {payload.get('tramite')} "
+                    f"({payload.get('index')} de {payload.get('total_tramites')})"
+                )
+
+            elif event_type == "FILE_RESULT":
+                estado = payload.get("estado", "")
+                contador_estados[estado] += 1
+
+                ultimos_100.append(
+                    {
+                        "N°": payload.get("sequence", ""),
+                        "Trámite": payload.get("tramite", ""),
+                        "Archivo": payload.get("archivo", ""),
+                        "Estado": estado,
+                        "Destino": payload.get("destino", ""),
+                        "Detalle": payload.get("detalle", ""),
+                    }
+                )
+
+                sequence = int(payload.get("sequence") or 0)
+
+                if sequence == 1 or sequence % 10 == 0:
+                    render_metricas()
+                    render_tabla()
+
+            elif event_type == "BATCH_MARK":
+                render_metricas()
+                render_tabla()
+                sync_status.info(
+                    f"Bloque procesado: {payload.get('sequence')} resultados revisados."
+                )
+
+            elif event_type == "RUN_END":
+                manifest_path = payload.get("manifest_path", "")
+                render_metricas()
+                render_tabla()
+                sync_status.success(
+                    f"Sync terminado. CSV: {manifest_path}"
+                )
+
+        returncode = process.wait()
+
+        # Render final por si no cayó exactamente en múltiplo de 10.
+        render_metricas()
+        render_tabla()
+
+        stdout = "\n".join(stdout_lines)
+
+        if not manifest_path:
+            for line in stdout_lines:
+                if line.startswith("CSV detalle:"):
+                    manifest_path = line.replace("CSV detalle:", "").strip()
+
+        return {
+            "ok": returncode == 0,
+            "already_running": returncode == 10,
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": "",
+            "manifest_path": manifest_path,
+            "run_id": run_id,
+            "estados": dict(contador_estados),
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "already_running": False,
+            "returncode": -3,
+            "stdout": "\n".join(stdout_lines),
+            "stderr": str(exc),
+            "manifest_path": manifest_path,
+            "run_id": run_id,
+            "estados": dict(contador_estados),
+        }
+
+
 def _render_auto_result():
     result = st.session_state.get("current_result")
 
@@ -256,6 +495,48 @@ def _render_auto_result():
             ).splitlines()[-30:]
             for line in lines:
                 st.code(line, language="json")
+
+    sync_repo = result.get("sync_repo")
+
+    if sync_repo:
+        st.markdown("### Resultado de sincronización al repositorio")
+
+        if sync_repo.get("ok"):
+            st.success("Sincronización finalizada correctamente.")
+        elif sync_repo.get("already_running"):
+            st.info("La sincronización no se ejecutó porque ya había otra en curso.")
+        else:
+            st.warning("La sincronización terminó con observaciones.")
+
+        estados = sync_repo.get("estados") or {}
+
+        if estados:
+            st.markdown("#### Estados del sync")
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Estado": estado, "Total": total} for estado, total in estados.items()]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        manifest_sync = sync_repo.get("manifest_path")
+
+        if manifest_sync and Path(manifest_sync).exists():
+            with Path(manifest_sync).open("rb") as file:
+                st.download_button(
+                    "Descargar CSV completo del sync",
+                    data=file,
+                    file_name=Path(manifest_sync).name,
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+        with st.expander("Ver salida técnica del sync"):
+            if sync_repo.get("stdout"):
+                st.code(sync_repo.get("stdout"), language="text")
+            if sync_repo.get("stderr"):
+                st.code(sync_repo.get("stderr"), language="text")
 
     errors = result.get("errors") or []
 
@@ -444,6 +725,11 @@ def dashboard_page():
 
     if generar:
         _limpiar_bandera_parada()
+        registrar_job_activo(
+            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+            output_dir=str(pdf_output_dir),
+            dig_tramite=dig_tramite_input,
+        )
 
     progress_bar = st.empty()
     status_box = st.empty()
@@ -508,25 +794,81 @@ def dashboard_page():
             )
 
         try:
-            result = generar_coberturas_automaticas_desde_mes(
+            result = ejecutar_coberturas_con_lock(
                 username=st.session_state.oracle_user,
                 password=st.session_state.oracle_password,
                 fe_pla_aniomes_desde=fe_pla_aniomes_desde,
                 dig_tramite=dig_tramite_input,
-                output_dir=pdf_output_dir,
+                output_dir=str(pdf_output_dir),
                 progress_callback=on_progress,
             )
 
+            if result.get("generados", 0) > 0:
+                status_box.markdown(
+                    """
+                    <div class="status-info">
+                        Coberturas generadas. Sincronizando PDFs hacia el repositorio oficial...
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                sync_result = _ejecutar_sync_coberturas_repo(
+                    origen_root=str(pdf_output_dir),
+                    dig_tramite=dig_tramite_input if dig_tramite_input else "",
+                )
+
+                result["sync_repo"] = sync_result
+
+                if sync_result.get("ok"):
+                    st.success("Sincronización al repositorio oficial finalizada.")
+                    marcar_job_completado("Proceso terminado desde Streamlit.")
+                elif sync_result.get("already_running"):
+                    st.info(
+                        "Ya existía una sincronización en ejecución. No se inició otra para evitar duplicidad."
+                    )
+                else:
+                    st.warning(
+                        "La generación terminó, pero la sincronización al repositorio oficial tuvo observaciones."
+                    )
+                    if sync_result.get("stderr"):
+                        st.code(sync_result.get("stderr", ""), language="text")
+                    if sync_result.get("stdout"):
+                        st.code(sync_result.get("stdout", ""), language="text")
+            else:
+                result["sync_repo"] = {
+                    "ok": True,
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "manifest_path": "",
+                    "mensaje": "No se ejecutó sync porque no se generaron PDFs nuevos.",
+                }
+
             progress_widget.progress(100)
 
-            status_box.markdown(
-                """
-                <div class="status-success">
-                    Proceso terminado. Manifiesto listo para descargar.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            if result.get("total", 0) <= 0 or result.get("sin_pendientes"):
+                status_box.markdown(
+                    """
+                    <div class="status-warn">
+                        El proceso terminó sin procesar registros.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.warning(
+                    "La aplicación no procesó registros. Si Oracle muestra pendientes, revisar ORACLE_TARGETS, "
+                    "la carpeta real desde donde corre Streamlit y los logs."
+                )
+            else:
+                status_box.markdown(
+                    """
+                    <div class="status-success">
+                        Proceso terminado. Manifiesto listo para descargar.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
             detail_box.empty()
             st.session_state.current_result = result
@@ -541,6 +883,7 @@ def dashboard_page():
                 """,
                 unsafe_allow_html=True,
             )
+            marcar_job_reintento(str(exc))
             st.error("No se pudo completar el proceso automático.")
             st.code(str(exc))
 

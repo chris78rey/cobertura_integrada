@@ -200,24 +200,49 @@ def actualizar_cobertura_por_id_tramite(
     username: str,
     password: str,
     dig_id_tramite: str,
+    dig_id_generacion: str = "",
+    dig_cedula: str = "",
 ) -> dict:
     """
-    Actualiza DIG_COBERTURA='S' solo si estÃ¡ en 'N' y DIG_PLANILLADO='S'.
+    Actualiza DIG_COBERTURA='S' solo si está en 'N' y DIG_PLANILLADO='S'.
 
-    UPDATE seguro por DIG_ID_TRAMITE + condiciones originales
-    para evitar sobreescrituras accidentales.
+    Si DIG_ID_TRAMITE está vacío, usa DIG_ID_GENERACION + DIG_CEDULA
+    como clave alternativa para identificar la fila.
     """
 
     conn = None
     prepared_statement = None
 
-    sql = """
-        UPDATE DIGITALIZACION.DIGITALIZACION
-        SET DIG_COBERTURA = 'S'
-        WHERE DIG_ID_TRAMITE = ?
-          AND DIG_COBERTURA = 'N'
-          AND DIG_PLANILLADO = 'S'
-    """
+    dig_id_tramite = str(dig_id_tramite or "").strip()
+    dig_id_generacion = str(dig_id_generacion or "").strip()
+    dig_cedula = str(dig_cedula or "").strip()
+
+    if dig_id_tramite:
+        sql = """
+            UPDATE DIGITALIZACION.DIGITALIZACION
+            SET DIG_COBERTURA = 'S'
+            WHERE DIG_ID_TRAMITE = ?
+              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+              AND TRIM(DIG_PLANILLADO) = 'S'
+        """
+        params = [dig_id_tramite]
+    elif dig_id_generacion and dig_cedula:
+        sql = """
+            UPDATE DIGITALIZACION.DIGITALIZACION
+            SET DIG_COBERTURA = 'S'
+            WHERE DIG_ID_GENERACION = ?
+              AND DIG_CEDULA = ?
+              AND (DIG_ID_TRAMITE IS NULL OR TRIM(DIG_ID_TRAMITE) IS NULL)
+              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+              AND TRIM(DIG_PLANILLADO) = 'S'
+        """
+        params = [dig_id_generacion, dig_cedula]
+    else:
+        return {
+            "ok": False,
+            "affected": 0,
+            "error": "Sin clave suficiente para actualizar (DIG_ID_TRAMITE y DIG_ID_GENERACION/CEDULA vacíos).",
+        }
 
     try:
         conn = oracle_connect(username, password)
@@ -225,7 +250,9 @@ def actualizar_cobertura_por_id_tramite(
         java_conn.setAutoCommit(False)
 
         prepared_statement = java_conn.prepareStatement(sql)
-        prepared_statement.setString(1, dig_id_tramite)
+
+        for index, value in enumerate(params, start=1):
+            prepared_statement.setString(index, str(value))
 
         affected = prepared_statement.executeUpdate()
 
