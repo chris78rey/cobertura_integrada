@@ -258,14 +258,32 @@ def _render_auto_result():
     errors = result.get("errors") or []
 
     if errors:
-        with st.expander(f"Ver {len(errors)} errores"):
+        st.markdown(
+            f"""
+            <div class="status-warn">
+                Se detectaron {len(errors)} registros con problemas.
+                Revise el detalle antes de cerrar el proceso.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander(f"Ver diagnóstico de {len(errors)} errores"):
             for item in errors:
-                st.write(
-                    f"Trámite: `{item.get('dig_tramite')}` | "
-                    f"ID Trámite: `{item.get('dig_id_tramite')}` | "
-                    f"Cédula: `{item.get('cedula')}`"
+                st.markdown(
+                    f"""
+                    **Trámite:** `{item.get('dig_tramite')}`  
+                    **ID trámite:** `{item.get('dig_id_tramite')}`  
+                    **Cédula:** `{item.get('cedula')}`  
+                    **PDF esperado:** `{item.get('pdf_esperado', '')}`  
+                    **Categoría:** `{item.get('categoria', '')}`  
+                    **Causa probable:** {item.get('causa', item.get('error', ''))}  
+                    **Qué revisar:** {item.get('sugerencia', '')}
+                    """
                 )
-                st.code(item.get("error", ""))
+
+                with st.expander("Ver detalle técnico de este error"):
+                    st.code(item.get("error", ""))
 
 
 def dashboard_page():

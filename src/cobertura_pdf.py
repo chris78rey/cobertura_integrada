@@ -88,6 +88,73 @@ def _nombre_cc_por_secuencia(indice: int, total: int) -> str:
     return f"CC_{indice:02d}"
 
 
+def _limitar_texto(value, max_chars=1200):
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n... TEXTO RECORTADO ..."
+
+
+def _diagnosticar_fallo_pdf(
+    result_node: dict,
+    pdf_path: Path,
+    cedula: str,
+    fecha: str,
+) -> dict:
+    stdout = _limitar_texto(result_node.get("stdout", ""))
+    stderr = _limitar_texto(result_node.get("stderr", ""))
+    error = _limitar_texto(result_node.get("error", ""))
+
+    texto = f"{error}\n{stderr}\n{stdout}".lower()
+
+    if "timeout" in texto:
+        causa = "La consulta tard\u00f3 demasiado y se agot\u00f3 el tiempo de espera."
+        sugerencia = "Reintentar m\u00e1s tarde. Revisar si el portal est\u00e1 lento o si hay demasiada carga en el servidor."
+        categoria = "TIMEOUT"
+    elif "eacces" in texto or "permission denied" in texto or "permiso" in texto:
+        causa = "La aplicaci\u00f3n no pudo escribir el archivo PDF en la carpeta destino."
+        sugerencia = "Revisar permisos de escritura sobre la carpeta de salida y propietario del proceso Streamlit."
+        categoria = "PERMISOS"
+    elif "enoent" in texto or "no such file" in texto or "no existe" in texto:
+        causa = "Falta una ruta, script, recurso o carpeta necesaria para generar el PDF."
+        sugerencia = "Revisar COBERTURA_NODE_PROJECT_DIR, scripts/generate_pdf.js, assets y carpeta de salida."
+        categoria = "RUTA_O_ARCHIVO_FALTANTE"
+    elif "network" in texto or "fetch" in texto or "socket" in texto or "econn" in texto:
+        causa = "Hubo un problema de red al consultar el portal."
+        sugerencia = "Revisar conexi\u00f3n a internet, disponibilidad del portal y estabilidad de red."
+        categoria = "RED_PORTAL"
+    elif "captcha" in texto or "forbidden" in texto or "403" in texto or "429" in texto:
+        causa = "El portal rechaz\u00f3 o limit\u00f3 temporalmente la consulta."
+        sugerencia = "Bajar el ritmo de consultas, reintentar m\u00e1s tarde y revisar si el portal cambi\u00f3 su comportamiento."
+        categoria = "PORTAL_LIMITO_CONSULTA"
+    elif not pdf_path.exists():
+        causa = "El generador termin\u00f3, pero el PDF esperado no apareci\u00f3 en la carpeta."
+        sugerencia = "Revisar salida t\u00e9cnica de Node, nombre esperado del PDF, ruta de salida y assets del generador."
+        categoria = "PDF_NO_CREADO"
+    elif pdf_path.exists() and pdf_path.stat().st_size <= 0:
+        causa = "El PDF fue creado, pero qued\u00f3 vac\u00edo."
+        sugerencia = "Eliminar el PDF vac\u00edo y regenerar. Revisar respuesta del portal y plantilla de generaci\u00f3n."
+        categoria = "PDF_VACIO"
+    else:
+        causa = "No se pudo determinar autom\u00e1ticamente la causa exacta."
+        sugerencia = "Revisar el log t\u00e9cnico JSONL, stderr/stdout de Node y probar manualmente esa c\u00e9dula y fecha."
+        categoria = "ERROR_DESCONOCIDO"
+
+    return {
+        "categoria": categoria,
+        "causa": causa,
+        "sugerencia": sugerencia,
+        "cedula": cedula,
+        "fecha": fecha,
+        "pdf_esperado": str(pdf_path),
+        "stdout": stdout,
+        "stderr": stderr,
+        "error_tecnico": error,
+        "attempts": str(result_node.get("attempts", "")),
+        "returncode": str(result_node.get("returncode", "")),
+    }
+
+
 def _crear_zip_coberturas(
     zip_path: Path,
     files: list[Path],
@@ -473,6 +540,8 @@ def _run_node_pdf_generator(
                     "stdout": completed.stdout,
                     "stderr": completed.stderr,
                     "attempts": attempt,
+                    "returncode": completed.returncode,
+                    "cmd": " ".join(cmd),
                 }
 
             last_error = (
@@ -480,6 +549,9 @@ def _run_node_pdf_generator(
                 or completed.stdout.strip()
                 or f"Node terminó con código {completed.returncode}"
             )
+            last_stdout = completed.stdout
+            last_stderr = completed.stderr
+            last_returncode = completed.returncode
 
         except subprocess.TimeoutExpired:
             last_error = f"Timeout generando cobertura para {cedula} con fecha {fecha_pdf}"
@@ -490,7 +562,11 @@ def _run_node_pdf_generator(
     return {
         "ok": False,
         "error": last_error,
+        "stdout": last_stdout,
+        "stderr": last_stderr,
+        "returncode": last_returncode,
         "attempts": max_retries,
+        "cmd": " ".join(cmd),
     }
 
 
@@ -893,6 +969,15 @@ def generar_coberturas_automaticas_desde_mes(
                 "ESPERA_SEGUNDOS",
                 "ERRORES_CONSECUTIVOS",
                 "ERROR",
+                "CEDULA_FALLIDA",
+                "PDF_ESPERADO",
+                "ERROR_CATEGORIA",
+                "CAUSA_PROBABLE",
+                "SUGERENCIA_REVISION",
+                "NODE_ATTEMPTS",
+                "NODE_RETURNCODE",
+                "NODE_STDERR",
+                "NODE_STDOUT",
                 "FECHA_PROCESO",
             ],
         )
@@ -946,6 +1031,7 @@ def generar_coberturas_automaticas_desde_mes(
             total_pdfs_tramite = len(cedulas_a_generar)
             pdfs_generados: list[Path] = []
             error_en_pdf = ""
+            error_en_pdf_detalle: dict[str, str] = {}
 
             for secuencia_pdf, item_cedula in enumerate(cedulas_a_generar, start=1):
                 c = item_cedula["cedula"]
@@ -1014,24 +1100,34 @@ def generar_coberturas_automaticas_desde_mes(
                         segundos_pdf=round(ultimo_segundos_pdf, 3),
                     )
                 else:
-                    error_en_pdf = str(
-                        result_node.get("error")
-                        or f"No se generó correctamente {pdf_path.name} para cédula {c}"
+                    error_en_pdf_detalle = _diagnosticar_fallo_pdf(
+                        result_node=result_node,
+                        pdf_path=pdf_path,
+                        cedula=c,
+                        fecha=fecha_hasta,
                     )
-                    logger.event(
+
+                    error_en_pdf = error_en_pdf_detalle["error_tecnico"] or error_en_pdf_detalle["causa"]
+
+                    logger.error(
                         "PDF_GENERATION_ERROR",
+                        error_en_pdf,
                         index=index,
                         dig_tramite=tramite,
                         dig_id_tramite=dig_id_tramite,
                         cedula=mask_cedula(c),
+                        tipo_persona=tipo_persona,
                         pdf_path=str(pdf_path),
                         segundos_pdf=round(ultimo_segundos_pdf, 3),
-                        error=error_en_pdf,
+                        error_categoria=error_en_pdf_detalle["categoria"],
+                        causa_probable=error_en_pdf_detalle["causa"],
+                        sugerencia_revision=error_en_pdf_detalle["sugerencia"],
+                        node_attempts=error_en_pdf_detalle["attempts"],
+                        node_returncode=error_en_pdf_detalle["returncode"],
+                        node_stderr=error_en_pdf_detalle["stderr"],
+                        node_stdout=error_en_pdf_detalle["stdout"],
                     )
                     break
-
-                time.sleep(1.0)            # Actualizar Oracle solo si todos los PDFs se generaron
-            if pdfs_generados and not error_en_pdf:
                 logger.event(
                     "ORACLE_UPDATE_START",
                     index=index,
@@ -1102,71 +1198,14 @@ def generar_coberturas_automaticas_desde_mes(
                         {
                             "dig_tramite": tramite,
                             "dig_id_tramite": dig_id_tramite,
-                            "cedula": cedula,
+                            "cedula": error_en_pdf_detalle.get("cedula", cedula),
+                            "pdf_esperado": error_en_pdf_detalle.get("pdf_esperado", ""),
+                            "categoria": error_en_pdf_detalle.get("categoria", "ERROR_GENERANDO_PDF"),
+                            "causa": error_en_pdf_detalle.get("causa", err_msg),
+                            "sugerencia": error_en_pdf_detalle.get("sugerencia", ""),
                             "error": err_msg,
                         }
                     )
-                    writer.writerow(
-                        {
-                            "RUN_ID": run_id,
-                            "FE_PLA_ANIOMES": fe_pla,
-                            "DIG_TRAMITE": tramite,
-                            "DIG_ID_TRAMITE": dig_id_tramite,
-                            "DIG_ID_GENERACION": id_generacion,
-                            "DIG_CEDULA": cedula,
-                            "DIG_FECHA_HASTA": fecha_hasta,
-                            "PDF_PATH": str(pdfs_generados[0]),
-                            "PDF_SIZE_BYTES": pdf_size,
-                            "ESTADO": "ERROR_ACTUALIZANDO_ORACLE",
-                            "PASO": "ORACLE_UPDATE",
-                            "ORACLE_AFFECTED": 0,
-                            "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
-                            "ESPERA_SEGUNDOS": "",
-                            "ERRORES_CONSECUTIVOS": "",
-                            "ERROR": err_msg,
-                            "FECHA_PROCESO": timestamp,
-                        }
-                    )
-            else:
-                errores += 1
-                errores_consecutivos += 1
-                err_msg = error_en_pdf or "PDF_NO_EXISTE"
-                errors_list.append(
-                    {
-                        "dig_tramite": tramite,
-                        "dig_id_tramite": dig_id_tramite,
-                        "cedula": cedula,
-                        "error": err_msg,
-                    }
-                )
-                writer.writerow(
-                    {
-                        "RUN_ID": run_id,
-                        "FE_PLA_ANIOMES": fe_pla,
-                        "DIG_TRAMITE": tramite,
-                        "DIG_ID_TRAMITE": dig_id_tramite,
-                        "DIG_ID_GENERACION": id_generacion,
-                        "DIG_CEDULA": cedula,
-                        "DIG_FECHA_HASTA": fecha_hasta,
-                        "PDF_PATH": "",
-                        "PDF_SIZE_BYTES": 0,
-                        "ESTADO": "ERROR_GENERANDO_PDF",
-                        "PASO": "PDF_GENERATION",
-                        "ORACLE_AFFECTED": 0,
-                        "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
-                        "ESPERA_SEGUNDOS": "",
-                        "ERRORES_CONSECUTIVOS": "",
-                        "ERROR": err_msg,
-                        "FECHA_PROCESO": timestamp,
-                    }
-                )
-
-            # Pausa dinámica según carga del sistema
-            espera, motivo_espera = calcular_espera_dinamica(
-                output_root=output_root,
-                segundos_pdf=ultimo_segundos_pdf,
-                errores_consecutivos=errores_consecutivos,
-            )
 
             logger.event(
                 "THROTTLE_WAIT",
