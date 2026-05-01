@@ -15,7 +15,6 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-
 PDF_CC_REGEX = re.compile(r"^CC(?:_\d{2})?\.pdf$")
 
 
@@ -398,7 +397,9 @@ def procesar_tramite(
 
             if source_hash == dest_hash:
                 estado = "OMITIDO_YA_EXISTE_IDENTICO"
-                detalle = "El PDF ya existe en destino y es idéntico. No se sobrescribe."
+                detalle = (
+                    "El PDF ya existe en destino y es idéntico. No se sobrescribe."
+                )
             else:
                 estado = "OMITIDO_YA_EXISTE_DIFERENTE"
                 detalle = "El PDF ya existe en destino, pero tiene hash diferente. No se sobrescribe por seguridad."
