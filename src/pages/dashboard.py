@@ -884,8 +884,37 @@ def dashboard_page():
                 unsafe_allow_html=True,
             )
             marcar_job_reintento(str(exc))
-            st.error("No se pudo completar el proceso automático.")
-            st.code(str(exc))
+            mensaje_error = str(exc)
+
+            if "Ya existe un proceso de coberturas ejecutándose" in mensaje_error or "ProcesoCoberturaYaEnEjecucion" in mensaje_error:
+                status_box.markdown(
+                    """
+                    <div class="status-warn">
+                        Ya hay un proceso de coberturas en ejecución.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.warning(
+                    "No se inició una nueva generación porque otro proceso está activo. "
+                    "Revise si Streamlit, el recuperador automático o una ejecución anterior siguen trabajando."
+                )
+
+                st.code(mensaje_error, language="text")
+
+            else:
+                status_box.markdown(
+                    """
+                    <div class="status-warn">
+                        Error durante el proceso.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.error("No se pudo completar el proceso automático.")
+                st.code(mensaje_error, language="text")
 
     _render_auto_result()
 

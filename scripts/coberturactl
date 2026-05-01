@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="/data_nuevo/cobertura_integrada"
+OUTPUT_ROOT="/data_nuevo/coberturas"
+STREAMLIT_SERVICE="cobertura-streamlit.service"
+RESUME_SERVICE="cobertura-auto-resume.service"
+RESUME_TIMER="cobertura-auto-resume.timer"
+
+GEN_LOCK="$PROJECT_ROOT/logs/cobertura_generation.lock"
+SYNC_LOCK="$PROJECT_ROOT/logs/cobertura_repo_sync.lock"
+STOP_FLAG="$PROJECT_ROOT/config/stop_cobertura.flag"
+STATE_FILE="$PROJECT_ROOT/logs/cobertura_auto_resume_state.json"
+APP_LOG_DIR="$PROJECT_ROOT/logs"
+
+need_root() {
+  if [ "${EUID}" -ne 0 ]; then
+    echo "Este comando requiere sudo."
+    echo "Ejemplo: sudo coberturactl $*"
+    exit 1
+  fi
+}
+
+title() {
+  echo ""
+  echo "============================================================"
+  echo "$1"
+  echo "============================================================"
+}
+
+service_exists() {
+  systemctl list-unit-files "$1" >/dev/null 2>&1
+}
+
+show_status() {
+  title "GENERAL"
+
+  echo "Proyecto: $PROJECT_ROOT"
+  echo "Salida PDFs: $OUTPUT_ROOT"
+  echo ""
+
+  echo "Streamlit:"
+  if service_exists "$STREAMLIT_SERVICE"; then
+    systemctl is-active "$STREAMLIT_SERVICE" 2>/dev/null || echo "inactive"
+  else
+    echo "Servicio no configurado"
+    ps aux | grep "[s]treamlit run" | awk '{print "PID "$2" corriendo manualmente"}' || echo "No corriendo"
+  fi
+
+  echo ""
+  echo "Recuperador automático:"
+  if service_exists "$RESUME_TIMER"; then
+    systemctl is-active "$RESUME_TIMER" 2>/dev/null || echo "inactive"
+  else
+    echo "Timer no configurado"
+  fi
+
+  title "LOCKS"
+
+  if [ -f "$GEN_LOCK" ]; then
+    echo "Lock generación: EXISTE"
+    echo "Proceso:"
+    lsof "$GEN_LOCK" 2>/dev/null || echo "  Nadie tiene tomado el lock"
+  else
+    echo "Lock generación: libre"
+  fi
+
+  if [ -f "$SYNC_LOCK" ]; then
+    echo "Lock sync: EXISTE"
+    lsof "$SYNC_LOCK" 2>/dev/null || echo "  Nadie tiene tomado el lock"
+  else
+    echo "Lock sync: libre"
+  fi
+
+  title "BANDERA DE PARADA"
+
+  if [ -f "$STOP_FLAG" ]; then
+    echo "ACTIVA  (no se tomarán nuevos registros)"
+  else
+    echo "Inactiva"
+  fi
+
+  title "ESTADO REANUDACIÓN"
+
+  if [ -f "$STATE_FILE" ]; then
+    grep -E "enabled|status|fe_pla_aniomes|pendientes|last_error" "$STATE_FILE" 2>/dev/null || cat "$STATE_FILE"
+  else
+    echo "No existe"
+  fi
+
+  title "PDFs RECIENTES (últimos 10 min)"
+
+  find "$OUTPUT_ROOT" -type f -name "CC*.pdf" -mmin -10 -printf "%TH:%TM %p\n" 2>/dev/null | sort | tail -20 || echo "Ninguno"
+}
+
+start_all() {
+  need_root start
+  title "INICIANDO SERVICIOS"
+  rm -f "$STOP_FLAG"
+  systemctl daemon-reload
+
+  if service_exists "$STREAMLIT_SERVICE"; then
+    systemctl enable --now "$STREAMLIT_SERVICE" 2>/dev/null
+    echo "Streamlit: iniciado"
+  else
+    echo "Streamlit: servicio no configurado"
+  fi
+
+  if service_exists "$RESUME_TIMER"; then
+    systemctl enable --now "$RESUME_TIMER" 2>/dev/null
+    echo "Recuperador: iniciado"
+  else
+    echo "Recuperador: no configurado"
+  fi
+}
+
+stop_all() {
+  need_root stop
+  title "PARADA CONTROLADA"
+  mkdir -p "$(dirname "$STOP_FLAG")"
+  touch "$STOP_FLAG"
+  echo "Bandera creada"
+
+  systemctl stop "$RESUME_TIMER" 2>/dev/null || true
+  systemctl stop "$RESUME_SERVICE" 2>/dev/null || true
+  systemctl stop "$STREAMLIT_SERVICE" 2>/dev/null || true
+  echo "Servicios detenidos"
+}
+
+restart_all() {
+  need_root restart
+  title "REINICIANDO"
+  stop_all
+  sleep 2
+  start_all
+}
+
+logs_all() {
+  echo "=== STREAMLIT ==="
+  journalctl -u "$STREAMLIT_SERVICE" -n 80 --no-pager 2>/dev/null || echo "Sin logs systemd"
+  echo ""
+  echo "=== RECUPERADOR ==="
+  journalctl -u "$RESUME_SERVICE" -n 80 --no-pager 2>/dev/null || echo "Sin logs"
+  echo ""
+  echo "=== ÚLTIMO LOG GENERACIÓN ==="
+  if ls "$APP_LOG_DIR"/cobertura_auto_*.jsonl >/dev/null 2>&1; then
+    LAST_LOG="$(ls -t "$APP_LOG_DIR"/cobertura_auto_*.jsonl 2>/dev/null | head -1)"
+    echo "$LAST_LOG"
+    tail -n 80 "$LAST_LOG" 2>/dev/null
+  else
+    echo "No hay logs"
+  fi
+}
+
+logs_follow() {
+  journalctl -u "$STREAMLIT_SERVICE" -u "$RESUME_SERVICE" -f 2>/dev/null
+}
+
+recover_once() {
+  need_root recover
+  title "RECUPERACIÓN MANUAL"
+  if [ -x "$PROJECT_ROOT/scripts/run_resume_coberturas.sh" ]; then
+    sudo -u red_gestion "$PROJECT_ROOT/scripts/run_resume_coberturas.sh"
+  else
+    echo "Script de recuperación no encontrado"
+    exit 1
+  fi
+}
+
+unlock_safe() {
+  need_root unlock
+  title "LIBERACIÓN SEGURA"
+
+  for LOCK in "$GEN_LOCK" "$SYNC_LOCK"; do
+    echo "Revisando: $LOCK"
+    if [ -f "$LOCK" ]; then
+      if lsof "$LOCK" >/dev/null 2>&1; then
+        echo "  EN USO - no se toca"
+        lsof "$LOCK"
+      else
+        echo "  Huérfano - eliminado"
+        rm -f "$LOCK"
+      fi
+    else
+      echo "  No existe"
+    fi
+  done
+
+  rm -f "$STOP_FLAG"
+  echo "Bandera de parada limpia"
+}
+
+hard_reset() {
+  need_root hard-reset
+  title "HARD RESET"
+
+  echo "1. Parando servicios..."
+  systemctl stop "$RESUME_TIMER" 2>/dev/null || true
+  systemctl stop "$RESUME_SERVICE" 2>/dev/null || true
+  systemctl stop "$STREAMLIT_SERVICE" 2>/dev/null || true
+
+  echo "2. Matando procesos con lock..."
+  for LOCK in "$GEN_LOCK" "$SYNC_LOCK"; do
+    if [ -f "$LOCK" ]; then
+      PIDS=$(lsof -t "$LOCK" 2>/dev/null || true)
+      if [ -n "$PIDS" ]; then
+        echo "  PIDs: $PIDS"
+        kill $PIDS 2>/dev/null || true
+        sleep 3
+        for PID in $PIDS; do
+          kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null && echo "  PID $PID forzado" || echo "  PID $PID detenido"
+        done
+      fi
+    fi
+  done
+
+  echo "3. Limpiando..."
+  rm -f "$STOP_FLAG"
+  for LOCK in "$GEN_LOCK" "$SYNC_LOCK"; do
+    [ -f "$LOCK" ] && ! lsof "$LOCK" >/dev/null 2>&1 && rm -f "$LOCK"
+  done
+
+  echo "4. Reiniciando..."
+  systemctl start "$STREAMLIT_SERVICE" 2>/dev/null || true
+  systemctl start "$RESUME_TIMER" 2>/dev/null || true
+  echo "Listo"
+}
+
+health() {
+  title "CHEQUEO RÁPIDO"
+  echo "Proyecto:    $([ -d "$PROJECT_ROOT" ] && echo OK || echo ERROR)"
+  echo "Salida:      $([ -d "$OUTPUT_ROOT" ] && echo OK || echo ERROR)"
+  echo "app.py:      $([ -f "$PROJECT_ROOT/app.py" ] && echo OK || echo ERROR)"
+  echo "Python:      $(python3 --version 2>/dev/null || echo ERROR)"
+  echo "Streamlit:   $(curl -so /dev/null -w '%{http_code}' http://localhost:80 2>/dev/null || echo DOWN)"
+}
+
+usage() {
+  cat <<EOF
+coberturactl — Administración de Cobertura Automática MSP
+
+Comandos:
+  status       Estado general, locks, flags, PDFs recientes
+  start        Inicia Streamlit y recuperador automático
+  stop         Parada controlada (crea stop flag, detiene servicios)
+  restart      Reinicia todo
+  logs         Últimos logs
+  logs-follow  Logs en vivo
+  health       Chequeo rápido del entorno
+  recover      Ejecuta reanudación manual una vez
+  unlock       Elimina locks huérfanos (solo si nadie los usa)
+  hard-reset   Para servicios, mata procesos colgados, reinicia
+
+Ejemplos:
+  sudo coberturactl status
+  sudo coberturactl restart
+  coberturactl logs
+EOF
+}
+
+COMMAND="${1:-}"
+case "$COMMAND" in
+  status)    show_status ;;
+  start)     start_all ;;
+  stop)      stop_all ;;
+  restart)   restart_all ;;
+  logs)      logs_all ;;
+  logs-follow) logs_follow ;;
+  recover)   recover_once ;;
+  unlock)    unlock_safe ;;
+  hard-reset) hard_reset ;;
+  health)    health ;;
+  ""|help|-h|--help) usage ;;
+  *) echo "Comando no reconocido: $COMMAND"; usage; exit 1 ;;
+esac

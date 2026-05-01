@@ -1440,11 +1440,26 @@ def generar_coberturas_automaticas_desde_mes(
                             node_stdout=error_en_pdf_detalle["stdout"],
                         )
                         break
+
+                # =========================
+                # ACTUALIZACIÓN ORACLE POR TRÁMITE
+                # Solo cuando TODOS los PDFs del trámite existen.
+                # =========================
+                todos_los_pdfs_ok = (
+                    not error_en_pdf
+                    and len(pdfs_generados) == total_pdfs_tramite
+                    and all(p.exists() and p.stat().st_size > 0 for p in pdfs_generados)
+                )
+
+                if todos_los_pdfs_ok:
                     logger.event(
                         "ORACLE_UPDATE_START",
                         index=index,
                         dig_tramite=tramite,
                         dig_id_tramite=dig_id_tramite,
+                        dig_id_generacion=id_generacion,
+                        total_pdfs_tramite=total_pdfs_tramite,
+                        pdfs_generados=len(pdfs_generados),
                         nuevo_valor="DIG_COBERTURA=S",
                     )
 
@@ -1459,6 +1474,7 @@ def generar_coberturas_automaticas_desde_mes(
                         index=index,
                         dig_tramite=tramite,
                         dig_id_tramite=dig_id_tramite,
+                        dig_id_generacion=id_generacion,
                         ok=bool(update_result.get("ok")),
                         affected=update_result.get("affected", 0),
                         error=update_result.get("error", ""),
@@ -1478,8 +1494,8 @@ def generar_coberturas_automaticas_desde_mes(
                                 "DIG_ID_GENERACION": id_generacion,
                                 "DIG_CEDULA": cedula,
                                 "DIG_FECHA_HASTA": fecha_hasta,
-                                "PDF_PATH": str(pdfs_generados[0]),
-                                "PDF_SIZE_BYTES": pdf_size,
+                                "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
+                                "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados),
                                 "ESTADO": "GENERADO_Y_ACTUALIZADO",
                                 "PASO": "OK",
                                 "ORACLE_AFFECTED": update_result.get("affected", 0),
@@ -1487,6 +1503,15 @@ def generar_coberturas_automaticas_desde_mes(
                                 "ESPERA_SEGUNDOS": "",
                                 "ERRORES_CONSECUTIVOS": "",
                                 "ERROR": "",
+                                "CEDULA_FALLIDA": "",
+                                "PDF_ESPERADO": "",
+                                "ERROR_CATEGORIA": "",
+                                "CAUSA_PROBABLE": "",
+                                "SUGERENCIA_REVISION": "",
+                                "NODE_ATTEMPTS": "",
+                                "NODE_RETURNCODE": "",
+                                "NODE_STDERR": "",
+                                "NODE_STDOUT": "",
                                 "FECHA_PROCESO": timestamp,
                             }
                         )
@@ -1502,26 +1527,69 @@ def generar_coberturas_automaticas_desde_mes(
                                     "dig_cedula": cedula,
                                     "dig_fecha_hasta": fecha_hasta,
                                     "estado": "GENERADO_Y_ACTUALIZADO",
+                                    "procesados_global": str(procesados_global),
+                                    "lote_numero": str(lote_numero),
                                 },
                             )
                     else:
                         errores += 1
                         errores_consecutivos += 1
                         err_msg = update_result.get("error") or "No se pudo actualizar Oracle"
+
                         if clave_exclusion:
                             dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
+
                         errors_list.append(
                             {
                                 "dig_tramite": tramite,
                                 "dig_id_tramite": dig_id_tramite,
-                                "cedula": error_en_pdf_detalle.get("cedula", cedula),
-                                "pdf_esperado": error_en_pdf_detalle.get("pdf_esperado", ""),
-                                "categoria": error_en_pdf_detalle.get("categoria", "ERROR_GENERANDO_PDF"),
-                                "causa": error_en_pdf_detalle.get("causa", err_msg),
-                                "sugerencia": error_en_pdf_detalle.get("sugerencia", ""),
+                                "cedula": cedula,
+                                "pdf_esperado": "",
+                                "categoria": "ERROR_ACTUALIZANDO_ORACLE",
+                                "causa": err_msg,
+                                "sugerencia": "Revisar condición del UPDATE, DIG_ID_TRAMITE, DIG_ID_GENERACION, DIG_CEDULA y estado DIG_PLANILLADO.",
                                 "error": err_msg,
                             }
                         )
+                else:
+                    errores += 1
+                    errores_consecutivos += 1
+
+                    if clave_exclusion:
+                        dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
+
+                    err_msg = error_en_pdf or "No se generaron todos los PDFs esperados del trámite."
+
+                    writer.writerow(
+                        {
+                            "RUN_ID": run_id,
+                            "FE_PLA_ANIOMES": fe_pla,
+                            "DIG_TRAMITE": tramite,
+                            "DIG_ID_TRAMITE": dig_id_tramite,
+                            "DIG_ID_GENERACION": id_generacion,
+                            "DIG_CEDULA": cedula,
+                            "DIG_FECHA_HASTA": fecha_hasta,
+                            "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
+                            "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados) if pdfs_generados else 0,
+                            "ESTADO": "NO_ACTUALIZADO_PDFS_INCOMPLETOS",
+                            "PASO": "ERROR",
+                            "ORACLE_AFFECTED": 0,
+                            "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
+                            "ESPERA_SEGUNDOS": "",
+                            "ERRORES_CONSECUTIVOS": errores_consecutivos,
+                            "ERROR": err_msg,
+                            "CEDULA_FALLIDA": error_en_pdf_detalle.get("cedula", ""),
+                            "PDF_ESPERADO": error_en_pdf_detalle.get("pdf_esperado", ""),
+                            "ERROR_CATEGORIA": error_en_pdf_detalle.get("categoria", "PDFS_INCOMPLETOS"),
+                            "CAUSA_PROBABLE": error_en_pdf_detalle.get("causa", err_msg),
+                            "SUGERENCIA_REVISION": error_en_pdf_detalle.get("sugerencia", ""),
+                            "NODE_ATTEMPTS": error_en_pdf_detalle.get("attempts", ""),
+                            "NODE_RETURNCODE": error_en_pdf_detalle.get("returncode", ""),
+                            "NODE_STDERR": error_en_pdf_detalle.get("stderr", ""),
+                            "NODE_STDOUT": error_en_pdf_detalle.get("stdout", ""),
+                            "FECHA_PROCESO": timestamp,
+                        }
+                    )
 
                 if index < total:
                     try:
