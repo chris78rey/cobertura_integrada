@@ -130,4 +130,27 @@ def job_debe_reanudarse() -> bool:
     }:
         return False
 
+    # Backoff: no despertar demasiado seguido
+    updated_at = estado.get("updated_at", "")
+    if updated_at:
+        try:
+            from datetime import datetime
+            ultima = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+            segundos = (datetime.now() - ultima).total_seconds()
+
+            if status in ("RUNNING", "RUNNING_BY_WORKER"):
+                if segundos < 60:
+                    return False
+            elif status == "RETRY_PENDING":
+                if segundos < 60:
+                    return False
+            elif status == "RETRY_PENDING_SLOW":
+                if segundos < 600:  # 10 minutos
+                    return False
+            elif status == "WAITING_OTHER_PROCESS":
+                if segundos < 120:
+                    return False
+        except (ValueError, ImportError):
+            pass
+
     return True

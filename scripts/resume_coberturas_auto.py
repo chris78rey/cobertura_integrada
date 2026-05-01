@@ -29,6 +29,29 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _limpiar_logs_antiguos() -> None:
+    """Retención automática: 30 días JSONL, 90 días CSV sync, 90 días SQLite."""
+    logs_dir = PROJECT_ROOT / "logs"
+    ahora = __import__("time").time()
+    dia = 86400
+
+    # JSONL: 30 días
+    for f in logs_dir.glob("cobertura_auto_*.jsonl"):
+        if ahora - f.stat().st_mtime > 30 * dia:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    # CSV sync: 90 días
+    for f in logs_dir.glob("cobertura_repo_sync_*.csv"):
+        if ahora - f.stat().st_mtime > 90 * dia:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+
 def contar_pendientes(
     username: str,
     password: str,
@@ -136,6 +159,9 @@ def main() -> int:
 
     import os
 
+    # Retención automática de logs: limpiar cada vez que corre el worker
+    _limpiar_logs_antiguos()
+
     if not job_debe_reanudarse():
         log("[INFO] No hay trabajo pendiente para reanudar.")
         return 0
@@ -170,6 +196,9 @@ def main() -> int:
     )
 
     log(f"[INFO] Pendientes antes de reanudar: {pendientes_antes}")
+
+    # Sync solo si es la primera corrida después de generar o si hay trámites nuevos
+    sync_ejecutado = False
 
     if pendientes_antes <= 0:
         marcar_job_completado("No quedan pendientes.")
@@ -240,7 +269,10 @@ def main() -> int:
 
     log(f"[INFO] Pendientes después de ejecutar: {pendientes_despues}")
 
-    ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
+    # Sync solo si este worker procesó algo o es la última pasada
+    if pendientes_despues == 0 or not sync_ejecutado:
+        ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
+        sync_ejecutado = True
 
     if pendientes_despues <= 0:
         marcar_job_completado("Proceso terminado automáticamente.")
