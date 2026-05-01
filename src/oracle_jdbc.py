@@ -202,6 +202,7 @@ def actualizar_cobertura_por_id_tramite(
     dig_id_tramite: str,
     dig_id_generacion: str = "",
     dig_cedula: str = "",
+    dig_tramite: str = "",
 ) -> dict:
     """
     Actualiza DIG_COBERTURA='S' solo si está en 'N' y DIG_PLANILLADO='S'.
@@ -216,6 +217,7 @@ def actualizar_cobertura_por_id_tramite(
     dig_id_tramite = str(dig_id_tramite or "").strip()
     dig_id_generacion = str(dig_id_generacion or "").strip()
     dig_cedula = str(dig_cedula or "").strip()
+    dig_tramite = str(dig_tramite or "").strip()
 
     if dig_id_tramite:
         sql = """
@@ -237,6 +239,19 @@ def actualizar_cobertura_por_id_tramite(
               AND TRIM(DIG_PLANILLADO) = 'S'
         """
         params = [dig_id_generacion, dig_cedula]
+    elif dig_cedula:
+        # Último recurso: ni DIG_ID_TRAMITE ni DIG_ID_GENERACION existen.
+        # Se usa DIG_TRAMITE + DIG_CEDULA + las condiciones de seguridad.
+        sql = """
+            UPDATE DIGITALIZACION.DIGITALIZACION
+            SET DIG_COBERTURA = 'S'
+            WHERE TO_CHAR(DIG_TRAMITE) = ?
+              AND DIG_CEDULA = ?
+              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+              AND TRIM(DIG_PLANILLADO) = 'S'
+              AND ROWNUM = 1
+        """
+        params = [dig_tramite, dig_cedula]
     else:
         return {
             "ok": False,

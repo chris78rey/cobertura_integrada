@@ -26,6 +26,12 @@ from src.auto_resume_state import (
     marcar_job_reintento,
     marcar_job_detenido_por_usuario,
 )
+from src.operator_tools import (
+    leer_estado_operador,
+    destrabar_para_reintento,
+    pausar_reintento_automatico,
+    exportar_estado_json,
+)
 
 
 def _reset_all():
@@ -163,42 +169,25 @@ def _render_css():
 
 def _render_config_section() -> str | None:
     """
-    Renderiza la sección de configuración de directorio de salida.
-    Devuelve la ruta válida actual o None si hay error.
+    Muestra la ruta oficial de salida.
+
+    La ruta no se edita desde pantalla para evitar que un operador
+    cambie accidentalmente el destino de los PDFs.
     """
-    config = leer_config()
-    ruta_actual = config.get("pdf_output_dir", "/home/crrb/coberturas_generadas/")
+    ruta_actual = obtener_pdf_output_dir()
 
     st.markdown("### Configuración de salida de PDFs")
 
-    nueva_ruta = st.text_input(
-        "Directorio de salida",
-        value=ruta_actual,
-        key="pdf_output_dir_input",
+    st.info(
+        "La ruta de salida está protegida y no puede modificarse desde la pantalla."
     )
 
-    guardar = st.button(
-        "Guardar ruta",
-        key="guardar_ruta_button",
-        use_container_width=True,
-    )
+    st.code(str(ruta_actual), language="text")
 
-    if guardar:
-        resultado = validar_directorio_salida(nueva_ruta)
-
-        if resultado["ok"]:
-            guardar_config({"pdf_output_dir": str(resultado["path"])})
-            st.success(f"Ruta guardada: {resultado['path']}")
-            return str(resultado["path"])
-        else:
-            st.error(resultado["error"])
-            return None
-
-    validacion = validar_directorio_salida(nueva_ruta)
+    validacion = validar_directorio_salida(str(ruta_actual))
 
     if not validacion["ok"]:
-        st.warning(validacion["error"])
-        st.caption("Corrija la ruta antes de generar coberturas.")
+        st.error(validacion["error"])
         return None
 
     return str(validacion["path"])
@@ -600,6 +589,116 @@ def _validar_fe_pla_aniomes_desde(valor: str) -> tuple[bool, str, str]:
     return True, mes, ""
 
 
+def _render_operator_panel():
+    st.markdown("---")
+    st.markdown("### 🛠️ Panel de operación segura")
+
+    estado = leer_estado_operador()
+
+    cuarentena_count = int(estado.get("quarantine_count", 0))
+    stop_flag = bool(estado.get("stop_flag"))
+    gen_lock = estado.get("generation_lock", {})
+    sync_lock = estado.get("sync_lock", {})
+    job = estado.get("job", {})
+
+    lock_activo = bool(gen_lock.get("held") or sync_lock.get("held"))
+    lock_huerfano = bool(gen_lock.get("orphan") or sync_lock.get("orphan"))
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+
+    with col_a:
+        st.metric("Cuarentena", cuarentena_count)
+    with col_b:
+        st.metric("Parada", "Activa" if stop_flag else "Inactiva")
+    with col_c:
+        if lock_activo:
+            st.metric("Proceso", "Trabajando")
+        elif lock_huerfano:
+            st.metric("Proceso", "Bloq. huérfano")
+        else:
+            st.metric("Proceso", "Libre")
+    with col_d:
+        st.metric("Reintento", str(job.get("status", "Sin estado")))
+
+    if lock_activo:
+        st.info(
+            "Hay un proceso activo. No se debe destrabar todavía. "
+            "Si los PDFs siguen apareciendo, el sistema está trabajando."
+        )
+    elif cuarentena_count > 0:
+        st.warning(
+            "Hay trámites en cuarentena temporal. Si el proceso no avanza, "
+            "podés liberar la cuarentena y permitir un nuevo intento."
+        )
+    elif lock_huerfano:
+        st.warning("Existe un bloqueo huérfano. Esto puede ocurrir tras un corte inesperado.")
+    elif stop_flag:
+        st.warning("La bandera de parada está activa. El proceso no tomará nuevos registros.")
+    else:
+        st.success("El estado operativo no muestra bloqueos críticos.")
+
+    with st.expander("Ver trámites en cuarentena", expanded=cuarentena_count > 0):
+        rows = estado.get("quarantine_rows", [])
+        if rows:
+            df = pd.DataFrame(rows)
+            columnas = ["tramite", "minutos_restantes", "retry_count", "motivo", "created_at_local", "expires_at_local", "clave"]
+            columnas_existentes = [c for c in columnas if c in df.columns]
+            st.dataframe(df[columnas_existentes], use_container_width=True, hide_index=True)
+        else:
+            st.caption("No hay trámites en cuarentena activa.")
+
+    with st.expander("Ver estado interno", expanded=False):
+        st.json(job)
+
+    with st.expander("Ver últimos eventos técnicos", expanded=False):
+        errores = estado.get("last_errors", [])
+        if errores:
+            st.code("\n".join(errores[-40:]), language="text")
+        else:
+            st.caption("No hay errores recientes relevantes.")
+
+    st.markdown("#### Acciones seguras")
+    st.caption(
+        "Estas acciones no borran PDFs, no modifican Oracle y no matan procesos activos. "
+        "Solo liberan bloqueos temporales de la aplicación."
+    )
+
+    confirmar = st.checkbox(
+        "Confirmo que el proceso no está avanzando y deseo liberar bloqueos temporales",
+        key="confirmar_destrabe_seguro",
+    )
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        if st.button(
+            "Liberar cuarentena y permitir reintento",
+            key="btn_destrabar_reintento_seguro",
+            use_container_width=True,
+            disabled=not confirmar or lock_activo,
+        ):
+            resultado = destrabar_para_reintento()
+            if resultado.get("ok"):
+                st.success("Listo. Se liberó cuarentena, se limpió parada y se habilitó reintento.")
+            else:
+                st.warning("No se habilitó reintento porque hay un proceso activo.")
+            st.json(resultado)
+            st.rerun()
+
+    with col2:
+        if st.button(
+            "Pausar reintento automático",
+            key="btn_pausar_reintento_auto",
+            use_container_width=True,
+        ):
+            pausar_reintento_automatico()
+            st.warning("Reintento automático pausado.")
+            st.rerun()
+
+    with st.expander("Copiar diagnóstico para soporte", expanded=False):
+        st.code(exportar_estado_json(), language="json")
+
+
 def dashboard_page():
     _init_state()
     _render_css()
@@ -847,7 +946,21 @@ def dashboard_page():
 
             progress_widget.progress(100)
 
-            if result.get("total", 0) <= 0 or result.get("sin_pendientes"):
+            if result.get("solo_cuarentena"):
+                status_box.markdown(
+                    """
+                    <div class="status-info">
+                        Los pendientes actuales están en cuarentena temporal.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.info(
+                    "Oracle todavía reporta pendientes, pero la aplicación no los retomó porque están en cuarentena temporal. "
+                    "Esto evita repetir trámites fallidos y permite que el proceso avance con registros nuevos cuando existan."
+                )
+
+            elif result.get("total", 0) <= 0 or result.get("sin_pendientes"):
                 status_box.markdown(
                     """
                     <div class="status-warn">
@@ -917,6 +1030,8 @@ def dashboard_page():
                 st.code(mensaje_error, language="text")
 
     _render_auto_result()
+
+    _render_operator_panel()
 
     st.markdown("</div>", unsafe_allow_html=True)
 

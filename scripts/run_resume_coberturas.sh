@@ -5,7 +5,9 @@ cd /data_nuevo/cobertura_integrada
 
 export JAVA_TOOL_OPTIONS="-Doracle.jdbc.timezoneAsRegion=false"
 
-if [ -x "venv/bin/python" ]; then
+if [ -x ".venv/bin/python" ]; then
+  PYTHON=".venv/bin/python"
+elif [ -x "venv/bin/python" ]; then
   PYTHON="venv/bin/python"
 else
   PYTHON="/usr/bin/python3"

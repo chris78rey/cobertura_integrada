@@ -144,7 +144,8 @@ def main() -> int:
 
     fe_pla_aniomes_desde = str(estado.get("fe_pla_aniomes_desde", "")).strip()
     dig_tramite = str(estado.get("dig_tramite", "") or "").strip()
-    output_dir = str(estado.get("output_dir", "/data_nuevo/coberturas")).strip()
+    # Ruta oficial fija. No se toma desde estado para evitar rutas antiguas o manipuladas.
+    output_dir = "/data_nuevo/coberturas"
 
     username = os.environ.get("ORACLE_AUTO_USER", "").strip()
     password = os.environ.get("ORACLE_AUTO_PASSWORD", "").strip()
@@ -181,6 +182,7 @@ def main() -> int:
             "enabled": True,
             "status": "RUNNING_BY_WORKER",
             "last_error": "",
+            "retry_count": 0,
             "pendientes_antes": pendientes_antes,
         }
     )
@@ -198,14 +200,30 @@ def main() -> int:
         log(f"[INFO] Resultado generación: {result}")
 
     except ProcesoCoberturaYaEnEjecucion as exc:
-        guardar_estado_job(
-            {
-                "enabled": True,
-                "status": "WAITING_OTHER_PROCESS",
-                "last_error": str(exc),
-            }
-        )
-        log(f"[INFO] {exc}")
+        estado = leer_estado_job()
+        retries = int(estado.get("retry_count", 0)) + 1
+
+        if retries >= 5:
+            guardar_estado_job(
+                {
+                    "enabled": True,
+                    "status": "RETRY_PENDING_SLOW",
+                    "last_error": str(exc),
+                    "retry_count": retries,
+                    "detalle": "Lock ocupado 5 veces consecutivas. Se mantiene en reintento lento.",
+                }
+            )
+            log(f"[INFO] Lock ocupado {retries} veces. Reintento lento.")
+        else:
+            guardar_estado_job(
+                {
+                    "enabled": True,
+                    "status": "WAITING_OTHER_PROCESS",
+                    "last_error": str(exc),
+                    "retry_count": retries,
+                }
+            )
+            log(f"[INFO] Lock ocupado (intento {retries}/5). Se reintentará.")
         return 0
 
     except Exception as exc:
@@ -234,6 +252,7 @@ def main() -> int:
                 "status": "RETRY_PENDING",
                 "pendientes_despues": pendientes_despues,
                 "last_error": "",
+                "retry_count": 0,
             }
         )
         log("[INFO] Aún quedan pendientes. El timer volverá a ejecutar.")

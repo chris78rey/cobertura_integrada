@@ -72,13 +72,31 @@ def marcar_job_completado(detalle: str = "") -> None:
 
 
 def marcar_job_reintento(error: str) -> None:
-    guardar_estado_job(
-        {
-            "enabled": True,
-            "status": "RETRY_PENDING",
-            "last_error": str(error),
-        }
-    )
+    estado = leer_estado_job()
+    retries = int(estado.get("retry_count", 0)) + 1
+
+    if retries >= 5:
+        guardar_estado_job(
+            {
+                "enabled": True,
+                "status": "RETRY_PENDING_SLOW",
+                "last_error": str(error),
+                "retry_count": retries,
+                "detalle": (
+                    "Se alcanzaron 5 reintentos. No se abandona el proceso; "
+                    "queda en reintento lento para operación autónoma."
+                ),
+            }
+        )
+    else:
+        guardar_estado_job(
+            {
+                "enabled": True,
+                "status": "RETRY_PENDING",
+                "last_error": str(error),
+                "retry_count": retries,
+            }
+        )
 
 
 def marcar_job_detenido_por_usuario() -> None:
@@ -101,9 +119,15 @@ def job_debe_reanudarse() -> bool:
     if not estado.get("enabled"):
         return False
 
-    return estado.get("status") in {
+    status = estado.get("status", "")
+
+    if status not in {
         "RUNNING",
         "RETRY_PENDING",
+        "RETRY_PENDING_SLOW",
         "RUNNING_BY_WORKER",
         "WAITING_OTHER_PROCESS",
-    }
+    }:
+        return False
+
+    return True

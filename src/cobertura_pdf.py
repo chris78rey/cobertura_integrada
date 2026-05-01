@@ -829,13 +829,35 @@ def _obtener_registros_automaticos(
 
     dig_tramite = _validar_dig_tramite_opcional(dig_tramite)
 
+    # INICIO NUEVO: exclusión segura de cuarentena
     excluir_dig_id_tramite = excluir_dig_id_tramite or set()
-    excluir_lista = [str(x).strip() for x in excluir_dig_id_tramite if str(x).strip()]
 
-    # Protección Oracle: NOT IN no debe crecer sin control.
-    # Como los registros exitosos cambian a DIG_COBERTURA='S',
-    # normalmente aquí solo entran los fallidos de esta corrida.
-    excluir_lista = excluir_lista[:900]
+    excluir_lista_raw = [
+        str(x).strip()
+        for x in excluir_dig_id_tramite
+        if str(x).strip()
+    ]
+
+    excluir_lista: list[str] = []
+    vistos: set[str] = set()
+
+    for item in excluir_lista_raw:
+        if item not in vistos:
+            excluir_lista.append(item)
+            vistos.add(item)
+
+    # Claves reales de DIG_ID_TRAMITE
+    excluir_ids = [
+        x for x in excluir_lista
+        if not x.startswith("GEN_")
+    ][:450]
+
+    # Claves alternativas cuando DIG_ID_TRAMITE no existe
+    excluir_gen = [
+        x for x in excluir_lista
+        if x.startswith("GEN_")
+    ][:450]
+    # FIN NUEVO
 
     sql = """
         SELECT *
@@ -870,12 +892,33 @@ def _obtener_registros_automaticos(
         """
         params.append(dig_tramite)
 
-    if excluir_lista:
-        placeholders = ",".join(["?"] * len(excluir_lista))
+    # INICIO NUEVO: no excluir accidentalmente registros con DIG_ID_TRAMITE NULL
+    if excluir_ids:
+        placeholders_ids = ",".join(["?"] * len(excluir_ids))
+
         sql += f"""
-              AND TO_CHAR(DIG_ID_TRAMITE) NOT IN ({placeholders})
+              AND (
+                    DIG_ID_TRAMITE IS NULL
+                    OR TRIM(TO_CHAR(DIG_ID_TRAMITE)) NOT IN ({placeholders_ids})
+                  )
         """
-        params.extend(excluir_lista)
+
+        params.extend(excluir_ids)
+
+    if excluir_gen:
+        placeholders_gen = ",".join(["?"] * len(excluir_gen))
+
+        sql += f"""
+              AND (
+                    DIG_ID_TRAMITE IS NOT NULL
+                    OR (
+                        'GEN_' || NVL(TRIM(TO_CHAR(DIG_ID_GENERACION)), '') NOT IN ({placeholders_gen})
+                    )
+                  )
+        """
+
+        params.extend(excluir_gen)
+    # FIN NUEVO
 
     sql += """
             ORDER BY FE_PLA_ANIOMES, DIG_TRAMITE, DIG_ID_TRAMITE
@@ -1079,6 +1122,14 @@ def generar_coberturas_automaticas_desde_mes(
 
     from src.oracle_jdbc import actualizar_cobertura_por_id_tramite
     from src.observability import RunLogger, build_run_id, mask_cedula
+    from src.quarantine import (
+        obtener_claves_en_cuarentena,
+        poner_en_cuarentena,
+        limpiar_cuarentena_expirada,
+        contar_en_cuarentena,
+        segundos_hasta_proxima_expiracion,
+        resumen_cuarentena_activa,
+    )
 
     run_id = build_run_id("cobertura_auto")
     logger = RunLogger(run_id)
@@ -1138,6 +1189,12 @@ def generar_coberturas_automaticas_desde_mes(
     lote_numero = 0
     rondas_vacias = 0
     dig_id_tramite_fallidos_en_corrida: set[str] = set()
+    limpiar_cuarentena_expirada()
+    cuarentena_inicial = contar_en_cuarentena()
+    logger.event(
+        "QUARANTINE_INITIAL",
+        en_cuarentena=cuarentena_inicial,
+    )
 
     with manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(
@@ -1193,12 +1250,15 @@ def generar_coberturas_automaticas_desde_mes(
             )
 
             try:
+                # Combinar exclusión en memoria con cuarentena persistente
+                exclusion_total = dig_id_tramite_fallidos_en_corrida | obtener_claves_en_cuarentena()
+
                 registros = _obtener_registros_automaticos(
                     username=username,
                     password=password,
                     fe_pla_aniomes_desde=fe_pla_aniomes_desde,
                     dig_tramite=dig_tramite,
-                    excluir_dig_id_tramite=dig_id_tramite_fallidos_en_corrida,
+                    excluir_dig_id_tramite=exclusion_total,
                     batch_size=batch_size,
                 )
             except Exception as exc:
@@ -1215,6 +1275,64 @@ def generar_coberturas_automaticas_desde_mes(
             total = len(registros)
 
             if pendientes_previo > 0 and total == 0:
+                en_cuarentena_actual = contar_en_cuarentena()
+                excluidos_en_memoria = len(dig_id_tramite_fallidos_en_corrida)
+
+                if en_cuarentena_actual > 0 or excluidos_en_memoria > 0:
+                    resumen_q = resumen_cuarentena_activa()
+
+                    espera_cuarentena = min(
+                        max(1, segundos_hasta_proxima_expiracion(default_segundos=30)),
+                        30,
+                    )
+
+                    logger.event(
+                        "DB_ONLY_QUARANTINED_WAITING_AUTONOMOUS",
+                        pendientes_oracle=pendientes_previo,
+                        en_cuarentena=en_cuarentena_actual,
+                        excluidos_en_memoria=excluidos_en_memoria,
+                        espera_segundos=espera_cuarentena,
+                        resumen_cuarentena=resumen_q,
+                        mensaje=(
+                            "Oracle reporta pendientes, pero los candidatos actuales están "
+                            "temporalmente excluidos. El proceso esperará y volverá a consultar "
+                            "sin intervención manual."
+                        ),
+                    )
+
+                    if progress_callback:
+                        progress_callback(
+                            procesados_global,
+                            max(pendientes_previo, 1),
+                            {
+                                "fe_pla_aniomes": fe_pla_aniomes_desde,
+                                "dig_tramite": "",
+                                "dig_cedula": "",
+                                "dig_fecha_hasta": "",
+                                "estado": (
+                                    "Pendientes en cuarentena temporal. "
+                                    f"Reintentando automáticamente en {espera_cuarentena}s..."
+                                ),
+                                "procesados_global": str(procesados_global),
+                                "lote_numero": str(lote_numero),
+                            },
+                        )
+
+                    inicio_espera_cuarentena = time.monotonic()
+
+                    while time.monotonic() - inicio_espera_cuarentena < espera_cuarentena:
+                        if _get_stop_flag().exists():
+                            break
+                        time.sleep(0.5)
+
+                    limpiar_cuarentena_expirada()
+                    dig_id_tramite_fallidos_en_corrida.clear()
+
+                    if _get_stop_flag().exists():
+                        break
+
+                    continue
+
                 raise RuntimeError(
                     "Inconsistencia crítica: Oracle reporta pendientes, pero la consulta de trabajo devolvió 0 registros. "
                     f"Pendientes detectados por la app: {pendientes_previo}. "
@@ -1467,6 +1585,7 @@ def generar_coberturas_automaticas_desde_mes(
                         username, password, dig_id_tramite,
                         dig_id_generacion=id_generacion,
                         dig_cedula=cedula,
+                        dig_tramite=tramite,
                     )
 
                     logger.event(
@@ -1538,6 +1657,7 @@ def generar_coberturas_automaticas_desde_mes(
 
                         if clave_exclusion:
                             dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
+                            poner_en_cuarentena(clave_exclusion, tramite, err_msg)
 
                         errors_list.append(
                             {
@@ -1557,6 +1677,7 @@ def generar_coberturas_automaticas_desde_mes(
 
                     if clave_exclusion:
                         dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
+                        poner_en_cuarentena(clave_exclusion, tramite, err_msg or "PDFs incompletos")
 
                     err_msg = error_en_pdf or "No se generaron todos los PDFs esperados del trámite."
 

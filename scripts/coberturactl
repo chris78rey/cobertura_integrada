@@ -119,12 +119,33 @@ stop_all() {
   title "PARADA CONTROLADA"
   mkdir -p "$(dirname "$STOP_FLAG")"
   touch "$STOP_FLAG"
-  echo "Bandera creada"
+  echo "Bandera creada: $STOP_FLAG"
 
+  echo ""
+  echo "Deteniendo recuperador automático..."
   systemctl stop "$RESUME_TIMER" 2>/dev/null || true
   systemctl stop "$RESUME_SERVICE" 2>/dev/null || true
+
+  echo ""
+  echo "Deteniendo Streamlit..."
   systemctl stop "$STREAMLIT_SERVICE" 2>/dev/null || true
-  echo "Servicios detenidos"
+
+  echo ""
+  echo "Esperando liberación del lock..."
+  sleep 5
+
+  if [ -f "$GEN_LOCK" ] && lsof "$GEN_LOCK" >/dev/null 2>&1; then
+    echo ""
+    echo "ATENCIÓN: todavía hay un proceso usando el lock:"
+    lsof "$GEN_LOCK" || true
+    echo ""
+    echo "Si no hay PDFs nuevos, usar:"
+    echo "  sudo coberturactl hard-reset"
+  else
+    echo "Lock de generación libre."
+  fi
+
+  show_status
 }
 
 restart_all() {
@@ -250,6 +271,9 @@ Comandos:
   recover      Ejecuta reanudación manual una vez
   unlock       Elimina locks huérfanos (solo si nadie los usa)
   hard-reset   Para servicios, mata procesos colgados, reinicia
+  pause-auto   Pausa solo el recuperador automático
+  resume-auto  Reactiva el recuperador automático
+  clear-stop   Elimina la bandera de parada
 
 Ejemplos:
   sudo coberturactl status
@@ -269,6 +293,9 @@ case "$COMMAND" in
   recover)   recover_once ;;
   unlock)    unlock_safe ;;
   hard-reset) hard_reset ;;
+  pause-auto) systemctl stop cobertura-auto-resume.timer 2>/dev/null; echo "Recuperador pausado" ;;
+  resume-auto) systemctl start cobertura-auto-resume.timer 2>/dev/null; echo "Recuperador activado" ;;
+  clear-stop) rm -f /data_nuevo/cobertura_integrada/config/stop_cobertura.flag; echo "Bandera eliminada" ;;
   health)    health ;;
   ""|help|-h|--help) usage ;;
   *) echo "Comando no reconocido: $COMMAND"; usage; exit 1 ;;
