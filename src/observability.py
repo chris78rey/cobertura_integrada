@@ -43,15 +43,27 @@ class RunLogger:
         self.jsonl_path = self.log_dir / f"{run_id}.jsonl"
         self.error_path = self.log_dir / f"{run_id}_errors.jsonl"
 
+    def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
     def event(self, event: str, **data: Any) -> None:
+        safe_data = dict(data)
+        safe_data.pop("event", None)
+        safe_data.pop("ts", None)
+        safe_data.pop("run_id", None)
+
         payload = {
             "ts": now_iso(),
             "run_id": self.run_id,
             "event": event,
-            **data,
+            **safe_data,
         }
-        with self.jsonl_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        self._append_jsonl(self.jsonl_path, payload)
 
     def error(self, event: str, exc: Exception | str, **data: Any) -> None:
         if isinstance(exc, Exception):
@@ -63,6 +75,14 @@ class RunLogger:
             error_type = "ERROR"
             trace = ""
 
+        safe_data = dict(data)
+        safe_data.pop("event", None)
+        safe_data.pop("ts", None)
+        safe_data.pop("run_id", None)
+        safe_data.pop("error", None)
+        safe_data.pop("error_type", None)
+        safe_data.pop("traceback", None)
+
         payload = {
             "ts": now_iso(),
             "run_id": self.run_id,
@@ -70,11 +90,11 @@ class RunLogger:
             "error_type": error_type,
             "error": error_message,
             "traceback": trace,
-            **data,
+            **safe_data,
         }
-        with self.error_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
-        self.event(event, **payload)
+
+        self._append_jsonl(self.error_path, payload)
+        self._append_jsonl(self.jsonl_path, payload)
 
     def paths(self) -> dict[str, str]:
         return {

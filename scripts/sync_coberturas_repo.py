@@ -709,6 +709,11 @@ def main() -> int:
         print(f"SYNC_YA_EN_EJECUCION: {exc}")
         return 10
 
+    # Si se procesó un trámite específico y hubo fallidos, retornar 20
+    if tramite and totales.get("fallidos", 0) > 0:
+        print("SYNC_CON_FALLIDOS_TRAMITE_ESPECIFICO")
+        return 20
+
     return 0
 
 

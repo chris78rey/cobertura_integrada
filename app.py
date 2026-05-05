@@ -6,11 +6,11 @@
 import os
 
 import streamlit as st
-
 from dotenv import load_dotenv
 
 from src.oracle_jdbc import test_login
 from src.pages.dashboard import dashboard_page
+from src.pages.cedulas_tramite import cedulas_tramite_page
 from src.ui import inject_global_css
 
 
@@ -53,7 +53,18 @@ def _auto_login():
 def main():
     inject_global_css()
     _auto_login()
-    dashboard_page()
+
+    pagina = st.radio(
+        "",
+        ["🏥 Coberturas automáticas", "📝 Corrección de cédulas"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if pagina == "📝 Corrección de cédulas":
+        cedulas_tramite_page()
+    else:
+        dashboard_page()
 
 
 if __name__ == "__main__":

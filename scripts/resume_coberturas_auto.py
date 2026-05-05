@@ -17,6 +17,10 @@ from src.auto_resume_state import (  # noqa: E402
     guardar_estado_job,
     marcar_job_completado,
     marcar_job_reintento,
+    marcar_job_vigilando_sin_pendientes,
+    obtener_tramites_sync_pendientes,
+    marcar_tramite_sync_ok,
+    marcar_tramite_sync_error,
 )
 from src.cobertura_runner import (  # noqa: E402
     ejecutar_coberturas_con_lock,
@@ -30,265 +34,244 @@ def log(msg: str) -> None:
 
 
 def _limpiar_logs_antiguos() -> None:
-    """Retención automática: 30 días JSONL, 90 días CSV sync, 90 días SQLite."""
     logs_dir = PROJECT_ROOT / "logs"
     ahora = __import__("time").time()
     dia = 86400
-
-    # JSONL: 30 días
     for f in logs_dir.glob("cobertura_auto_*.jsonl"):
-        if ahora - f.stat().st_mtime > 30 * dia:
-            try:
+        try:
+            if ahora - f.stat().st_mtime > 30 * dia:
                 f.unlink()
-            except Exception:
-                pass
-
-    # CSV sync: 90 días
+        except Exception:
+            pass
     for f in logs_dir.glob("cobertura_repo_sync_*.csv"):
-        if ahora - f.stat().st_mtime > 90 * dia:
-            try:
+        try:
+            if ahora - f.stat().st_mtime > 90 * dia:
                 f.unlink()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
-def contar_pendientes(
-    username: str,
-    password: str,
-    fe_pla_aniomes_desde: str,
-    dig_tramite: str = "",
-) -> int:
+def _es_modo_vigilante(dig_tramite: str) -> bool:
+    return not str(dig_tramite or "").strip()
+
+
+def contar_pendientes(username: str, password: str, fe_pla_aniomes_desde: str, dig_tramite: str = "") -> int:
     conn = None
     ps = None
     rs = None
-
-    sql = """
-        SELECT COUNT(*)
-        FROM DIGITALIZACION.DIGITALIZACION
-        WHERE TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
-          AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
-          AND TRIM(DIG_PLANILLADO) = 'S'
-    """
-
+    sql = """SELECT COUNT(*) FROM DIGITALIZACION.DIGITALIZACION
+        WHERE TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ? AND NVL(TRIM(DIG_COBERTURA),'N')='N' AND TRIM(DIG_PLANILLADO)='S'"""
     params = [fe_pla_aniomes_desde]
-
     if dig_tramite:
         sql += " AND TO_CHAR(DIG_TRAMITE) = ?"
         params.append(dig_tramite)
-
     try:
         conn = oracle_connect(username, password)
-        java_conn = conn.jconn
-
-        ps = java_conn.prepareStatement(sql)
-
-        for index, value in enumerate(params, start=1):
-            ps.setString(index, str(value))
-
+        ps = conn.jconn.prepareStatement(sql)
+        for i, v in enumerate(params, start=1):
+            ps.setString(i, str(v))
         ps.setQueryTimeout(60)
         rs = ps.executeQuery()
-
         if rs.next():
             return int(rs.getLong(1))
-
         return 0
-
     finally:
-        if rs:
-            try:
-                rs.close()
-            except Exception:
-                pass
-
-        if ps:
-            try:
-                ps.close()
-            except Exception:
-                pass
-
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        for obj in (rs, ps, conn):
+            if obj:
+                try: obj.close()
+                except Exception: pass
 
 
-def ejecutar_sync_repo(output_dir: str, dig_tramite: str = "") -> None:
+def ejecutar_sync_repo(output_dir: str, dig_tramite: str = "") -> dict:
     script = PROJECT_ROOT / "scripts" / "sync_coberturas_repo.py"
-
     if not script.exists():
-        log(f"[WARN] No existe script de sync: {script}")
-        return
-
-    cmd = [
-        sys.executable,
-        str(script),
-        "--origen-root",
-        output_dir,
-        "--repo-root",
-        "/data_nuevo/repo_grande/data/datos",
-        "--logs-dir",
-        str(PROJECT_ROOT / "logs"),
-        "--state-db",
-        str(PROJECT_ROOT / "logs" / "cobertura_repo_sync.sqlite"),
-        "--apply",
-    ]
-
+        msg = f"No existe script de sync: {script}"
+        log(f"[WARN] {msg}")
+        return {"ok": False, "already_running": False, "returncode": -1, "stdout": "", "error": msg}
+    cmd = [sys.executable, str(script), "--origen-root", output_dir,
+           "--repo-root", "/data_nuevo/repo_grande/data/datos",
+           "--logs-dir", str(PROJECT_ROOT / "logs"),
+           "--state-db", str(PROJECT_ROOT / "logs" / "cobertura_repo_sync.sqlite"), "--apply"]
     if dig_tramite:
         cmd.extend(["--tramite", dig_tramite])
-
     log("[INFO] Ejecutando sync al repositorio oficial...")
-    completed = subprocess.run(
-        cmd,
-        cwd=str(PROJECT_ROOT),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=1800,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(cmd, cwd=str(PROJECT_ROOT), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800, check=False)
+        stdout = completed.stdout or ""
+        log(stdout)
+        if completed.returncode != 0:
+            log(f"[WARN] Sync terminó con código {completed.returncode}")
+        return {"ok": completed.returncode == 0, "already_running": completed.returncode == 10,
+                "returncode": completed.returncode, "stdout": stdout,
+                "error": "" if completed.returncode == 0 else stdout[-2000:]}
+    except subprocess.TimeoutExpired as exc:
+        msg = f"Timeout ejecutando sync: {exc}"
+        log(f"[ERROR] {msg}")
+        return {"ok": False, "already_running": False, "returncode": -2, "stdout": "", "error": msg}
+    except Exception as exc:
+        msg = f"Error ejecutando sync: {exc}"
+        log(f"[ERROR] {msg}")
+        return {"ok": False, "already_running": False, "returncode": -3, "stdout": "", "error": msg}
 
-    log(completed.stdout or "")
 
-    if completed.returncode != 0:
-        log(f"[WARN] Sync terminó con código {completed.returncode}")
+def _marcar_sync_pendiente(detalle: str, error: str = "") -> None:
+    guardar_estado_job({"enabled": True, "status": "WATCHING_NO_PENDING",
+                        "sync_pending": True, "last_error": error, "retry_count": 0, "detalle": detalle})
 
 
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
-
     import os
-
-    # Retención automática de logs: limpiar cada vez que corre el worker
     _limpiar_logs_antiguos()
 
+    # Procesar cola de sync pendiente SIEMPRE, independiente del estado del job
+    pendientes_sync = obtener_tramites_sync_pendientes(limit=500)
+    if pendientes_sync:
+        log(f"[INFO] Cola de sync pendiente: {len(pendientes_sync)} trámites")
+        for item in pendientes_sync:
+            t = item["tramite"]
+            log(f"[INFO] Sincronizando trámite {t} desde cola pendiente...")
+            sync_result = ejecutar_sync_repo(output_dir="/data_nuevo/coberturas", dig_tramite=t)
+            if sync_result.get("ok") and sync_result.get("returncode") == 0:
+                marcar_tramite_sync_ok(t)
+                log(f"[INFO] Sync OK para {t}")
+            elif sync_result.get("returncode") == 20:
+                marcar_tramite_sync_error(t, "DESTINO_NO_ENCONTRADO - esperando que otra app restaure la carpeta")
+                log(f"[WARN] Destino no encontrado para {t}. Se espera a que otra app restaure.")
+            else:
+                marcar_tramite_sync_error(t, sync_result.get("error", "Error desconocido"))
+                log(f"[WARN] Sync falló para {t}")
+
     if not job_debe_reanudarse():
-        log("[INFO] No hay trabajo pendiente para reanudar.")
         return 0
 
     estado = leer_estado_job()
-
     fe_pla_aniomes_desde = str(estado.get("fe_pla_aniomes_desde", "")).strip()
     dig_tramite = str(estado.get("dig_tramite", "") or "").strip()
-    # Ruta oficial fija. No se toma desde estado para evitar rutas antiguas o manipuladas.
     output_dir = "/data_nuevo/coberturas"
-
     username = os.environ.get("ORACLE_AUTO_USER", "").strip()
     password = os.environ.get("ORACLE_AUTO_PASSWORD", "").strip()
 
     if not username or not password:
-        error = "Faltan ORACLE_AUTO_USER u ORACLE_AUTO_PASSWORD en .env"
-        marcar_job_reintento(error)
-        log(f"[ERROR] {error}")
+        marcar_job_reintento("Faltan ORACLE_AUTO_USER u ORACLE_AUTO_PASSWORD en .env")
         return 1
-
     if not fe_pla_aniomes_desde:
-        error = "No existe fe_pla_aniomes_desde en el estado de reanudación."
-        marcar_job_reintento(error)
-        log(f"[ERROR] {error}")
+        marcar_job_reintento("No existe fe_pla_aniomes_desde en el estado.")
         return 1
 
-    pendientes_antes = contar_pendientes(
-        username=username,
-        password=password,
-        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-        dig_tramite=dig_tramite,
-    )
-
-    log(f"[INFO] Pendientes antes de reanudar: {pendientes_antes}")
-
-    # Sync solo si es la primera corrida después de generar o si hay trámites nuevos
-    sync_ejecutado = False
+    modo_vigilante = _es_modo_vigilante(dig_tramite)
+    pendientes_antes = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
+    log(f"[INFO] Pendientes antes de ejecutar: {pendientes_antes}")
 
     if pendientes_antes <= 0:
-        marcar_job_completado("No quedan pendientes.")
-        ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
-        log("[INFO] Trabajo completado. No quedan pendientes.")
+        sync_pending = bool(estado.get("sync_pending"))
+        if sync_pending:
+            log("[INFO] Sin pendientes Oracle, pero hay sync pendiente. Ejecutando sync...")
+            sync_result = ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
+            if not sync_result.get("ok"):
+                _marcar_sync_pendiente(
+                    "Sin pendientes Oracle, pero la sincronización al repositorio sigue pendiente.",
+                    sync_result.get("error") or f"Returncode: {sync_result.get('returncode')}")
+                return 0
+            if modo_vigilante:
+                marcar_job_vigilando_sin_pendientes(
+                    f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
+                    "Sync pendiente resuelto. Sistema vigilando.", sync_pending=False)
+                log("[INFO] Sync pendiente resuelto. Modo vigilante activo.")
+            else:
+                marcar_job_completado("Trámite específico completado con sync resuelto.")
+                log("[INFO] Trámite específico completado con sync resuelto.")
+            return 0
+
+        if modo_vigilante:
+            marcar_job_vigilando_sin_pendientes(
+                f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. Sistema vigilando.",
+                sync_pending=False)
+            log("[INFO] Sin pendientes. Modo vigilante activo.")
+        else:
+            marcar_job_completado("No queda pendiente el trámite solicitado.")
+            log("[INFO] Trabajo completado para trámite específico.")
         return 0
 
-    guardar_estado_job(
-        {
-            "enabled": True,
-            "status": "RUNNING_BY_WORKER",
-            "last_error": "",
-            "retry_count": 0,
-            "pendientes_antes": pendientes_antes,
-        }
-    )
+    guardar_estado_job({"enabled": True, "status": "RUNNING_BY_WORKER",
+                        "last_error": "", "retry_count": 0, "watch_empty_cycles": 0,
+                        "pendientes_antes": pendientes_antes,
+                        "pendientes_despues": "",
+                        "last_generados": "",
+                        "last_actualizados": "",
+                        "last_errores": "",
+                        "detalle": (
+                            f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
+                            + (f" y trámite {dig_tramite}" if dig_tramite else "")
+                        ),
+                        })
 
     try:
         result = ejecutar_coberturas_con_lock(
-            username=username,
-            password=password,
-            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-            dig_tramite=dig_tramite,
-            output_dir=output_dir,
-            progress_callback=None,
-        )
-
-        log(f"[INFO] Resultado generación: {result}")
-
+            username=username, password=password, fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+            dig_tramite=dig_tramite, output_dir=output_dir, progress_callback=None)
+        log(f"[INFO] Resultado generación: generados={result.get('generados',0)}, actualizados={result.get('actualizados',0)}, errores={result.get('errores',0)}")
+        # Guardar métricas del último ciclo para que la UI las muestre
+        guardar_estado_job({
+            "enabled": True, "status": "RUNNING_BY_WORKER",
+            "last_run_id": result.get("manifest_path", "").rsplit("/", 1)[-1].replace("cobertura_auto_", "").replace(".jsonl", "") if result.get("manifest_path") else "",
+            "last_generados": result.get("generados", 0),
+            "last_actualizados": result.get("actualizados", 0),
+            "last_errores": result.get("errores", 0),
+            "last_manifest_path": result.get("manifest_path", ""),
+            "detalle": (
+                f"Pasada terminada. "
+                f"Generados={result.get('generados', 0)}, "
+                f"Actualizados={result.get('actualizados', 0)}, "
+                f"Errores={result.get('errores', 0)}."
+            ),
+        })
     except ProcesoCoberturaYaEnEjecucion as exc:
         estado = leer_estado_job()
         retries = int(estado.get("retry_count", 0)) + 1
-
         if retries >= 5:
-            guardar_estado_job(
-                {
-                    "enabled": True,
-                    "status": "RETRY_PENDING_SLOW",
-                    "last_error": str(exc),
-                    "retry_count": retries,
-                    "detalle": "Lock ocupado 5 veces consecutivas. Se mantiene en reintento lento.",
-                }
-            )
-            log(f"[INFO] Lock ocupado {retries} veces. Reintento lento.")
+            guardar_estado_job({"enabled": True, "status": "RETRY_PENDING_SLOW",
+                                "last_error": str(exc), "retry_count": retries,
+                                "detalle": "Lock ocupado 5 veces. Reintento lento."})
         else:
-            guardar_estado_job(
-                {
-                    "enabled": True,
-                    "status": "WAITING_OTHER_PROCESS",
-                    "last_error": str(exc),
-                    "retry_count": retries,
-                }
-            )
-            log(f"[INFO] Lock ocupado (intento {retries}/5). Se reintentará.")
+            guardar_estado_job({"enabled": True, "status": "WAITING_OTHER_PROCESS",
+                                "last_error": str(exc), "retry_count": retries})
         return 0
-
     except Exception as exc:
         marcar_job_reintento(str(exc))
-        log(f"[ERROR] Falló reanudación: {exc}")
         return 1
 
-    pendientes_despues = contar_pendientes(
-        username=username,
-        password=password,
-        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-        dig_tramite=dig_tramite,
-    )
+    sync_result = ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
+    sync_ok = bool(sync_result.get("ok"))
+    sync_error = sync_result.get("error") or f"Returncode: {sync_result.get('returncode')}"
 
+    pendientes_despues = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
     log(f"[INFO] Pendientes después de ejecutar: {pendientes_despues}")
 
-    # Sync solo si este worker procesó algo o es la última pasada
-    if pendientes_despues == 0 or not sync_ejecutado:
-        ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
-        sync_ejecutado = True
-
     if pendientes_despues <= 0:
-        marcar_job_completado("Proceso terminado automáticamente.")
-        log("[INFO] Trabajo completado.")
+        if not sync_ok:
+            _marcar_sync_pendiente(
+                "Se terminaron los pendientes Oracle, pero el sync al repositorio quedó pendiente.",
+                sync_error)
+            log("[WARN] Sin pendientes Oracle, pero sync pendiente.")
+            return 0
+        if modo_vigilante:
+            marcar_job_vigilando_sin_pendientes(
+                f"Terminados pendientes actuales con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
+                "Sistema vigilando.", sync_pending=False)
+            log("[INFO] Pendientes actuales terminados. Modo vigilante activo.")
+        else:
+            marcar_job_completado("Proceso terminado para el trámite solicitado.")
+            log("[INFO] Trabajo completado para trámite específico.")
     else:
-        guardar_estado_job(
-            {
-                "enabled": True,
-                "status": "RETRY_PENDING",
-                "pendientes_despues": pendientes_despues,
-                "last_error": "",
-                "retry_count": 0,
-            }
-        )
+        guardar_estado_job({"enabled": True, "status": "RETRY_PENDING",
+                            "pendientes_despues": pendientes_despues,
+                            "last_error": "" if sync_ok else sync_error, "retry_count": 0,
+                            "sync_pending": not sync_ok,
+                            "detalle": "Aún quedan pendientes. El timer volverá a ejecutar."
+                                       + (" Sync pendiente." if not sync_ok else "")})
         log("[INFO] Aún quedan pendientes. El timer volverá a ejecutar.")
-
     return 0
 
 

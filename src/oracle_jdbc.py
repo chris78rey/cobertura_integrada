@@ -4,6 +4,16 @@
 
 from __future__ import annotations
 
+import os
+import time
+
+# Forzar timezone Colombia para evitar ORA-01882
+os.environ["TZ"] = "America/Bogota"
+try:
+    time.tzset()
+except Exception:
+    pass
+
 import pandas as pd
 import jaydebeapi
 
@@ -25,6 +35,15 @@ def oracle_connect(username: str, password: str):
 
     if not username or not password:
         raise RuntimeError("Usuario o contraseña vacíos")
+
+    # Forzar timezone del JVM a Colombia (previene ORA-01882)
+    try:
+        import jpype
+        if jpype.isJVMStarted():
+            java_util_tz = jpype.JPackage("java").util.TimeZone
+            java_util_tz.setDefault(java_util_tz.getTimeZone("America/Bogota"))
+    except Exception:
+        pass
 
     jar = get_jdbc_jar()
     targets = get_oracle_targets()

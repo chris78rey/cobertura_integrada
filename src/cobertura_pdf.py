@@ -563,6 +563,9 @@ def _run_node_pdf_generator(
     ]
 
     last_error = ""
+    last_stdout = ""
+    last_stderr = ""
+    last_returncode = -1
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -595,8 +598,11 @@ def _run_node_pdf_generator(
             last_stderr = completed.stderr
             last_returncode = completed.returncode
 
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             last_error = f"Timeout generando cobertura para {cedula} con fecha {fecha_pdf}"
+            last_stdout = ""
+            last_stderr = str(exc)
+            last_returncode = -1
 
         if attempt < max_retries:
             time.sleep(delay_seconds * attempt)
@@ -1130,6 +1136,7 @@ def generar_coberturas_automaticas_desde_mes(
         segundos_hasta_proxima_expiracion,
         resumen_cuarentena_activa,
     )
+    from src.auto_resume_state import marcar_tramite_sync_pendiente
 
     run_id = build_run_id("cobertura_auto")
     logger = RunLogger(run_id)
@@ -1281,22 +1288,17 @@ def generar_coberturas_automaticas_desde_mes(
                 if en_cuarentena_actual > 0 or excluidos_en_memoria > 0:
                     resumen_q = resumen_cuarentena_activa()
 
-                    espera_cuarentena = min(
-                        max(1, segundos_hasta_proxima_expiracion(default_segundos=30)),
-                        30,
-                    )
-
                     logger.event(
-                        "DB_ONLY_QUARANTINED_WAITING_AUTONOMOUS",
+                        "DB_ONLY_QUARANTINED_RETURNING_CONTROL",
                         pendientes_oracle=pendientes_previo,
                         en_cuarentena=en_cuarentena_actual,
                         excluidos_en_memoria=excluidos_en_memoria,
-                        espera_segundos=espera_cuarentena,
                         resumen_cuarentena=resumen_q,
                         mensaje=(
                             "Oracle reporta pendientes, pero los candidatos actuales están "
-                            "temporalmente excluidos. El proceso esperará y volverá a consultar "
-                            "sin intervención manual."
+                            "temporalmente en cuarentena o excluidos en memoria. "
+                            "Se devuelve el control para no dejar la pantalla esperando. "
+                            "El recuperador automático retomará después."
                         ),
                     )
 
@@ -1311,27 +1313,31 @@ def generar_coberturas_automaticas_desde_mes(
                                 "dig_fecha_hasta": "",
                                 "estado": (
                                     "Pendientes en cuarentena temporal. "
-                                    f"Reintentando automáticamente en {espera_cuarentena}s..."
+                                    "Se libera la pantalla y el recuperador automático retomará."
                                 ),
                                 "procesados_global": str(procesados_global),
                                 "lote_numero": str(lote_numero),
                             },
                         )
 
-                    inicio_espera_cuarentena = time.monotonic()
-
-                    while time.monotonic() - inicio_espera_cuarentena < espera_cuarentena:
-                        if _get_stop_flag().exists():
-                            break
-                        time.sleep(0.5)
-
-                    limpiar_cuarentena_expirada()
-                    dig_id_tramite_fallidos_en_corrida.clear()
-
-                    if _get_stop_flag().exists():
-                        break
-
-                    continue
+                    return {
+                        "ok": True,
+                        "solo_cuarentena": True,
+                        "run_id": run_id,
+                        "fe_pla_aniomes_desde": fe_pla_aniomes_desde,
+                        "dig_tramite": dig_tramite,
+                        "total": procesados_global,
+                        "generados": generados,
+                        "actualizados": actualizados,
+                        "errores": errores,
+                        "output_root": str(output_root),
+                        "manifest_path": str(manifest_path),
+                        "errors": errors_list,
+                        "mensaje": (
+                            "Los pendientes actuales están temporalmente en cuarentena. "
+                            "No se mantiene Streamlit esperando indefinidamente."
+                        ),
+                    }
 
                 raise RuntimeError(
                     "Inconsistencia crítica: Oracle reporta pendientes, pero la consulta de trabajo devolvió 0 registros. "
@@ -1570,6 +1576,12 @@ def generar_coberturas_automaticas_desde_mes(
                 )
 
                 if todos_los_pdfs_ok:
+                    # Marcar como sync pendiente ANTES de actualizar Oracle
+                    marcar_tramite_sync_pendiente(
+                        tramite=tramite,
+                        source_dir=str(planilla_dir),
+                    )
+
                     logger.event(
                         "ORACLE_UPDATE_START",
                         index=index,
@@ -1675,11 +1687,11 @@ def generar_coberturas_automaticas_desde_mes(
                     errores += 1
                     errores_consecutivos += 1
 
+                    err_msg = error_en_pdf or "No se generaron todos los PDFs esperados del trámite."
+
                     if clave_exclusion:
                         dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
-                        poner_en_cuarentena(clave_exclusion, tramite, err_msg or "PDFs incompletos")
-
-                    err_msg = error_en_pdf or "No se generaron todos los PDFs esperados del trámite."
+                        poner_en_cuarentena(clave_exclusion, tramite, err_msg)
 
                     writer.writerow(
                         {

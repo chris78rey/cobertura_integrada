@@ -17,14 +17,16 @@ from src.app_config import (
     validar_directorio_salida,
 )
 from src.cobertura_pdf import (
-    generar_coberturas_automaticas_desde_mes,
+    _contar_pendientes_automaticos,
 )
-from src.cobertura_runner import ejecutar_coberturas_con_lock
 from src.auto_resume_state import (
+    leer_estado_job,
+    guardar_estado_job,
     registrar_job_activo,
     marcar_job_completado,
     marcar_job_reintento,
     marcar_job_detenido_por_usuario,
+    marcar_job_vigilando_sin_pendientes,
 )
 from src.operator_tools import (
     leer_estado_operador,
@@ -56,6 +58,35 @@ def _crear_bandera_parada():
     flag = Path(__file__).resolve().parent.parent.parent / "config" / "stop_cobertura.flag"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text("STOP", encoding="utf-8")
+
+
+def _ruta_script_worker() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "scripts" / "run_resume_coberturas.sh"
+
+
+def _disparar_worker_inmediato() -> dict:
+    """Lanza una ejecución inmediata del worker autónomo en segundo plano."""
+    script = _ruta_script_worker()
+    logs_dir = Path(__file__).resolve().parent.parent.parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    launcher_log = logs_dir / "worker_launcher.log"
+
+    if not script.exists():
+        return {"ok": False, "error": f"No existe el script: {script}"}
+
+    try:
+        with launcher_log.open("a", encoding="utf-8") as fh:
+            proc = subprocess.Popen(
+                ["bash", str(script)],
+                cwd=str(script.parent.parent),
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+        return {"ok": True, "pid": proc.pid, "log_path": str(launcher_log)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _init_state():
@@ -419,7 +450,65 @@ def _ejecutar_sync_coberturas_repo(
         }
 
 
+def _render_estado_worker():
+    """Lee el estado persistente del worker y lo muestra como panel de monitor en vivo."""
+    estado = leer_estado_job() or {}
+
+    st.markdown("---")
+    st.markdown("### 📡 Estado automático en vivo")
+
+    if not estado or not estado.get("enabled"):
+        st.info("El worker autónomo no está activo. Presione 'Generar coberturas automáticas' para activarlo.")
+        return
+
+    # Fila 1: estado general
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Estado", str(estado.get("status", "-")))
+    with col2:
+        st.metric("Mes desde", str(estado.get("fe_pla_aniomes_desde", "-")))
+    with col3:
+        st.metric("Pendientes antes", str(estado.get("pendientes_antes", "-")))
+    with col4:
+        st.metric("Pendientes después", str(estado.get("pendientes_despues", "-")))
+
+    # Fila 2: métricas de última pasada
+    col5, col6, col7, col8 = st.columns(4)
+    with col5:
+        st.metric("Generados", str(estado.get("last_generados", "-")))
+    with col6:
+        st.metric("Actualizados", str(estado.get("last_actualizados", "-")))
+    with col7:
+        st.metric("Errores", str(estado.get("last_errores", "-")))
+    with col8:
+        st.metric("PID worker", str(estado.get("launcher_pid", "-")))
+
+    detalle = str(estado.get("detalle", "") or "").strip()
+    last_error = str(estado.get("last_error", "") or "").strip()
+    updated_at = str(estado.get("updated_at", "") or "").strip()
+
+    if detalle:
+        st.info(detalle)
+    if updated_at:
+        st.caption(f"Última actualización: {updated_at}")
+
+    # PDFs recientes (últimos 60 min)
+    try:
+        pdfs_recientes = len(list(Path("/data_nuevo/coberturas").rglob("*.pdf")))
+        pdfs_hora = len([p for p in Path("/data_nuevo/coberturas").rglob("*.pdf") if p.stat().st_mtime > (__import__("time").time() - 3600)])
+        st.caption(f"📄 PDFs totales: {pdfs_recientes} | Última hora: {pdfs_hora}")
+    except Exception:
+        pass
+
+    if last_error:
+        st.warning(last_error)
+
+    if st.button("Actualizar avance", key="btn_actualizar_avance", use_container_width=True):
+        st.rerun()
+
+
 def _render_auto_result():
+    """Muestra resultados de ejecución directa (legado, mantenido para compatibilidad)."""
     result = st.session_state.get("current_result")
 
     if not result:
@@ -709,9 +798,8 @@ def dashboard_page():
         """
         <div class="main-title">Cobertura automática MSP</div>
         <div class="main-subtitle">
-            Genera coberturas desde el mes seleccionado en pantalla,
-            solo registros con DIG_COBERTURA='N' y DIG_PLANILLADO='S'.
-            Actualiza DIG_COBERTURA='S' solo si el PDF existe.
+            Monitor operativo. El worker corre solo por timer cada 2 min.
+            Usar contingencia solo si el sistema no responde.
         </div>
         """,
         unsafe_allow_html=True,
@@ -759,6 +847,22 @@ def dashboard_page():
         else:
             st.info(f"Se procesará únicamente el trámite {dig_tramite_input}.")
             tramite_valido = True
+
+        if dig_tramite_input and dig_tramite_input.isdigit():
+            st.markdown("#### Acciones rápidas")
+            if st.button(
+                "📦 Enviar trámite a cola de resincronización",
+                key="btn_cola_sync",
+                use_container_width=True,
+                help="NO genera PDF. NO toca Oracle. Solo intenta sincronizar PDFs existentes al repositorio.",
+            ):
+                from src.auto_resume_state import marcar_tramite_sync_pendiente
+                marcar_tramite_sync_pendiente(
+                    tramite=dig_tramite_input,
+                    source_dir=f"/data_nuevo/coberturas/{dig_tramite_input}",
+                )
+                st.success(f"Trámite {dig_tramite_input} enviado a cola de resincronización.")
+                st.info("El worker lo procesará en la siguiente pasada.")
     else:
         tramite_valido = True
 
@@ -785,33 +889,69 @@ def dashboard_page():
     else:
         st.error(error_mes)
 
+    # Contador de pendientes
+    pendientes_oracle_actuales = st.session_state.get("pendientes_inicio_corrida")
+    proceso_activo = bool(st.session_state.get("proceso_en_curso", False))
+
+    if mes_valido and tramite_valido:
+        username = st.session_state.get("oracle_user", "")
+        password = st.session_state.get("oracle_password", "")
+        contador_tramite = dig_tramite_input if modo_procesamiento == "Procesar por trámite específico" else ""
+
+        if not proceso_activo:
+            if st.button("Actualizar contador", key="btn_actualizar_contador", use_container_width=True):
+                if username and password:
+                    try:
+                        with st.spinner("Consultando Oracle..."):
+                            pendientes_oracle_actuales = _contar_pendientes_automaticos(
+                                username=username, password=password,
+                                fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+                                dig_tramite=contador_tramite, timeout_seconds=30)
+                        st.session_state["pendientes_inicio_corrida"] = int(pendientes_oracle_actuales)
+                    except Exception as exc:
+                        st.warning(f"No se pudo consultar: {exc}")
+
+        if pendientes_oracle_actuales is not None:
+            procesados = int(st.session_state.get("procesados_corrida", 0))
+            faltan = max(int(pendientes_oracle_actuales) - procesados, 0)
+            c1, c2, c3 = st.columns(3)
+            with c1: st.metric("Pendientes en Oracle", f"{int(pendientes_oracle_actuales):,}")
+            with c2: st.metric("Procesados en esta corrida", f"{procesados:,}")
+            with c3: st.metric("Faltan en esta corrida", f"{faltan:,}")
+            if int(pendientes_oracle_actuales) == 0 and not proceso_activo:
+                st.info("No hay registros pendientes con los filtros seleccionados.")
+
+    st.markdown("---")
+
+    # Monitor del worker autónomo (arriba de los botones)
+    _render_estado_worker()
+
     st.markdown("---")
 
     puede_generar = ruta_valida and mes_valido and tramite_valido
 
-    col1, col2, col3 = st.columns([2, 1, 1])
-
-    with col1:
-        generar = st.button(
-            "Generar coberturas automáticas",
-            key="generar_auto_button",
-            use_container_width=True,
-            disabled=not puede_generar,
-        )
-
-    with col2:
-        parar = st.button(
-            "Parar proceso",
-            key="parar_auto_button",
-            use_container_width=True,
-        )
-
-    with col3:
-        limpiar = st.button(
-            "Limpiar",
-            key="limpiar_auto_button",
-            use_container_width=True,
-        )
+    with st.expander("⚙️ Contingencia: forzar corrida manual", expanded=False):
+        st.caption("El sistema corre solo por timer. Usar solo si el worker no responde o para trámite puntual urgente.")
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            generar = st.button(
+                "Forzar corrida manual",
+                key="generar_auto_button",
+                use_container_width=True,
+                disabled=not puede_generar,
+            )
+        with col2:
+            parar = st.button(
+                "Parar proceso",
+                key="parar_auto_button",
+                use_container_width=True,
+            )
+        with col3:
+            limpiar = st.button(
+                "Limpiar",
+                key="limpiar_auto_button",
+                use_container_width=True,
+            )
 
     if parar:
         _crear_bandera_parada()
@@ -830,204 +970,26 @@ def dashboard_page():
             dig_tramite=dig_tramite_input,
         )
 
-    progress_bar = st.empty()
-    status_box = st.empty()
-    detail_box = st.empty()
+        lanzamiento = _disparar_worker_inmediato()
 
-    if generar and pdf_output_dir and tramite_valido and mes_valido:
-        st.session_state.current_result = None
-        st.session_state.current_error = None
+        if lanzamiento.get("ok"):
+            guardar_estado_job({
+                "launcher_pid": lanzamiento.get("pid"),
+                "detalle": (
+                    f"Trabajo armado desde Streamlit. "
+                    f"Worker inmediato lanzado PID={lanzamiento.get('pid')}."
+                ),
+                "last_error": "",
+            })
+            st.success("Modo autónomo activado.")
+            st.info("El worker seguirá vigilando Oracle y procesará nuevos trámites sin más clics.")
+            st.session_state["worker_recien_lanzado"] = True
+        else:
+            marcar_job_reintento(lanzamiento.get("error", "No se pudo lanzar el worker."))
+            st.error("No se pudo lanzar el worker inmediato.")
+            st.code(str(lanzamiento.get("error", "")), language="text")
 
-        progress_widget = progress_bar.progress(0)
-
-        status_box.markdown(
-            """
-            <div class="status-info">
-                Iniciando proceso...
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        def on_progress(done: int, total: int, item: dict[str, str]):
-            percent = int((done / total) * 100) if total else 0
-            progress_widget.progress(percent)
-
-            estado = item.get("estado", "")
-
-            if estado == "GENERADO_Y_ACTUALIZADO":
-                emoji = "✅"
-            elif "Esperando" in estado:
-                emoji = "⏳"
-            else:
-                emoji = "⚙️"
-
-            procesados_global = item.get("procesados_global", "")
-            lote_numero = item.get("lote_numero", "")
-
-            if procesados_global:
-                texto_progreso = f"Procesados en esta corrida: {procesados_global}"
-            else:
-                texto_progreso = f"Procesando lote actual: {done} de {total}"
-
-            if lote_numero:
-                texto_progreso += f"<br>Lote consultado: {lote_numero}"
-
-            status_box.markdown(
-                f"""
-                <div class="status-info">
-                    {emoji} {texto_progreso}<br>
-                    Avance del lote actual: {percent}%
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            detail_box.info(
-                f"Modo: {modo_procesamiento} | "
-                f"Mes desde: {fe_pla_aniomes_desde} | "
-                f"Mes registro: {item.get('fe_pla_aniomes')} | "
-                f"Trámite: {item.get('dig_tramite')} | "
-                f"Cédula: {item.get('dig_cedula')} | "
-                f"Estado: {estado}"
-            )
-
-        try:
-            result = ejecutar_coberturas_con_lock(
-                username=st.session_state.oracle_user,
-                password=st.session_state.oracle_password,
-                fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-                dig_tramite=dig_tramite_input,
-                output_dir=str(pdf_output_dir),
-                progress_callback=on_progress,
-            )
-
-            if result.get("generados", 0) > 0:
-                status_box.markdown(
-                    """
-                    <div class="status-info">
-                        Coberturas generadas. Sincronizando PDFs hacia el repositorio oficial...
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                sync_result = _ejecutar_sync_coberturas_repo(
-                    origen_root=str(pdf_output_dir),
-                    dig_tramite=dig_tramite_input if dig_tramite_input else "",
-                )
-
-                result["sync_repo"] = sync_result
-
-                if sync_result.get("ok"):
-                    st.success("Sincronización al repositorio oficial finalizada.")
-                    marcar_job_completado("Proceso terminado desde Streamlit.")
-                elif sync_result.get("already_running"):
-                    st.info(
-                        "Ya existía una sincronización en ejecución. No se inició otra para evitar duplicidad."
-                    )
-                else:
-                    st.warning(
-                        "La generación terminó, pero la sincronización al repositorio oficial tuvo observaciones."
-                    )
-                    if sync_result.get("stderr"):
-                        st.code(sync_result.get("stderr", ""), language="text")
-                    if sync_result.get("stdout"):
-                        st.code(sync_result.get("stdout", ""), language="text")
-            else:
-                result["sync_repo"] = {
-                    "ok": True,
-                    "returncode": 0,
-                    "stdout": "",
-                    "stderr": "",
-                    "manifest_path": "",
-                    "mensaje": "No se ejecutó sync porque no se generaron PDFs nuevos.",
-                }
-
-            progress_widget.progress(100)
-
-            if result.get("solo_cuarentena"):
-                status_box.markdown(
-                    """
-                    <div class="status-info">
-                        Los pendientes actuales están en cuarentena temporal.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.info(
-                    "Oracle todavía reporta pendientes, pero la aplicación no los retomó porque están en cuarentena temporal. "
-                    "Esto evita repetir trámites fallidos y permite que el proceso avance con registros nuevos cuando existan."
-                )
-
-            elif result.get("total", 0) <= 0 or result.get("sin_pendientes"):
-                status_box.markdown(
-                    """
-                    <div class="status-warn">
-                        El proceso terminó sin procesar registros.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.warning(
-                    "La aplicación no procesó registros. Si Oracle muestra pendientes, revisar ORACLE_TARGETS, "
-                    "la carpeta real desde donde corre Streamlit y los logs."
-                )
-            else:
-                status_box.markdown(
-                    """
-                    <div class="status-success">
-                        Proceso terminado. Manifiesto listo para descargar.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            detail_box.empty()
-            st.session_state.current_result = result
-
-        except Exception as exc:
-            st.session_state.current_error = str(exc)
-            status_box.markdown(
-                """
-                <div class="status-warn">
-                    Error durante el proceso.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            marcar_job_reintento(str(exc))
-            mensaje_error = str(exc)
-
-            if "Ya existe un proceso de coberturas ejecutándose" in mensaje_error or "ProcesoCoberturaYaEnEjecucion" in mensaje_error:
-                status_box.markdown(
-                    """
-                    <div class="status-warn">
-                        Ya hay un proceso de coberturas en ejecución.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                st.warning(
-                    "No se inició una nueva generación porque otro proceso está activo. "
-                    "Revise si Streamlit, el recuperador automático o una ejecución anterior siguen trabajando."
-                )
-
-                st.code(mensaje_error, language="text")
-
-            else:
-                status_box.markdown(
-                    """
-                    <div class="status-warn">
-                        Error durante el proceso.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                st.error("No se pudo completar el proceso automático.")
-                st.code(mensaje_error, language="text")
+        st.rerun()
 
     _render_auto_result()
 
