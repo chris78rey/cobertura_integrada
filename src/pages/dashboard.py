@@ -1,9 +1,11 @@
+import html
 import json
 import os
 import re
 import subprocess
 import sys
 from collections import Counter, deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +23,7 @@ from src.cobertura_pdf import (
 )
 from src.auto_resume_state import (
     leer_estado_job,
+    _parse_ts,
     guardar_estado_job,
     registrar_job_activo,
     marcar_job_completado,
@@ -34,6 +37,7 @@ from src.operator_tools import (
     pausar_reintento_automatico,
     exportar_estado_json,
 )
+from src.oracle_jdbc import obtener_tramites_en_cola
 
 
 def _reset_all():
@@ -98,6 +102,27 @@ def _init_state():
 
     if "current_error" not in st.session_state:
         st.session_state.current_error = None
+
+
+def _segundos_desde(ts: str | None) -> int | None:
+    dt = _parse_ts(ts)
+    if not dt:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+
+
+def _estado_semaforo(seconds_progress: int | None, sync_active: bool, status: str) -> tuple[str, str]:
+    if sync_active:
+        return "ok", "Sync en curso con heartbeat activo."
+    if status in {"WATCHING_NO_PENDING", "COMPLETED", "STOPPED_BY_USER"}:
+        return "ok", "Sin trabajo activo."
+    if seconds_progress is None:
+        return "warn", "Todavía no hay heartbeat suficiente para medir progreso."
+    if seconds_progress < 300:
+        return "ok", "Proceso con actividad reciente."
+    if seconds_progress < 1200:
+        return "warn", "Proceso lento o con pausas; sigue vivo."
+    return "alert", "Proceso estancado o sin heartbeat reciente."
 
 
 def _render_css():
@@ -180,6 +205,85 @@ def _render_css():
             margin-bottom: 1rem;
         }
 
+        .status-card {
+            border-radius: 20px;
+            padding: 1rem 1.1rem;
+            margin: 0.5rem 0 1rem 0;
+            border: 1px solid transparent;
+            font-weight: 800;
+        }
+
+        .status-card.ok {
+            background: #ecfdf5;
+            border-color: #86efac;
+            color: #166534;
+        }
+
+        .status-card.warn {
+            background: #fffbeb;
+            border-color: #fcd34d;
+            color: #92400e;
+        }
+
+        .status-card.alert {
+            background: #fef2f2;
+            border-color: #fca5a5;
+            color: #991b1b;
+        }
+
+        .op-summary-grid {
+            margin: 0.5rem 0 1rem 0;
+        }
+
+        .op-card {
+            border-radius: 24px;
+            padding: 1rem 1.05rem;
+            min-height: 220px;
+            box-shadow: 0 16px 34px rgba(15, 23, 42, 0.08);
+        }
+
+        .op-card-primary {
+            background: linear-gradient(180deg, #eff6ff 0%, #dbeafe 100%);
+            border: 1px solid #93c5fd;
+        }
+
+        .op-card-accent {
+            background: linear-gradient(180deg, #fff7ed 0%, #ffedd5 100%);
+            border: 1px solid #fdba74;
+        }
+
+        .op-card-title {
+            font-size: 0.82rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-weight: 900;
+            color: #334155;
+            margin-bottom: 0.8rem;
+        }
+
+        .op-card-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.8rem;
+            padding: 0.35rem 0;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+        }
+
+        .op-card-row:last-child {
+            border-bottom: none;
+        }
+
+        .op-card-row span {
+            color: #475569;
+            font-size: 0.88rem;
+        }
+
+        .op-card-row strong {
+            color: #0f172a;
+            font-size: 0.92rem;
+            text-align: right;
+        }
+
         .stButton > button {
             border-radius: 16px !important;
             font-size: 1.05rem !important;
@@ -222,6 +326,176 @@ def _render_config_section() -> str | None:
         return None
 
     return str(validacion["path"])
+
+
+def _formatear_texto(valor: object, vacio: str = "-") -> str:
+    texto = str(valor or "").strip()
+    return texto if texto else vacio
+
+
+def _formatear_ts_visible(valor: object, vacio: str = "-") -> str:
+    texto = str(valor or "").strip()
+    if not texto:
+        return vacio
+    dt = _parse_ts(texto)
+    if not dt:
+        return texto
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _render_tarjeta_resumen(titulo: str, filas: list[tuple[str, str]], variante: str = "normal") -> None:
+    clase = f"op-card op-card-{variante}"
+    cuerpo = "".join(
+        f"""
+        <div class="op-card-row">
+            <span>{html.escape(etiqueta)}</span>
+            <strong>{html.escape(valor)}</strong>
+        </div>
+        """
+        for etiqueta, valor in filas
+    )
+    st.markdown(
+        f"""
+        <div class="{clase}">
+            <div class="op-card-title">{html.escape(titulo)}</div>
+            {cuerpo}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_cola_pendiente(username: str, password: str, fe_pla_aniomes_desde: str, dig_tramite: str = ""):
+    st.markdown("### Próximos 200 trámites en cola")
+
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        refrescar = st.button(
+            "Actualizar cola",
+            key="btn_actualizar_cola_200",
+            use_container_width=True,
+        )
+    with col_b:
+        mostrar = st.checkbox(
+            "Mostrar cola pendiente",
+            value=True,
+            key="chk_mostrar_cola_200",
+        )
+
+    if not mostrar:
+        st.caption("La cola quedó oculta por el operador.")
+        return
+
+    cache_key = f"cola_200::{fe_pla_aniomes_desde}::{(dig_tramite or '').strip()}"
+    if refrescar:
+        st.session_state.pop(cache_key, None)
+
+    filas = st.session_state.get(cache_key)
+
+    if filas is None:
+        with st.spinner("Consultando los próximos trámites pendientes en Oracle..."):
+            try:
+                filas = obtener_tramites_en_cola(
+                    username=username,
+                    password=password,
+                    fe_pla_aniomes_desde=str(fe_pla_aniomes_desde).strip(),
+                    limite=200,
+                    dig_tramite=(dig_tramite or "").strip() or None,
+                )
+                st.session_state[cache_key] = filas
+            except Exception as exc:
+                st.error("No se pudo consultar la cola pendiente.")
+                st.code(str(exc), language="text")
+                return
+
+    estado = leer_estado_job() or {}
+    siguiente = filas[0] if filas else {}
+    col_res_1, col_res_2 = st.columns(2)
+    with col_res_1:
+        _render_tarjeta_resumen(
+            "Última procesada",
+            [
+                ("Trámite", _formatear_texto(estado.get("last_processed_tramite"))),
+                ("Cédula", _formatear_texto(estado.get("last_processed_cedula"))),
+                ("Planilla", _formatear_texto(estado.get("last_processed_planilla"))),
+                ("Mes", _formatear_texto(estado.get("last_processed_fe_pla_aniomes"))),
+                ("Hora", _formatear_ts_visible(estado.get("last_processed_at"))),
+                ("Estado", _formatear_texto(estado.get("last_processed_status"))),
+            ],
+            variante="primary",
+        )
+    with col_res_2:
+        if siguiente:
+            _render_tarjeta_resumen(
+                "Siguiente en cola",
+                [
+                    ("Trámite", _formatear_texto(siguiente.get("DIG_TRAMITE"))),
+                    ("Cédula", _formatear_texto(siguiente.get("DIG_CEDULA"))),
+                    ("Planilla", _formatear_texto(siguiente.get("DIG_TRAMITE"))),
+                    ("Mes", _formatear_texto(siguiente.get("FE_PLA_ANIOMES"))),
+                    ("Hora", _formatear_texto(siguiente.get("DIG_FECHA_PLANILLA"))),
+                    ("ID trámite", _formatear_texto(siguiente.get("DIG_ID_TRAMITE"))),
+                ],
+                variante="accent",
+            )
+        else:
+            _render_tarjeta_resumen(
+                "Siguiente en cola",
+                [
+                    ("Trámite", "Sin pendientes"),
+                    ("Cédula", "-"),
+                    ("Planilla", "-"),
+                    ("Mes", "-"),
+                    ("Hora", "-"),
+                    ("ID trámite", "-"),
+                ],
+                variante="accent",
+            )
+
+    total = len(filas)
+    st.caption(f"Se muestran {total} trámite(s) pendientes de un máximo de 200.")
+
+    if not filas:
+        st.info("No hay trámites pendientes en cola con los filtros actuales.")
+        return
+
+    df = pd.DataFrame(filas).copy()
+
+    columnas_preferidas = [
+        "DIG_TRAMITE",
+        "DIG_CEDULA",
+        "FE_PLA_ANIOMES",
+        "DIG_ID_TRAMITE",
+        "DIG_ID_GENERACION",
+        "DIG_PLANILLADO",
+        "DIG_COBERTURA",
+        "DIG_DEPENDIENTE_01",
+        "DIG_DEPENDIENTE_02",
+        "DIG_FECHA_PLANILLA",
+    ]
+
+    columnas_visibles = [c for c in columnas_preferidas if c in df.columns]
+    if columnas_visibles:
+        df = df[columnas_visibles]
+
+    df.insert(0, "ORDEN_COLA", range(1, len(df) + 1))
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        height=420,
+    )
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Descargar cola CSV",
+        data=csv_bytes,
+        file_name=f"cola_pendiente_{fe_pla_aniomes_desde}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="btn_descargar_cola_csv",
+    )
 
 
 def _ejecutar_sync_coberturas_repo(
@@ -492,19 +766,115 @@ def _render_estado_worker():
     if updated_at:
         st.caption(f"Última actualización: {updated_at}")
 
-    # PDFs recientes (últimos 60 min)
-    try:
-        pdfs_recientes = len(list(Path("/data_nuevo/coberturas").rglob("*.pdf")))
-        pdfs_hora = len([p for p in Path("/data_nuevo/coberturas").rglob("*.pdf") if p.stat().st_mtime > (__import__("time").time() - 3600)])
-        st.caption(f"📄 PDFs totales: {pdfs_recientes} | Última hora: {pdfs_hora}")
-    except Exception:
-        pass
-
     if last_error:
         st.warning(last_error)
 
-    if st.button("Actualizar avance", key="btn_actualizar_avance", use_container_width=True):
-        st.rerun()
+
+def _leer_json_seguro(path: Path) -> dict:
+    try:
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@st.fragment(run_every="5s")
+def _render_monitor_progreso():
+    """Muestra el estado real del worker y del watchdog en una sola tarjeta."""
+    state_path = Path("/data_nuevo/cobertura_integrada/logs/cobertura_auto_resume_state.json")
+    watchdog_state_path = Path("/data_nuevo/cobertura_integrada/logs/cobertura_watchdog_state.json")
+    watchdog_log_path = Path("/data_nuevo/cobertura_integrada/logs/cobertura_watchdog.log")
+
+    worker = _leer_json_seguro(state_path)
+    watchdog = _leer_json_seguro(watchdog_state_path)
+
+    st.markdown("### 📈 Avance real")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Estado worker", str(worker.get("status", "-")))
+    with col2:
+        st.metric("Pendientes antes", str(worker.get("pendientes_antes", "-")))
+    with col3:
+        st.metric("Pendientes después", str(worker.get("pendientes_despues", "-")))
+    with col4:
+        st.metric("Sync activo", "Sí" if worker.get("sync_active") else "No")
+
+    col5, col6, col7, col8 = st.columns(4)
+    with col5:
+        st.metric("Generados", str(worker.get("last_generados", "-")))
+    with col6:
+        st.metric("Actualizados", str(worker.get("last_actualizados", "-")))
+    with col7:
+        st.metric("Errores", str(worker.get("last_errores", "-")))
+    with col8:
+        st.metric("Último trámite", str(worker.get("sync_active_tramite") or worker.get("dig_tramite", "-") or "-"))
+
+    detalle = str(worker.get("detalle", "") or "").strip()
+    last_progress_at = str(worker.get("last_progress_at", "") or "").strip()
+    sync_since = str(worker.get("sync_active_since", "") or "").strip()
+    updated_at = str(worker.get("updated_at", "") or "").strip()
+    seconds_update = _segundos_desde(updated_at)
+    seconds_progress = _segundos_desde(last_progress_at)
+    semaforo_estado, semaforo_texto = _estado_semaforo(
+        seconds_progress,
+        bool(worker.get("sync_active")),
+        str(worker.get("status", "") or ""),
+    )
+
+    st.markdown(
+        f"""
+        <div class="status-card {semaforo_estado}">
+            <strong>Estado visual:</strong> {semaforo_texto}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if detalle:
+        st.info(detalle)
+
+    info_cols = st.columns(3)
+    with info_cols[0]:
+        st.caption(f"Último progreso: {last_progress_at or '-'}")
+    with info_cols[1]:
+        st.caption(f"Sync desde: {sync_since or '-'}")
+    with info_cols[2]:
+        st.caption(f"Actualizado: {updated_at or '-'}")
+
+    age_cols = st.columns(2)
+    with age_cols[0]:
+        st.caption(f"Segundos sin progreso: {'-' if seconds_progress is None else seconds_progress}")
+    with age_cols[1]:
+        st.caption(f"Segundos desde actualización: {'-' if seconds_update is None else seconds_update}")
+
+    if watchdog:
+        verdict = watchdog.get("verdict", {}) or {}
+        wcols = st.columns(4)
+        with wcols[0]:
+            st.metric("Watchdog", str(verdict.get("action", "-")))
+        with wcols[1]:
+            st.metric("Servicio", str(watchdog.get("service_active", "-")))
+        with wcols[2]:
+            st.metric("PID worker", str(watchdog.get("main_pid", "-")))
+        with wcols[3]:
+            st.metric("PID sync", str(watchdog.get("sync_pid", "-")))
+
+        verdict_reason = str(verdict.get("reason", "") or "").strip()
+        if verdict_reason:
+            st.caption(verdict_reason)
+
+        checked_at = str(watchdog.get("checked_at", "") or "").strip()
+        if checked_at:
+            st.caption(f"Último chequeo watchdog: {checked_at}")
+
+    if watchdog_log_path.exists():
+        try:
+            last_line = watchdog_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-1]
+            st.caption(f"Watchdog log: {last_line}")
+        except Exception:
+            pass
 
 
 def _render_auto_result():
@@ -892,10 +1262,10 @@ def dashboard_page():
     # Contador de pendientes
     pendientes_oracle_actuales = st.session_state.get("pendientes_inicio_corrida")
     proceso_activo = bool(st.session_state.get("proceso_en_curso", False))
+    username = st.session_state.get("oracle_user", "")
+    password = st.session_state.get("oracle_password", "")
 
     if mes_valido and tramite_valido:
-        username = st.session_state.get("oracle_user", "")
-        password = st.session_state.get("oracle_password", "")
         contador_tramite = dig_tramite_input if modo_procesamiento == "Procesar por trámite específico" else ""
 
         if not proceso_activo:
@@ -923,7 +1293,17 @@ def dashboard_page():
 
     st.markdown("---")
 
-    # Monitor del worker autónomo (arriba de los botones)
+    if mes_valido and tramite_valido:
+        _render_cola_pendiente(
+            username=username,
+            password=password,
+            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+            dig_tramite=dig_tramite_input if modo_procesamiento == "Procesar por trámite específico" else "",
+        )
+
+    st.markdown("---")
+
+    # Monitor del worker autónomo
     _render_estado_worker()
 
     st.markdown("---")
@@ -991,8 +1371,8 @@ def dashboard_page():
 
         st.rerun()
 
+    _render_monitor_progreso()
     _render_auto_result()
-
     _render_operator_panel()
 
     st.markdown("</div>", unsafe_allow_html=True)

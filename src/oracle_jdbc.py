@@ -325,6 +325,99 @@ def actualizar_cobertura_por_id_tramite(
                 pass
 
 
+def obtener_tramites_en_cola(
+    username: str,
+    password: str,
+    fe_pla_aniomes_desde: str,
+    limite: int = 200,
+    dig_tramite: str | None = None,
+) -> list[dict]:
+    """
+    Devuelve los próximos trámites pendientes que entrarían a la cola de procesamiento.
+    Solo lectura. No actualiza nada.
+    """
+
+    conn = oracle_connect(username, password)
+    rows: list[dict] = []
+
+    sql = """
+        SELECT *
+        FROM (
+            SELECT
+                TO_CHAR(d.DIG_ID_TRAMITE)      AS DIG_ID_TRAMITE,
+                TO_CHAR(d.DIG_ID_GENERACION)   AS DIG_ID_GENERACION,
+                TO_CHAR(d.DIG_TRAMITE)         AS DIG_TRAMITE,
+                TRIM(d.DIG_CEDULA)             AS DIG_CEDULA,
+                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) AS FE_PLA_ANIOMES,
+                TRIM(NVL(d.DIG_PLANILLADO, '')) AS DIG_PLANILLADO,
+                TRIM(NVL(d.DIG_COBERTURA, ''))  AS DIG_COBERTURA,
+                TRIM(NVL(d.DIG_DEPENDIENTE_01, '')) AS DIG_DEPENDIENTE_01,
+                TRIM(NVL(d.DIG_DEPENDIENTE_02, '')) AS DIG_DEPENDIENTE_02,
+                TO_CHAR(d.DIG_FECHA_PLANILLA, 'YYYY-MM-DD HH24:MI:SS') AS DIG_FECHA_PLANILLA
+            FROM DIGITALIZACION.DIGITALIZACION d
+            WHERE TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) >= ?
+              AND NVL(TRIM(d.DIG_COBERTURA), 'N') = 'N'
+              AND TRIM(d.DIG_PLANILLADO) = 'S'
+              AND (? IS NULL OR TO_CHAR(d.DIG_TRAMITE) = ?)
+            ORDER BY
+                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)),
+                TO_CHAR(d.DIG_TRAMITE),
+                TO_CHAR(d.DIG_ID_TRAMITE)
+        )
+        WHERE ROWNUM <= ?
+    """
+
+    pstmt = None
+    rs = None
+
+    try:
+        pstmt = conn.jconn.prepareStatement(sql)
+        pstmt.setString(1, str(fe_pla_aniomes_desde))
+        if dig_tramite and str(dig_tramite).strip():
+            tramite = str(dig_tramite).strip()
+            pstmt.setString(2, tramite)
+            pstmt.setString(3, tramite)
+        else:
+            pstmt.setNull(2, 12)  # VARCHAR
+            pstmt.setNull(3, 12)  # VARCHAR
+        pstmt.setInt(4, int(limite))
+
+        try:
+            pstmt.setQueryTimeout(20)
+        except Exception:
+            pass
+
+        rs = pstmt.executeQuery()
+        meta = rs.getMetaData()
+        total_cols = meta.getColumnCount()
+
+        while rs.next():
+            row = {}
+            for idx in range(1, total_cols + 1):
+                col_name = meta.getColumnLabel(idx)
+                value = rs.getString(idx)
+                row[col_name] = value.strip() if isinstance(value, str) else value
+            rows.append(row)
+
+        return rows
+
+    finally:
+        try:
+            if rs:
+                rs.close()
+        except Exception:
+            pass
+        try:
+            if pstmt:
+                pstmt.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 # =========================
 # FIN
 # =========================

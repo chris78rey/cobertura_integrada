@@ -1136,7 +1136,7 @@ def generar_coberturas_automaticas_desde_mes(
         segundos_hasta_proxima_expiracion,
         resumen_cuarentena_activa,
     )
-    from src.auto_resume_state import marcar_tramite_sync_pendiente
+    from src.auto_resume_state import marcar_tramite_sync_pendiente, marcar_ultimo_procesado
 
     run_id = build_run_id("cobertura_auto")
     logger = RunLogger(run_id)
@@ -1575,6 +1575,9 @@ def generar_coberturas_automaticas_desde_mes(
                     and all(p.exists() and p.stat().st_size > 0 for p in pdfs_generados)
                 )
 
+                last_processed_status = "SIN_ESTADO"
+                last_processed_detail = "Fila procesada."
+
                 if todos_los_pdfs_ok:
                     # Marcar como sync pendiente ANTES de actualizar Oracle
                     marcar_tramite_sync_pendiente(
@@ -1615,6 +1618,8 @@ def generar_coberturas_automaticas_desde_mes(
                         generados += 1
                         actualizados += 1
                         errores_consecutivos = 0
+                        last_processed_status = "GENERADO_Y_ACTUALIZADO"
+                        last_processed_detail = "Fila procesada correctamente y Oracle actualizado."
 
                         writer.writerow(
                             {
@@ -1666,6 +1671,8 @@ def generar_coberturas_automaticas_desde_mes(
                         errores += 1
                         errores_consecutivos += 1
                         err_msg = update_result.get("error") or "No se pudo actualizar Oracle"
+                        last_processed_status = "ERROR_ACTUALIZANDO_ORACLE"
+                        last_processed_detail = err_msg
 
                         if clave_exclusion:
                             dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
@@ -1688,6 +1695,8 @@ def generar_coberturas_automaticas_desde_mes(
                     errores_consecutivos += 1
 
                     err_msg = error_en_pdf or "No se generaron todos los PDFs esperados del trámite."
+                    last_processed_status = "NO_ACTUALIZADO_PDFS_INCOMPLETOS"
+                    last_processed_detail = err_msg
 
                     if clave_exclusion:
                         dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
@@ -1724,7 +1733,17 @@ def generar_coberturas_automaticas_desde_mes(
                         }
                     )
 
+                marcar_ultimo_procesado(
+                    tramite=tramite,
+                    cedula=cedula,
+                    planilla=tramite,
+                    fe_pla_aniomes=fe_pla,
+                    status=last_processed_status,
+                    detalle=last_processed_detail,
+                )
+
                 if index < total:
+
                     try:
                         espera, motivo_espera = calcular_espera_dinamica(
                             output_root=output_root,

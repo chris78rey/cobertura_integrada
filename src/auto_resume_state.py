@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +13,40 @@ STATE_PATH = PROJECT_ROOT / "logs" / "cobertura_auto_resume_state.json"
 
 
 def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # UTC ISO 8601 estable para systemd, worker, UI y watchdog
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    # Compatibilidad con formato viejo: "YYYY-MM-DD HH:MM:SS"
+    try:
+        if "T" not in raw:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+            return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+
+    # Compatibilidad con ISO 8601
+    try:
+        raw = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def heartbeat_job(**extra: Any) -> None:
+    payload = {
+        "last_progress_at": _now(),
+    }
+    payload.update(extra)
+    guardar_estado_job(payload)
 
 
 def _watch_interval_seconds() -> int:
@@ -112,6 +145,27 @@ def guardar_estado_job(data: dict[str, Any]) -> None:
     os.replace(tmp_path, STATE_PATH)
 
 
+def marcar_ultimo_procesado(
+    tramite: str = "",
+    cedula: str = "",
+    planilla: str = "",
+    fe_pla_aniomes: str = "",
+    status: str = "",
+    detalle: str = "",
+) -> None:
+    payload: dict[str, Any] = {
+        "last_processed_tramite": str(tramite or "").strip(),
+        "last_processed_cedula": str(cedula or "").strip(),
+        "last_processed_planilla": str(planilla or "").strip(),
+        "last_processed_fe_pla_aniomes": str(fe_pla_aniomes or "").strip(),
+        "last_processed_status": str(status or "").strip(),
+        "last_processed_at": _now(),
+    }
+    if detalle:
+        payload["last_processed_detail"] = str(detalle).strip()
+    guardar_estado_job(payload)
+
+
 def registrar_job_activo(fe_pla_aniomes_desde: str, output_dir: str, dig_tramite: str = "") -> None:
     guardar_estado_job({
         "enabled": True, "status": "RUNNING",
@@ -164,6 +218,41 @@ def marcar_job_reintento(error: str) -> None:
         })
 
 
+def marcar_sync_activo(tramite: str, detalle: str = "") -> None:
+    heartbeat_job(
+        enabled=True,
+        status="SYNC_ACTIVE",
+        sync_pending=True,
+        sync_active=True,
+        sync_active_tramite=str(tramite).strip(),
+        sync_active_since=_now(),
+        last_progress_detail=detalle or f"Sincronizando trámite {str(tramite).strip()}.",
+        detalle=detalle or f"Sincronizando trámite {str(tramite).strip()}.",
+    )
+
+
+def marcar_sync_finalizado(
+    detalle: str = "",
+    sync_pending: bool | None = None,
+    status: str = "RUNNING_BY_WORKER",
+) -> None:
+    estado = leer_estado_job()
+    if sync_pending is None:
+        sync_pending_final = bool(estado.get("sync_pending", False))
+    else:
+        sync_pending_final = bool(sync_pending)
+    heartbeat_job(
+        enabled=True,
+        status="RETRY_PENDING" if sync_pending_final else status,
+        sync_pending=sync_pending_final,
+        sync_active=False,
+        sync_active_tramite="",
+        sync_active_since="",
+        last_progress_detail=detalle or "Sincronización finalizada.",
+        detalle=detalle or "Sincronización finalizada.",
+    )
+
+
 def marcar_job_detenido_por_usuario() -> None:
     guardar_estado_job({
         "enabled": False, "status": "STOPPED_BY_USER",
@@ -184,20 +273,17 @@ def job_debe_reanudarse() -> bool:
     }:
         return False
     updated_at = estado.get("updated_at", "")
-    if updated_at:
-        try:
-            ultima = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
-            segundos = (datetime.now() - ultima).total_seconds()
-            if status in ("RUNNING", "RUNNING_BY_WORKER") and segundos < 60:
-                return False
-            if status == "RETRY_PENDING" and segundos < 60:
-                return False
-            if status == "RETRY_PENDING_SLOW" and segundos < 600:
-                return False
-            if status == "WAITING_OTHER_PROCESS" and segundos < 120:
-                return False
-            if status == "WATCHING_NO_PENDING" and segundos < _watch_interval_seconds():
-                return False
-        except ValueError:
-            pass
+    ts = _parse_ts(updated_at)
+    if ts is not None:
+        segundos = max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+        if status in ("RUNNING", "RUNNING_BY_WORKER") and segundos < 60:
+            return False
+        if status == "RETRY_PENDING" and segundos < 60:
+            return False
+        if status == "RETRY_PENDING_SLOW" and segundos < 600:
+            return False
+        if status == "WAITING_OTHER_PROCESS" and segundos < 120:
+            return False
+        if status == "WATCHING_NO_PENDING" and segundos < _watch_interval_seconds():
+            return False
     return True
