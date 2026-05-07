@@ -142,16 +142,19 @@ function svgTable({ x, y, widths, headers, rows, headerHeight, rowHeight, header
   let cursorX = x;
   for (let index = 0; index < headers.length; index += 1) {
     const width = widths[index];
+    const isLongHeader =
+      String(headers[index] || "").includes("Registro de Cobertura de Atención de Salud") ||
+      String(headers[index] || "").includes("Identificación del Beneficiario");
+    const effectiveHeaderFontSize = isLongHeader ? Math.max(8, headerFontSize - 1) : headerFontSize;
     elements.push(`<rect x="${cursorX}" y="${y}" width="${width}" height="${headerHeight}" fill="none" stroke="#000" stroke-width="${lineWidth}"/>`);
     elements.push(
       svgText({
         text: headers[index],
         x: cursorX + width / 2,
-        y: y + headerFontSize + 5,
-        size: headerFontSize,
+        y: y + effectiveHeaderFontSize + 5,
+        size: effectiveHeaderFontSize,
         bold: true,
         anchor: "middle",
-        width: width - 12,
       })
     );
     cursorX += width;
@@ -168,10 +171,11 @@ function svgTable({ x, y, widths, headers, rows, headerHeight, rowHeight, header
       elements.push(
         svgText({
           text: row[index] || "-",
-          x: cursorX + 5,
+          x: cursorX + width / 2,
           y: rowY + bodyFontSize + 5,
           size: bodyFontSize,
           width: width - 10,
+          anchor: "middle",
         })
       );
       cursorX += width;
@@ -210,16 +214,19 @@ function svgTableDynamic({
   let cursorX = x;
   for (let index = 0; index < headers.length; index += 1) {
     const width = widths[index];
+    const isLongHeader =
+      String(headers[index] || "").includes("Registro de Cobertura de Atención de Salud") ||
+      String(headers[index] || "").includes("Identificación del Beneficiario");
+    const effectiveHeaderFontSize = isLongHeader ? Math.max(8, headerFontSize - 1) : headerFontSize;
     elements.push(`<rect x="${cursorX}" y="${y}" width="${width}" height="${headerHeight}" fill="none" stroke="#000" stroke-width="${lineWidth}"/>`);
     elements.push(
       svgText({
         text: headers[index],
         x: cursorX + width / 2,
-        y: y + headerFontSize + 5,
-        size: headerFontSize,
+        y: y + effectiveHeaderFontSize + 5,
+        size: effectiveHeaderFontSize,
         bold: true,
         anchor: "middle",
-        width: width - 12,
       })
     );
     cursorX += width;
@@ -238,10 +245,11 @@ function svgTableDynamic({
       elements.push(
         svgText({
           text: row[colIndex] || "-",
-          x: cursorX + 5,
+          x: cursorX + width / 2,
           y: rowY + bodyFontSize + 5,
           size: bodyFontSize,
           width: width - 10,
+          anchor: "middle",
         })
       );
       cursorX += width;
@@ -386,9 +394,9 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
     EstadoCobertura: "Servicio no disponible",
   }]).map((item) => [
     item.NombreInstitucion || "",
-    item.TipoSeguro || "Servicio no disponible",
-    item.MensajeServicioExterno || "Servicio no disponible",
-    item.EstadoCobertura || "Servicio no disponible",
+    String(item.TipoSeguro || "Servicio no disponible").toLowerCase(),
+    String(item.MensajeServicioExterno || "Servicio no disponible").toLowerCase(),
+    String(item.EstadoCobertura || "Servicio no disponible").toLowerCase(),
   ]);
 
   const segurosWidths = [92, 188, 255, 195];
@@ -410,6 +418,7 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
     mainTableTop + segurosHeaderHeight + segurosRowHeights.reduce((sum, value) => sum + value, 0);
   const noteY = mainTableBottom + 16;
   const privateTitleY = noteY + 18;
+  const privateNoDataTitleY = privateTitleY + 8;
   const privateTableY = privateTitleY + 14;
   const fechaConsultaY = PAGE_HEIGHT - 141;
   const privateBottomLimit = fechaConsultaY - 8;
@@ -429,13 +438,13 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   ${svgText({ text: cedula, x: 272, y: 174, size: 10, fontFamily: "Times New Roman, Times, serif" })}
   ${svgText({ text: "Fecha de Cobertura de Seguro de Salud:", x: 420, y: 174, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
   ${svgText({ text: formatCoverageDate(fecha), x: PAGE_WIDTH - 50, y: 174, size: 10, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
-  ${svgText({ text: "IESS, ISSFA, ISSPOL", x: PAGE_WIDTH / 2, y: 194, size: 10, bold: true, anchor: "middle", fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: "IESS, ISSFA, ISSPOL", x: 50, y: 194, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
 
   ${svgTableDynamic({
     x: 50,
     y: mainTableTop,
     widths: segurosWidths,
-    headers: ["Seguro", "Tipo de seguro", "Mensaje", "Registro de Cobertura\nde Atención de Salud"],
+    headers: ["Seguro", "Tipo de seguro", "Mensaje", "Registro de Cobertura de Atención de Salud"],
     rows: segurosRows,
     rowHeights: segurosRowHeights,
     headerHeight: segurosHeaderHeight,
@@ -445,21 +454,36 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   })}
 
   ${svgText({ text: "* La información histórica reflejada corresponde a datos\ndesde Junio 2010", x: 70, y: noteY, size: 7, fill: "#0000ff", fontFamily: "Times New Roman, Times, serif" })}
-  ${showPrivateTable ? svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: privateTitleY, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" }) : ""}
-  ${showPrivateTable
-    ? svgTableDynamic({
-        x: 50,
-        y: privateTableY,
-        widths: privadosWidths,
-        headers: ["RUC", "Nombre del Financiador", "Identificación del\nBeneficiario", "Nombres", "Apellidos"],
-        rows: firstPrivatePage.rows,
-        rowHeights: firstPrivatePage.rowHeights,
-        headerHeight: privadosHeaderHeight,
-        headerFontSize: 10,
-        bodyFontSize: privadosBodyFont,
-        lineWidth: privadosLineWidth,
-      })
-    : ""}
+  ${svgText({
+    text: "RED PRIVADA COMPLEMENTARIA",
+    x: 25,
+    y: showPrivateTable ? privateTitleY : privateNoDataTitleY,
+    size: 10,
+    bold: true,
+    fontFamily: "Times New Roman, Times, serif",
+  })}
+  ${
+    showPrivateTable
+      ? svgTableDynamic({
+          x: 50,
+          y: privateTableY,
+          widths: privadosWidths,
+          headers: ["RUC", "Nombre del Financiador", "Identificación del Beneficiario", "Nombres", "Apellidos"],
+          rows: firstPrivatePage.rows,
+          rowHeights: firstPrivatePage.rowHeights,
+          headerHeight: privadosHeaderHeight,
+          headerFontSize: 10,
+          bodyFontSize: privadosBodyFont,
+          lineWidth: privadosLineWidth,
+        })
+      : `${svgText({
+          text: "NO EXISTEN RESULTADOS PARA LOS PARÁMETROS INGRESADOS",
+          x: 42,
+          y: privateTableY + 8,
+          size: 10,
+          fontFamily: "Times New Roman, Times, serif",
+        })}`
+  }
   ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
   ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 10, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
   `);
@@ -471,7 +495,7 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
       x: 50,
       y: 142,
       widths: privadosWidths,
-      headers: ["RUC", "Nombre del Financiador", "Identificación del\nBeneficiario", "Nombres", "Apellidos"],
+      headers: ["RUC", "Nombre del Financiador", "Identificación del Beneficiario", "Nombres", "Apellidos"],
       rows: privatePage.rows,
       rowHeights: privatePage.rowHeights,
       headerHeight: privadosHeaderHeight,

@@ -113,6 +113,7 @@ def _consultar_menores_por_mes(
                 TRIM(NVL(DIG_DEPENDIENTE_01, '')) AS DIG_DEPENDIENTE_01,
                 TRIM(NVL(DIG_DEPENDIENTE_02, '')) AS DIG_DEPENDIENTE_02,
                 TRIM(TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD')) AS DIG_FECHA_HASTA,
+                TRIM(TO_CHAR(DIG_FECHA_ALTA, 'YYYY-MM-DD')) AS DIG_FECHA_ALTA,
                 TRIM(NVL(DIG_MENOR_EDAD, 'N')) AS DIG_MENOR_EDAD,
                 TRIM(NVL(DIG_COBERTURA, 'N')) AS DIG_COBERTURA,
                 TRIM(NVL(DIG_PLANILLADO, '')) AS DIG_PLANILLADO,
@@ -140,10 +141,11 @@ def _consultar_menores_por_mes(
                 "DIG_DEPENDIENTE_01": str(rs.getString(3) or "").strip(),
                 "DIG_DEPENDIENTE_02": str(rs.getString(4) or "").strip(),
                 "DIG_FECHA_HASTA": str(rs.getString(5) or "").strip(),
-                "DIG_MENOR_EDAD": str(rs.getString(6) or "").strip(),
-                "DIG_COBERTURA": str(rs.getString(7) or "").strip(),
-                "DIG_PLANILLADO": str(rs.getString(8) or "").strip(),
-                "FE_PLA_ANIOMES": str(rs.getString(9) or "").strip(),
+                "DIG_FECHA_ALTA": str(rs.getString(6) or "").strip(),
+                "DIG_MENOR_EDAD": str(rs.getString(7) or "").strip(),
+                "DIG_COBERTURA": str(rs.getString(8) or "").strip(),
+                "DIG_PLANILLADO": str(rs.getString(9) or "").strip(),
+                "FE_PLA_ANIOMES": str(rs.getString(10) or "").strip(),
             })
         return rows
     finally:
@@ -175,11 +177,34 @@ def _construir_indice_destinos_por_year(repo_root_text: str, year: str) -> dict[
     return {k: sorted(v) for k, v in indice.items()}
 
 
+def _preparar_registro_cobertura(row: dict[str, str]) -> dict[str, str]:
+    return {
+        "dig_tramite": str(row.get("DIG_TRAMITE", "")).strip(),
+        "dig_cedula": str(row.get("DIG_CEDULA", "")).strip(),
+        "dig_menor_edad": str(row.get("DIG_MENOR_EDAD", "")).strip(),
+        "dig_dependiente_01": str(row.get("DIG_DEPENDIENTE_01", "")).strip(),
+        "dig_dependiente_02": str(row.get("DIG_DEPENDIENTE_02", "")).strip(),
+        "dig_fecha_hasta": str(row.get("DIG_FECHA_HASTA", "")).strip(),
+        "dig_fecha_alta": str(row.get("DIG_FECHA_ALTA", "")).strip(),
+    }
+
+
+def _esperados_cobertura(row: dict[str, str]) -> tuple[dict[str, str], list[dict[str, str]], list[str]]:
+    registro = _preparar_registro_cobertura(row)
+    cedulas_a_generar = _expandir_cedulas_para_cobertura(registro)
+    expected_output_names = [
+        _nombre_cc_por_secuencia(indice=i, total=len(cedulas_a_generar))
+        for i in range(1, len(cedulas_a_generar) + 1)
+    ]
+    return registro, cedulas_a_generar, [f"{name}.pdf" for name in expected_output_names]
+
+
 def _auditar_fila(row: dict[str, str], indice_destinos: dict[str, list[str]]) -> dict[str, Any]:
     tramite = str(row.get("DIG_TRAMITE", "")).strip()
     local_dir = OUTPUT_ROOT / tramite
     destinos = [Path(p) for p in indice_destinos.get(tramite, [])]
     destino_dir = destinos[0] if len(destinos) == 1 else None
+    registro, cedulas_a_generar, esperado = _esperados_cobertura(row)
 
     local_cc = _listar_cc(local_dir)
     local_legacy = _listar_cc_legacy(local_dir)
@@ -187,18 +212,17 @@ def _auditar_fila(row: dict[str, str], indice_destinos: dict[str, list[str]]) ->
     destino_cc = _listar_cc(destino_dir) if destino_dir else []
     legacy_destino = _listar_cc_legacy(destino_dir) if destino_dir else []
 
-    esperado = ["CC_01.pdf", "CC_02.pdf", "CC_03.pdf"]
     local_canonico_completo = all(x in local_cc for x in esperado)
-    local_tiene_suficientes = len(local_todos) >= 3
+    local_tiene_suficientes = len(local_todos) >= len(esperado)
     faltan_local = [] if local_tiene_suficientes else esperado
     faltan_destino = [x for x in esperado if x not in destino_cc]
     extras_local = [x for x in local_cc if x not in esperado]
     extras_destino = [x for x in destino_cc if x not in esperado]
 
     cedulas = [
-        str(row.get("DIG_CEDULA", "")).strip(),
-        str(row.get("DIG_DEPENDIENTE_01", "")).strip(),
-        str(row.get("DIG_DEPENDIENTE_02", "")).strip(),
+        registro["dig_cedula"],
+        registro["dig_dependiente_01"],
+        registro["dig_dependiente_02"],
     ]
     oracle_completo = all(cedulas)
 
@@ -207,16 +231,16 @@ def _auditar_fila(row: dict[str, str], indice_destinos: dict[str, list[str]]) ->
         accion = "Corregir cédulas en Oracle."
     elif not local_dir.exists():
         estado = "SIN_CARPETA_LOCAL"
-        accion = "Regenerar 3 PDFs locales y sincronizar."
+        accion = "Regenerar los PDFs locales esperados y sincronizar."
     elif not local_tiene_suficientes:
         estado = "FALTAN_CC_LOCALES"
-        accion = "Regenerar 3 PDFs locales y sincronizar."
+        accion = "Regenerar los PDFs locales esperados y sincronizar."
     elif local_legacy:
         estado = "LOCAL_LEGACY_CC"
         if local_canonico_completo:
             accion = "Los PDFs locales existen, pero también hay nombres legacy. Se puede sincronizar o normalizar."
         else:
-            accion = "Los PDFs locales existen, pero están en formato legacy. Regenerar 3 PDFs locales y sincronizar."
+            accion = "Los PDFs locales existen, pero están en formato legacy. Regenerar los PDFs locales esperados y sincronizar."
     elif len(destinos) == 0:
         estado = "DESTINO_NO_EXISTE"
         accion = "La carpeta destino todavía no existe."
@@ -225,7 +249,7 @@ def _auditar_fila(row: dict[str, str], indice_destinos: dict[str, list[str]]) ->
         accion = "Revisar carpetas destino duplicadas."
     elif legacy_destino:
         estado = "DESTINO_LEGACY_CC"
-        accion = "Sincronizar para limpiar CC legacy y dejar solo CC_01/02/03."
+        accion = "Sincronizar para limpiar CC legacy y dejar solo los PDFs canónicos esperados."
     elif not faltan_destino and not extras_destino:
         estado = "OK_DESTINO"
         accion = "Sin acción."
@@ -249,6 +273,7 @@ def _auditar_fila(row: dict[str, str], indice_destinos: dict[str, list[str]]) ->
         "DESTINO_DIR": str(destino_dir) if destino_dir else "",
         "PUEDE_SINCRONIZAR": local_canonico_completo or estado in {"REQUIERE_SINCRONIZAR", "DESTINO_LEGACY_CC"},
         "PUEDE_REGENERAR": estado in {"SIN_CARPETA_LOCAL", "FALTAN_CC_LOCALES", "LOCAL_LEGACY_CC"},
+        "DIG_FECHA_ALTA": registro["dig_fecha_alta"],
     }
 
 
@@ -418,6 +443,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
     dig_dep1 = str(row.get("DIG_DEPENDIENTE_01", "")).strip()
     dig_dep2 = str(row.get("DIG_DEPENDIENTE_02", "")).strip()
     dig_fecha_hasta = str(row.get("DIG_FECHA_HASTA", "")).strip()
+    dig_fecha_alta = str(row.get("DIG_FECHA_ALTA", "")).strip()
     fe_pla = str(row.get("FE_PLA_ANIOMES", "")).strip()
 
     if dig_planillado != "S":
@@ -435,6 +461,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
         "dig_dependiente_02": dig_dep2,
         "fe_pla_aniomes": fe_pla,
         "dig_fecha_hasta": dig_fecha_hasta,
+        "dig_fecha_alta": dig_fecha_alta,
     }
     cedulas_a_generar = _expandir_cedulas_para_cobertura(registro)
     if not cedulas_a_generar:
@@ -469,6 +496,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
             c = str(item_cedula.get("cedula", "")).strip()
             output_name = expected_output_names[secuencia_pdf - 1]
             pdf_path = output_dir / f"{output_name}.pdf"
+            fecha_pdf = str(item_cedula.get("fecha_pdf", dig_fecha_hasta)).strip() or dig_fecha_hasta
 
             if pdf_path.exists() and pdf_path.stat().st_size > 0:
                 nuevos_pdfs.append(pdf_path)
@@ -477,7 +505,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
             result_node = _run_node_pdf_generator(
                 node_project_dir=node_project_dir,
                 cedula=c,
-                fecha_pdf=dig_fecha_hasta,
+                fecha_pdf=fecha_pdf,
                 output_dir=output_dir,
                 output_name=output_name,
                 single_timeout_seconds=120,
@@ -550,9 +578,20 @@ def _sincronizar_item(row: dict[str, Any], username: str) -> dict[str, Any]:
     tramite = str(row.get("DIG_TRAMITE", "")).strip()
     destino_dir = Path(str(row.get("DESTINO_DIR", "")).strip())
     local_dir = OUTPUT_ROOT / tramite
-    nuevos_pdfs = [local_dir / "CC_01.pdf", local_dir / "CC_02.pdf", local_dir / "CC_03.pdf"]
+    _, _, expected_pdf_names = _esperados_cobertura(
+        {
+            "DIG_TRAMITE": tramite,
+            "DIG_CEDULA": str(row.get("DIG_CEDULA", "")).strip(),
+            "DIG_DEPENDIENTE_01": str(row.get("DIG_DEPENDIENTE_01", "")).strip(),
+            "DIG_DEPENDIENTE_02": str(row.get("DIG_DEPENDIENTE_02", "")).strip(),
+            "DIG_FECHA_HASTA": str(row.get("DIG_FECHA_HASTA", "")).strip(),
+            "DIG_FECHA_ALTA": str(row.get("DIG_FECHA_ALTA", "")).strip(),
+            "DIG_MENOR_EDAD": str(row.get("DIG_MENOR_EDAD", "")).strip(),
+        }
+    )
+    nuevos_pdfs = [local_dir / name for name in expected_pdf_names]
     if not all(p.exists() and p.stat().st_size > 0 for p in nuevos_pdfs):
-        raise RuntimeError(f"No están completos los tres PDFs locales esperados en {local_dir}")
+        raise RuntimeError(f"No están completos los PDFs locales esperados en {local_dir}")
     return _backup_y_reemplazar_solo_cc(
         destino_dir=destino_dir,
         tramite=tramite,
@@ -577,7 +616,7 @@ def auditoria_menor_edad_page() -> None:
     )
 
     st.warning(
-        "Esta pantalla no modifica Oracle ni regenera PDFs. Solo sincroniza CC*.pdf cuando el trámite ya tiene los tres archivos locales.",
+        "Esta pantalla no modifica Oracle ni regenera PDFs. Solo sincroniza CC*.pdf cuando el trámite ya tiene los archivos locales esperados.",
         icon="⚠️",
     )
 
@@ -657,6 +696,7 @@ def auditoria_menor_edad_page() -> None:
         "DIG_CEDULA",
         "DIG_DEPENDIENTE_01",
         "DIG_DEPENDIENTE_02",
+        "DIG_FECHA_ALTA",
         "DIG_COBERTURA",
         "ESTADO_AUDITORIA",
         "CC_LEGACY_LOCAL",
@@ -694,7 +734,7 @@ def auditoria_menor_edad_page() -> None:
 
         st.markdown("---")
         st.markdown("### Recuperación local")
-        st.caption("Regenera los 3 PDFs desde Oracle y luego reemplaza solo CC*.pdf en el destino.")
+        st.caption("Regenera los PDFs esperados desde Oracle y luego reemplaza solo CC*.pdf en el destino.")
 
         seleccion_regen = st.multiselect(
             "Seleccionar trámites a regenerar",
@@ -705,7 +745,7 @@ def auditoria_menor_edad_page() -> None:
         with st.form("form_auditoria_menor_regen"):
             confirmar_regen = st.checkbox("Confirmo regenerar localmente y sincronizar CC*.pdf")
             frase_regen = st.text_input("Escribir REGENERAR para confirmar", value="")
-            submitted_regen = st.form_submit_button("Regenerar 3 PDFs locales y sincronizar", use_container_width=True)
+            submitted_regen = st.form_submit_button("Regenerar PDFs locales y sincronizar", use_container_width=True)
 
             if submitted_regen:
                 if not seleccion_regen:

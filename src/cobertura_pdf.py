@@ -140,12 +140,15 @@ def _payload_firma_cc(
         "dig_id_generacion": str(registro.get("dig_id_generacion", "")).strip(),
         "fe_pla_aniomes": str(registro.get("fe_pla_aniomes", "")).strip(),
         "dig_fecha_hasta": str(registro.get("dig_fecha_hasta", "")).strip(),
+        "dig_fecha_alta": str(registro.get("dig_fecha_alta", "")).strip(),
         "dig_menor_edad": str(registro.get("dig_menor_edad", "")).strip(),
         "cedulas": [
             {
                 "orden": index,
                 "tipo": str(item.get("tipo", "")).strip(),
                 "cedula": str(item.get("cedula", "")).strip(),
+                "fecha_pdf": str(item.get("fecha_pdf", "")).strip(),
+                "fecha_tipo": str(item.get("fecha_tipo", "")).strip(),
             }
             for index, item in enumerate(cedulas_a_generar, start=1)
         ],
@@ -1084,6 +1087,7 @@ def _obtener_registros_automaticos(
             SELECT
                 DIG_TRAMITE,
                 TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD') AS FECHA_HASTA,
+                TO_CHAR(DIG_FECHA_ALTA, 'YYYY-MM-DD') AS FECHA_ALTA,
                 DIG_CEDULA,
                 DIG_MENOR_EDAD,
                 DIG_DEPENDIENTE_01,
@@ -1171,19 +1175,20 @@ def _obtener_registros_automaticos(
                 {
                     "dig_tramite": str(result_set.getString(1) or "").strip(),
                     "dig_fecha_hasta": str(result_set.getString(2) or "").strip(),
-                    "dig_cedula": str(result_set.getString(3) or "").strip(),
-                    "dig_menor_edad": str(result_set.getString(4) or "").strip(),
-                    "dig_dependiente_01": str(result_set.getString(5) or "").strip(),
-                    "dig_dependiente_02": str(result_set.getString(6) or "").strip(),
-                    "dig_planillado": str(result_set.getString(7) or "").strip(),
-                    "dig_cobertura": str(result_set.getString(8) or "").strip(),
-                    "dig_id_generacion": str(result_set.getString(9) or "").strip(),
-                    "dig_id_tipo": str(result_set.getString(10) or "").strip(),
-                    "dig_numero_solicitud": str(result_set.getString(11) or "").strip(),
-                    "dig_bloqueo_sgh": str(result_set.getString(12) or "").strip(),
-                    "dig_id_tramite": str(result_set.getString(13) or "").strip(),
-                    "dig_usuario": str(result_set.getString(14) or "").strip(),
-                    "fe_pla_aniomes": str(result_set.getString(15) or "").strip(),
+                    "dig_fecha_alta": str(result_set.getString(3) or "").strip(),
+                    "dig_cedula": str(result_set.getString(4) or "").strip(),
+                    "dig_menor_edad": str(result_set.getString(5) or "").strip(),
+                    "dig_dependiente_01": str(result_set.getString(6) or "").strip(),
+                    "dig_dependiente_02": str(result_set.getString(7) or "").strip(),
+                    "dig_planillado": str(result_set.getString(8) or "").strip(),
+                    "dig_cobertura": str(result_set.getString(9) or "").strip(),
+                    "dig_id_generacion": str(result_set.getString(10) or "").strip(),
+                    "dig_id_tipo": str(result_set.getString(11) or "").strip(),
+                    "dig_numero_solicitud": str(result_set.getString(12) or "").strip(),
+                    "dig_bloqueo_sgh": str(result_set.getString(13) or "").strip(),
+                    "dig_id_tramite": str(result_set.getString(14) or "").strip(),
+                    "dig_usuario": str(result_set.getString(15) or "").strip(),
+                    "fe_pla_aniomes": str(result_set.getString(16) or "").strip(),
                 }
             )
 
@@ -1213,22 +1218,45 @@ def _expandir_cedulas_para_cobertura(registro: dict[str, str]) -> list[dict[str,
     """
     Dado un registro de DIGITALIZACION, devuelve una lista con las cédulas
     que necesitan cobertura: titular + dependientes si DIG_MENOR_EDAD='S'.
+    Si DIG_FECHA_ALTA viene lleno, duplica la salida con esa fecha.
     """
-    cedulas: list[dict[str, str]] = []
+    cedulas_base: list[dict[str, str]] = []
 
     titular = registro.get("dig_cedula", "").strip()
     if titular:
-        cedulas.append({"cedula": titular, "tipo": "TITULAR"})
+        cedulas_base.append({"cedula": titular, "tipo": "TITULAR"})
 
     if registro.get("dig_menor_edad", "").strip() == "S":
         d1 = registro.get("dig_dependiente_01", "").strip()
         d2 = registro.get("dig_dependiente_02", "").strip()
 
         if d1:
-            cedulas.append({"cedula": d1, "tipo": "DEPENDIENTE_01"})
+            cedulas_base.append({"cedula": d1, "tipo": "DEPENDIENTE_01"})
 
         if d2 and d2 != d1:
-            cedulas.append({"cedula": d2, "tipo": "DEPENDIENTE_02"})
+            cedulas_base.append({"cedula": d2, "tipo": "DEPENDIENTE_02"})
+
+    fecha_hasta = str(registro.get("dig_fecha_hasta", "") or "").strip()
+    fecha_alta = str(registro.get("dig_fecha_alta", "") or "").strip()
+
+    if not fecha_hasta:
+        return []
+
+    variantes_fecha = [("HASTA", fecha_hasta)]
+    if fecha_alta:
+        variantes_fecha.append(("ALTA", fecha_alta))
+
+    cedulas: list[dict[str, str]] = []
+    for fecha_tipo, fecha_pdf in variantes_fecha:
+        for item in cedulas_base:
+            cedulas.append(
+                {
+                    "cedula": item["cedula"],
+                    "tipo": item["tipo"],
+                    "fecha_pdf": fecha_pdf,
+                    "fecha_tipo": fecha_tipo,
+                }
+            )
 
     return cedulas
 
@@ -1419,19 +1447,20 @@ def generar_coberturas_automaticas_desde_mes(
     with manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(
             csv_file,
-            fieldnames=[
-                "RUN_ID",
-                "FE_PLA_ANIOMES",
-                "DIG_TRAMITE",
-                "DIG_ID_TRAMITE",
-                "DIG_ID_GENERACION",
-                "DIG_CEDULA",
-                "DIG_FECHA_HASTA",
-                "PDF_PATH",
-                "PDF_SIZE_BYTES",
-                "ESTADO",
-                "PASO",
-                "ORACLE_AFFECTED",
+        fieldnames=[
+            "RUN_ID",
+            "FE_PLA_ANIOMES",
+            "DIG_TRAMITE",
+            "DIG_ID_TRAMITE",
+            "DIG_ID_GENERACION",
+            "DIG_CEDULA",
+            "DIG_FECHA_HASTA",
+            "DIG_FECHA_ALTA",
+            "PDF_PATH",
+            "PDF_SIZE_BYTES",
+            "ESTADO",
+            "PASO",
+            "ORACLE_AFFECTED",
                 "SEGUNDOS_PDF",
                 "ESPERA_SEGUNDOS",
                 "ERRORES_CONSECUTIVOS",
@@ -1637,6 +1666,7 @@ def generar_coberturas_automaticas_desde_mes(
                 id_generacion = reg.get("dig_id_generacion", "")
                 cedula = reg.get("dig_cedula", "")
                 fecha_hasta = reg.get("dig_fecha_hasta", "")
+                fecha_alta = reg.get("dig_fecha_alta", "")
 
                 ultimo_segundos_pdf = 0.0
                 espera = 0.0
@@ -1644,14 +1674,16 @@ def generar_coberturas_automaticas_desde_mes(
 
                 logger.event(
                     "ROW_START",
-                    index=index,
-                    total=total,
-                    fe_pla_aniomes=fe_pla,
-                    dig_tramite=tramite,
-                    dig_id_tramite=dig_id_tramite,
-                    dig_id_generacion=id_generacion,
-                    dig_cedula=mask_cedula(cedula),
-                )
+                        index=index,
+                        total=total,
+                        fe_pla_aniomes=fe_pla,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        dig_id_generacion=id_generacion,
+                        dig_cedula=mask_cedula(cedula),
+                        dig_fecha_hasta=fecha_hasta,
+                        dig_fecha_alta=fecha_alta,
+                    )
 
                 if progress_callback:
                     progress_callback(
@@ -1663,15 +1695,12 @@ def generar_coberturas_automaticas_desde_mes(
                             "dig_id_tramite": dig_id_tramite,
                             "dig_cedula": cedula,
                             "dig_fecha_hasta": fecha_hasta,
+                            "dig_fecha_alta": fecha_alta,
                             "estado": "INICIANDO",
                         },
                     )
 
                 # Expandir cédulas a generar (titular + dependientes)
-                cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
-                pdfs_generados: list[Path] = []
-                error_en_pdf = ""
-
                 # Carpeta por trámite
                 planilla_dir = output_root / _safe_name(tramite)
                 planilla_dir.mkdir(parents=True, exist_ok=True)
@@ -1704,6 +1733,8 @@ def generar_coberturas_automaticas_desde_mes(
                 for secuencia_pdf, item_cedula in enumerate(cedulas_a_generar, start=1):
                     c = item_cedula["cedula"]
                     tipo_persona = item_cedula.get("tipo", "")
+                    fecha_pdf = item_cedula.get("fecha_pdf", fecha_hasta)
+                    fecha_tipo = item_cedula.get("fecha_tipo", "HASTA")
 
                     output_name = _nombre_cc_por_secuencia(
                         indice=secuencia_pdf,
@@ -1720,6 +1751,8 @@ def generar_coberturas_automaticas_desde_mes(
                         dig_id_tramite=dig_id_tramite,
                         cedula=mask_cedula(c),
                         tipo_persona=tipo_persona,
+                        fecha_pdf=fecha_pdf,
+                        fecha_tipo=fecha_tipo,
                         output_name=output_name,
                         pdf_path=str(pdf_path),
                     )
@@ -1733,6 +1766,8 @@ def generar_coberturas_automaticas_desde_mes(
                             dig_tramite=tramite,
                             pdf_path=str(pdf_path),
                             pdf_size_bytes=pdf_size,
+                            fecha_pdf=fecha_pdf,
+                            fecha_tipo=fecha_tipo,
                         )
                         continue
 
@@ -1741,7 +1776,7 @@ def generar_coberturas_automaticas_desde_mes(
                     result_node = _run_node_pdf_generator(
                         node_project_dir=node_project_dir,
                         cedula=c,
-                        fecha_pdf=fecha_hasta,
+                        fecha_pdf=fecha_pdf,
                         output_dir=planilla_dir,
                         output_name=output_name,
                         single_timeout_seconds=120,
@@ -1765,6 +1800,8 @@ def generar_coberturas_automaticas_desde_mes(
                             pdf_exists=True,
                             pdf_size_bytes=pdf_size,
                             pdf_path=str(pdf_path),
+                            fecha_pdf=fecha_pdf,
+                            fecha_tipo=fecha_tipo,
                             segundos_pdf=round(ultimo_segundos_pdf, 3),
                         )
                     else:
@@ -1772,7 +1809,7 @@ def generar_coberturas_automaticas_desde_mes(
                             result_node=result_node,
                             pdf_path=pdf_path,
                             cedula=c,
-                            fecha=fecha_hasta,
+                            fecha=fecha_pdf,
                         )
 
                         error_en_pdf = error_en_pdf_detalle["error_tecnico"] or error_en_pdf_detalle["causa"]
@@ -1882,6 +1919,7 @@ def generar_coberturas_automaticas_desde_mes(
                                 "DIG_ID_GENERACION": id_generacion,
                                 "DIG_CEDULA": cedula,
                                 "DIG_FECHA_HASTA": fecha_hasta,
+                                "DIG_FECHA_ALTA": fecha_alta,
                                 "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
                                 "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados),
                                 "ESTADO": "ERROR_SYNC_INMEDIATO",
@@ -1974,6 +2012,7 @@ def generar_coberturas_automaticas_desde_mes(
                                 "DIG_ID_GENERACION": id_generacion,
                                 "DIG_CEDULA": cedula,
                                 "DIG_FECHA_HASTA": fecha_hasta,
+                                "DIG_FECHA_ALTA": fecha_alta,
                                 "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
                                 "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados),
                                 "ESTADO": "GENERADO_Y_ACTUALIZADO",
@@ -2006,6 +2045,7 @@ def generar_coberturas_automaticas_desde_mes(
                                     "dig_id_tramite": dig_id_tramite,
                                     "dig_cedula": cedula,
                                     "dig_fecha_hasta": fecha_hasta,
+                                    "dig_fecha_alta": fecha_alta,
                                     "estado": "GENERADO_Y_ACTUALIZADO",
                                     "procesados_global": str(procesados_global),
                                     "lote_numero": str(lote_numero),
@@ -2055,6 +2095,7 @@ def generar_coberturas_automaticas_desde_mes(
                             "DIG_ID_GENERACION": id_generacion,
                             "DIG_CEDULA": cedula,
                             "DIG_FECHA_HASTA": fecha_hasta,
+                            "DIG_FECHA_ALTA": fecha_alta,
                             "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
                             "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados) if pdfs_generados else 0,
                             "ESTADO": "NO_ACTUALIZADO_PDFS_INCOMPLETOS",
