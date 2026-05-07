@@ -1356,6 +1356,14 @@ def dashboard_page():
         unsafe_allow_html=True,
     )
 
+    vista_simple = st.toggle(
+        "Vista simple",
+        value=True,
+        help="Muestra primero estado, acción y filtros. El detalle técnico queda oculto abajo.",
+    )
+    if vista_simple:
+        st.caption("Modo simple activo: solo se muestran al frente el estado y las acciones útiles.")
+
     st.markdown('<div class="simple-card">', unsafe_allow_html=True)
 
     _render_estado_simple_operativo()
@@ -1478,20 +1486,24 @@ def dashboard_page():
 
     st.markdown("---")
 
-    if mes_valido and tramite_valido:
-        _render_cola_pendiente(
-            username=username,
-            password=password,
-            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-            dig_tramite=dig_tramite_input if modo_procesamiento == "Procesar por trámite específico" else "",
-        )
+    with st.expander(
+        "Ver detalle técnico, cola y soporte",
+        expanded=not vista_simple,
+    ):
+        if mes_valido and tramite_valido:
+            _render_cola_pendiente(
+                username=username,
+                password=password,
+                fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+                dig_tramite=dig_tramite_input if modo_procesamiento == "Procesar por trámite específico" else "",
+            )
 
-    st.markdown("---")
+        st.markdown("---")
 
-    # Monitor del worker autónomo
-    _render_estado_worker()
+        # Monitor del worker autónomo
+        _render_estado_worker()
 
-    st.markdown("---")
+        st.markdown("---")
 
     puede_generar = ruta_valida and mes_valido and tramite_valido
 
@@ -1556,9 +1568,13 @@ def dashboard_page():
 
         st.rerun()
 
-    _render_monitor_progreso()
-    _render_auto_result()
-    _render_operator_panel()
+    with st.expander(
+        "Ver estado vivo, resultado y soporte",
+        expanded=not vista_simple,
+    ):
+        _render_monitor_progreso()
+        _render_auto_result()
+        _render_operator_panel()
 
     st.markdown("</div>", unsafe_allow_html=True)
 

@@ -15,20 +15,14 @@ from src.auto_resume_state import (  # noqa: E402
     job_debe_reanudarse,
     guardar_estado_job,
     heartbeat_job,
-    marcar_sync_activo,
-    marcar_sync_finalizado,
     marcar_job_completado,
     marcar_job_reintento,
     marcar_job_vigilando_sin_pendientes,
-    obtener_tramites_sync_pendientes,
-    marcar_tramite_sync_ok,
-    marcar_tramite_sync_error,
 )
 from src.cobertura_runner import (  # noqa: E402
     ejecutar_coberturas_con_lock,
     ProcesoCoberturaYaEnEjecucion,
 )
-from src.repo_sync import ejecutar_sync_repo as _ejecutar_sync_repo  # noqa: E402
 from src.oracle_jdbc import oracle_connect  # noqa: E402
 
 
@@ -84,73 +78,47 @@ def contar_pendientes(username: str, password: str, fe_pla_aniomes_desde: str, d
                 try: obj.close()
                 except Exception: pass
 
+def _reactivar_vigilancia_mensual_si_corresponde(fe_pla_aniomes_desde: str, output_dir: str) -> bool:
+    """
+    Si el modo mensual quedó apagado, lo devuelve a vigilancia para que el timer
+    siga mirando Oracle sin intervención humana.
+    """
+    estado = leer_estado_job()
+    status = str(estado.get("status", "") or "").strip()
+    dig_tramite = str(estado.get("dig_tramite", "") or "").strip()
 
-def _marcar_sync_pendiente(detalle: str, error: str = "") -> None:
-    guardar_estado_job({"enabled": True, "status": "WATCHING_NO_PENDING",
-                        "sync_pending": True, "last_error": error, "retry_count": 0, "detalle": detalle})
+    if dig_tramite:
+        return False
 
+    if status in {"STOPPED_BY_USER", "PAUSED_BY_OPERATOR"}:
+        return False
 
-def ejecutar_sync_repo(output_dir: str, dig_tramite: str = "") -> dict:
-    log("[INFO] Ejecutando sync al repositorio oficial...")
-    try:
-        estado_sync = leer_estado_job()
-        heartbeat_job(
-            sync_active=True,
-            sync_active_since=str(estado_sync.get("sync_active_since") or estado_sync.get("updated_at") or ""),
-            sync_active_tramite=str(dig_tramite or "").strip(),
-            detalle="Sincronización al repositorio en ejecución.",
-        )
-        sync_result = _ejecutar_sync_repo(
-            output_dir=output_dir,
-            dig_tramite=dig_tramite,
-        )
-        stdout = sync_result.get("stdout") or ""
-        if stdout:
-            log(stdout)
-        if sync_result.get("returncode") != 0:
-            log(f"[WARN] Sync terminó con código {sync_result.get('returncode')}")
-        return sync_result
-    finally:
-        heartbeat_job(
-            sync_active=False,
-            sync_active_since="",
-            sync_active_tramite="",
-            detalle="Sincronización al repositorio finalizada.",
-        )
+    enabled = bool(estado.get("enabled"))
+    if enabled and status == "WATCHING_NO_PENDING":
+        return False
+
+    guardar_estado_job(
+        {
+            "enabled": True,
+            "status": "WATCHING_NO_PENDING",
+            "fe_pla_aniomes_desde": str(fe_pla_aniomes_desde or "").strip(),
+            "dig_tramite": "",
+            "output_dir": str(output_dir).strip(),
+            "completed_at": "",
+            "last_error": "",
+            "retry_count": 0,
+            "sync_pending": False,
+            "detalle": "Modo mensual reactivado para vigilar Oracle sin cola.",
+        }
+    )
+    log("[INFO] Modo mensual reactivado a WATCHING_NO_PENDING.")
+    return True
 
 
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     import os
     _limpiar_logs_antiguos()
-
-    # Procesar cola de sync pendiente SIEMPRE, independiente del estado del job
-    pendientes_sync = obtener_tramites_sync_pendientes(limit=500)
-    if pendientes_sync:
-        log(f"[INFO] Cola de sync pendiente: {len(pendientes_sync)} trámites")
-        for item in pendientes_sync:
-            t = item["tramite"]
-            log(f"[INFO] Sincronizando trámite {t} desde cola pendiente...")
-            marcar_sync_activo(t, f"Sync de cola pendiente para trámite {t}.")
-            try:
-                sync_result = ejecutar_sync_repo(output_dir="/data_nuevo/coberturas", dig_tramite=t)
-                if sync_result.get("ok") and sync_result.get("returncode") == 0:
-                    marcar_tramite_sync_ok(t)
-                    log(f"[INFO] Sync OK para {t}")
-                elif sync_result.get("returncode") == 20:
-                    marcar_tramite_sync_error(t, "DESTINO_NO_ENCONTRADO - esperando que otra app restaure la carpeta")
-                    log(f"[WARN] Destino no encontrado para {t}. Se espera a que otra app restaure.")
-                else:
-                    marcar_tramite_sync_error(t, sync_result.get("error", "Error desconocido"))
-                    log(f"[WARN] Sync falló para {t}")
-            finally:
-                marcar_sync_finalizado(
-                    detalle=f"Sync de cola finalizado para trámite {t}.",
-                    sync_pending=True,
-                )
-
-    if not job_debe_reanudarse():
-        return 0
 
     estado = leer_estado_job()
     fe_pla_aniomes_desde = str(estado.get("fe_pla_aniomes_desde", "")).strip()
@@ -165,6 +133,10 @@ def main() -> int:
     if not fe_pla_aniomes_desde:
         marcar_job_reintento("No existe fe_pla_aniomes_desde en el estado.")
         return 1
+
+    reactivado = _reactivar_vigilancia_mensual_si_corresponde(fe_pla_aniomes_desde, output_dir)
+    if not reactivado and not job_debe_reanudarse():
+        return 0
 
     modo_vigilante = _es_modo_vigilante(dig_tramite)
     pendientes_antes = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
@@ -181,25 +153,6 @@ def main() -> int:
     )
 
     if pendientes_antes <= 0:
-        sync_pending = bool(estado.get("sync_pending"))
-        if sync_pending:
-            log("[INFO] Sin pendientes Oracle, pero hay sync pendiente. Ejecutando sync...")
-            sync_result = ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
-            if not sync_result.get("ok"):
-                _marcar_sync_pendiente(
-                    "Sin pendientes Oracle, pero la sincronización al repositorio sigue pendiente.",
-                    sync_result.get("error") or f"Returncode: {sync_result.get('returncode')}")
-                return 0
-            if modo_vigilante:
-                marcar_job_vigilando_sin_pendientes(
-                    f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
-                    "Sync pendiente resuelto. Sistema vigilando.", sync_pending=False)
-                log("[INFO] Sync pendiente resuelto. Modo vigilante activo.")
-            else:
-                marcar_job_completado("Trámite específico completado con sync resuelto.")
-                log("[INFO] Trámite específico completado con sync resuelto.")
-            return 0
-
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
                 f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. Sistema vigilando.",
@@ -265,7 +218,6 @@ def main() -> int:
             ),
         })
     except ProcesoCoberturaYaEnEjecucion as exc:
-        marcar_sync_finalizado(detalle="Proceso principal en ejecución detectado; se esperará al siguiente ciclo.", sync_pending=True)
         estado = leer_estado_job()
         retries = int(estado.get("retry_count", 0)) + 1
         if retries >= 5:
@@ -277,17 +229,8 @@ def main() -> int:
                                 "last_error": str(exc), "retry_count": retries})
         return 0
     except Exception as exc:
-        marcar_sync_finalizado(detalle=f"Error en sincronización: {exc}", sync_pending=True)
         marcar_job_reintento(str(exc))
         return 1
-
-    sync_result = ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
-    sync_ok = bool(sync_result.get("ok"))
-    sync_error = sync_result.get("error") or f"Returncode: {sync_result.get('returncode')}"
-    marcar_sync_finalizado(
-        detalle="Sync del ciclo principal finalizado.",
-        sync_pending=not sync_ok,
-    )
 
     pendientes_despues = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
     log(f"[INFO] Pendientes después de ejecutar: {pendientes_despues}")
@@ -300,12 +243,6 @@ def main() -> int:
     )
 
     if pendientes_despues <= 0:
-        if not sync_ok:
-            _marcar_sync_pendiente(
-                "Se terminaron los pendientes Oracle, pero el sync al repositorio quedó pendiente.",
-                sync_error)
-            log("[WARN] Sin pendientes Oracle, pero sync pendiente.")
-            return 0
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
                 f"Terminados pendientes actuales con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
@@ -317,10 +254,9 @@ def main() -> int:
     else:
         guardar_estado_job({"enabled": True, "status": "RETRY_PENDING",
                             "pendientes_despues": pendientes_despues,
-                            "last_error": "" if sync_ok else sync_error, "retry_count": 0,
-                            "sync_pending": not sync_ok,
-                            "detalle": "Aún quedan pendientes. El timer volverá a ejecutar."
-                                       + (" Sync pendiente." if not sync_ok else "")})
+                            "last_error": "", "retry_count": 0,
+                            "sync_pending": False,
+                            "detalle": "Aún quedan pendientes. El timer volverá a ejecutar."})
         log("[INFO] Aún quedan pendientes. El timer volverá a ejecutar.")
     return 0
 

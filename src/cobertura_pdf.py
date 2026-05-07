@@ -1349,7 +1349,7 @@ def generar_coberturas_automaticas_desde_mes(
         segundos_hasta_proxima_expiracion,
         resumen_cuarentena_activa,
     )
-    from src.auto_resume_state import marcar_tramite_sync_pendiente, marcar_ultimo_procesado
+    from src.auto_resume_state import marcar_ultimo_procesado
 
     run_id = build_run_id("cobertura_auto")
     logger = RunLogger(run_id)
@@ -1834,12 +1834,6 @@ def generar_coberturas_automaticas_desde_mes(
                             dig_id_tramite=dig_id_tramite,
                         )
 
-                    # Marcar como sync pendiente ANTES de actualizar Oracle
-                    marcar_tramite_sync_pendiente(
-                        tramite=tramite,
-                        source_dir=str(planilla_dir),
-                    )
-
                     sync_result = _sincronizar_tramite_inmediato(
                         output_dir=output_root,
                         tramite=tramite,
@@ -1870,7 +1864,7 @@ def generar_coberturas_automaticas_desde_mes(
                                 "causa": sync_error,
                                 "sugerencia": (
                                     "Revisar el estado del destino oficial, el lock de sync y "
-                                    "volver a intentar la sincronización de la cola pendiente."
+                                    "volver a intentar la sincronización en el siguiente ciclo."
                                 ),
                                 "attempts": "",
                                 "returncode": sync_result.get("returncode", ""),
@@ -1903,7 +1897,7 @@ def generar_coberturas_automaticas_desde_mes(
                                 "CAUSA_PROBABLE": sync_error,
                                 "SUGERENCIA_REVISION": (
                                     "Revisar el estado del destino oficial, el lock de sync y "
-                                    "reintentar la cola."
+                                    "reintentar en el siguiente ciclo."
                                 ),
                                 "NODE_ATTEMPTS": "",
                                 "NODE_RETURNCODE": sync_result.get("returncode", ""),

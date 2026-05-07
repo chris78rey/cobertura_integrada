@@ -122,6 +122,7 @@ function svgText({
   width = 0,
   lineHeight = 1.2,
   fill = "#000000",
+  fontFamily = "Helvetica",
 }) {
   const effectiveBold = bold || REPORT_FORCE_BOLD;
   const lines = width > 0 ? wrapText(text, width, size) : String(text || "").split(/\n/);
@@ -131,7 +132,7 @@ function svgText({
       return `<tspan x="${x}" dy="${dy}">${escapeXml(line)}</tspan>`;
     })
     .join("");
-  return `<text x="${x}" y="${y}" font-family="Helvetica" font-size="${size}" font-weight="${
+  return `<text x="${x}" y="${y}" font-family="${escapeXml(fontFamily)}" font-size="${size}" font-weight="${
     effectiveBold ? "700" : "400"
   }" text-anchor="${anchor}" fill="${fill}">${tspans}</text>`;
 }
@@ -298,7 +299,7 @@ function buildFooterImages(outDir) {
     } else {
       const href = svgAssetHref(outDir, footerLogos[index]);
       if (href) {
-      footerImages.push(`<image href="${escapeXml(href)}" x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}"/>`);
+        footerImages.push(`<image href="${escapeXml(href)}" x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}"/>`);
       } else {
         footerImages.push(`<rect x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}" fill="none" stroke="#000" stroke-width="0.8"/>`);
       }
@@ -339,10 +340,10 @@ function buildSvgPage({
   <line x1="20" y1="${PAGE_HEIGHT - 108}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 108}" stroke="#000" stroke-width="1.1"/>
   ${footerImages.join("\n")}
   <line x1="20" y1="${PAGE_HEIGHT - 76}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 76}" stroke="#000" stroke-width="1.1"/>
-  ${svgText({ text: `${pageNumber} / ${totalPages}`, x: PAGE_WIDTH / 2, y: PAGE_HEIGHT - 61, size: 7.2, anchor: "middle" })}
-  ${svgText({ text: "Plataforma Gubernamental de Desarrollo Social", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 69, size: 6.8, anchor: "end" })}
-  ${svgText({ text: "Av. Quitumbe Nan y Amaru Nan", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 57, size: 6.8, anchor: "end" })}
-  ${svgText({ text: "Telf: 593 (2) 3814400  |  www.msp.gob.ec", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 45, size: 6.8, anchor: "end" })}
+  ${svgText({ text: `${pageNumber} / ${totalPages}`, x: PAGE_WIDTH / 2, y: PAGE_HEIGHT - 61, size: 8, anchor: "middle", fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: "Plataforma Gubernamental de Desarrollo Social", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 69, size: 8, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: "Av. Quitumbe Nan y Amaru Nan", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 57, size: 8, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: "Telf: 593 (2) 3814400  |  www.msp.gob.ec", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 45, size: 8, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
 </svg>`;
 }
 
@@ -359,7 +360,7 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   const baseName = resolveBaseName(cedula, fecha, outputName);
   const layout = loadSvgLayout();
 
-  const nombre = seguros.find((item) => item.Nombre)?.Nombre || "";
+  const nombre = String(seguros.find((item) => item.Nombre)?.Nombre || "").toUpperCase();
 
   const mspHref = svgAssetHref(outDir, "logomsp.jpg");
   const rpisHref = svgAssetHref(outDir, "logorpis.jpg");
@@ -391,17 +392,17 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   ]);
 
   const segurosWidths = [92, 188, 255, 195];
-  const segurosHeaderHeight = 26;
-  const segurosBodyFont = 7.1;
+  const segurosHeaderHeight = 30;
+  const segurosBodyFont = 10;
   const segurosLineWidth = 0.55;
-  const segurosRowHeights = segurosRows.map((row) => estimateRowHeight(row, segurosWidths, segurosBodyFont, 31));
+  const segurosRowHeights = segurosRows.map((row) => estimateRowHeight(row, segurosWidths, segurosBodyFont, 34));
 
   const privadosWidths = [104, 248, 150, 105, 108];
-  const privadosHeaderHeight = 20;
-  const privadosBodyFont = 6.9;
+  const privadosHeaderHeight = 26;
+  const privadosBodyFont = 10;
   const privadosLineWidth = 0.55;
   const privadosRowHeights = showPrivateTable
-    ? privateRows.map((row) => estimateRowHeight(row, privadosWidths, privadosBodyFont, 19))
+    ? privateRows.map((row) => estimateRowHeight(row, privadosWidths, privadosBodyFont, 28))
     : [];
 
   const mainTableTop = 202;
@@ -421,65 +422,65 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   const pageBodies = [];
   const firstPrivatePage = showPrivateTable ? privatePages.shift() || { rows: [], rowHeights: [] } : { rows: [], rowHeights: [] };
   pageBodies.push(`
-  ${svgText({ text: "RED PUBLICA INTEGRAL DE SALUD", x: PAGE_WIDTH / 2, y: 100, size: 13.5, bold: true, anchor: "middle" })}
-  ${svgText({ text: "CONSULTA DE COBERTURA DE SALUD", x: PAGE_WIDTH / 2, y: 128, size: 10.5, bold: true, anchor: "middle" })}
-  ${svgText({ text: nombre, x: 50, y: 152, size: 7.8, bold: true })}
-  ${svgText({ text: "Numero de documento de Identificacion:", x: 50, y: 174, size: 8.2, bold: true })}
-  ${svgText({ text: cedula, x: 272, y: 174, size: 8.2 })}
-  ${svgText({ text: "Fecha de Cobertura de Seguro de Salud:", x: 420, y: 174, size: 8.2, bold: true })}
-  ${svgText({ text: formatCoverageDate(fecha), x: PAGE_WIDTH - 50, y: 174, size: 8.2, anchor: "end" })}
-  ${svgText({ text: "IESS, ISSFA, ISSPOL", x: PAGE_WIDTH / 2, y: 194, size: 8.3, bold: true, anchor: "middle" })}
+  ${svgText({ text: "RED PÚBLICA INTEGRAL DE SALUD", x: PAGE_WIDTH / 2, y: 100, size: 14, bold: true, anchor: "middle", fontFamily: "Helvetica, Arial, sans-serif" })}
+  ${svgText({ text: "CONSULTA DE COBERTURA DE SALUD", x: PAGE_WIDTH / 2, y: 128, size: 12, bold: true, anchor: "middle", fontFamily: "Helvetica, Arial, sans-serif" })}
+  ${svgText({ text: nombre, x: 50, y: 152, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: "Número de documento de Identificación:", x: 50, y: 174, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: cedula, x: 272, y: 174, size: 10, fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: "Fecha de Cobertura de Seguro de Salud:", x: 420, y: 174, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: formatCoverageDate(fecha), x: PAGE_WIDTH - 50, y: 174, size: 10, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: "IESS, ISSFA, ISSPOL", x: PAGE_WIDTH / 2, y: 194, size: 10, bold: true, anchor: "middle", fontFamily: "Times New Roman, Times, serif" })}
 
   ${svgTableDynamic({
     x: 50,
     y: mainTableTop,
     widths: segurosWidths,
-    headers: ["Seguro", "Tipo de seguro", "Mensaje", "Registro de Cobertura\nde Atencion de Salud"],
+    headers: ["Seguro", "Tipo de seguro", "Mensaje", "Registro de Cobertura\nde Atención de Salud"],
     rows: segurosRows,
     rowHeights: segurosRowHeights,
     headerHeight: segurosHeaderHeight,
-    headerFontSize: 7.6,
+    headerFontSize: 10,
     bodyFontSize: segurosBodyFont,
     lineWidth: segurosLineWidth,
   })}
 
-  ${svgText({ text: "* La informacion historica reflejada corresponde a datos\ndesde Junio 2010", x: 70, y: noteY, size: 6.2, fill: "#0000ff" })}
-  ${showPrivateTable ? svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: privateTitleY, size: 8, bold: true }) : ""}
+  ${svgText({ text: "* La información histórica reflejada corresponde a datos\ndesde Junio 2010", x: 70, y: noteY, size: 7, fill: "#0000ff", fontFamily: "Times New Roman, Times, serif" })}
+  ${showPrivateTable ? svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: privateTitleY, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" }) : ""}
   ${showPrivateTable
     ? svgTableDynamic({
         x: 50,
         y: privateTableY,
         widths: privadosWidths,
-        headers: ["RUC", "Nombre del Financiador", "Identificacion del\nBeneficiario", "Nombres", "Apellidos"],
+        headers: ["RUC", "Nombre del Financiador", "Identificación del\nBeneficiario", "Nombres", "Apellidos"],
         rows: firstPrivatePage.rows,
         rowHeights: firstPrivatePage.rowHeights,
         headerHeight: privadosHeaderHeight,
-        headerFontSize: 7.2,
+        headerFontSize: 10,
         bodyFontSize: privadosBodyFont,
         lineWidth: privadosLineWidth,
       })
     : ""}
-  ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 8.3, bold: true })}
-  ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 8.3, anchor: "end" })}
+  ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
+  ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 10, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
   `);
 
   for (const privatePage of showPrivateTable ? privatePages : []) {
     pageBodies.push(`
-    ${svgText({ text: "RED PRIVADA COMPLEMENTARIA (continuacion)", x: PAGE_WIDTH / 2, y: 120, size: 10, bold: true, anchor: "middle" })}
+    ${svgText({ text: "RED PRIVADA COMPLEMENTARIA (CONTINUACIÓN)", x: PAGE_WIDTH / 2, y: 120, size: 10, bold: true, anchor: "middle", fontFamily: "Times New Roman, Times, serif" })}
     ${svgTableDynamic({
       x: 50,
       y: 142,
       widths: privadosWidths,
-      headers: ["RUC", "Nombre del Financiador", "Identificacion del\nBeneficiario", "Nombres", "Apellidos"],
+      headers: ["RUC", "Nombre del Financiador", "Identificación del\nBeneficiario", "Nombres", "Apellidos"],
       rows: privatePage.rows,
       rowHeights: privatePage.rowHeights,
       headerHeight: privadosHeaderHeight,
-      headerFontSize: 7.2,
+      headerFontSize: 10,
       bodyFontSize: privadosBodyFont,
       lineWidth: privadosLineWidth,
     })}
-    ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 8.3, bold: true })}
-    ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 8.3, anchor: "end" })}
+    ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 10, bold: true, fontFamily: "Times New Roman, Times, serif" })}
+    ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 10, anchor: "end", fontFamily: "Times New Roman, Times, serif" })}
     `);
   }
 
@@ -513,11 +514,11 @@ function writeLabelValue(doc, label, value, options = {}) {
     size = 10,
     align = "left",
   } = options;
-  doc.font("Helvetica-Bold").fontSize(size).text(label, x, y, {
+  doc.font("Times-Bold").fontSize(size).text(label, x, y, {
     width: labelWidth,
     lineBreak: false,
   });
-  doc.font("Helvetica").fontSize(size).text(value || "-", x + labelWidth + gap, y, {
+  doc.font("Times-Roman").fontSize(size).text(value || "-", x + labelWidth + gap, y, {
     width: valueWidth,
     align,
     lineBreak: false,
@@ -537,7 +538,7 @@ function drawTable(doc, headers, rows, widths, options = {}) {
   let y = options.y || doc.y;
 
   doc.lineWidth(lineWidth);
-  doc.font("Helvetica-Bold").fontSize(headerFontSize);
+  doc.font("Times-Bold").fontSize(headerFontSize);
   let x = startX;
   headers.forEach((header, index) => {
     doc.rect(x, y, widths[index], headerHeight).stroke();
@@ -549,7 +550,7 @@ function drawTable(doc, headers, rows, widths, options = {}) {
   });
 
   y += headerHeight;
-  doc.font("Helvetica").fontSize(bodyFontSize);
+  doc.font("Times-Roman").fontSize(bodyFontSize);
   rows.forEach((row) => {
     x = startX;
     row.forEach((cell, index) => {
@@ -590,7 +591,7 @@ function drawHeader(doc, pageWidth) {
     });
   } else {
     doc.rect(layout.mspLogo.x, layout.mspLogo.y, layout.mspLogo.width, layout.mspLogo.height).stroke();
-    doc.font("Helvetica-Bold").fontSize(10).text("MSP", layout.mspLogo.x + 44, layout.mspLogo.y + 4, {
+    doc.font("Times-Bold").fontSize(10).text("MSP", layout.mspLogo.x + 44, layout.mspLogo.y + 4, {
       align: "center",
       width: 32,
       lineBreak: false,
@@ -621,7 +622,7 @@ function drawHeader(doc, pageWidth) {
     doc.restore();
   } else {
     doc.rect(layout.escudo.x, layout.escudo.y, layout.escudo.width, layout.escudo.height).stroke();
-    doc.font("Helvetica-Bold").fontSize(13).text("EC", layout.escudo.x + 8, layout.escudo.y + 12, {
+    doc.font("Times-Bold").fontSize(13).text("EC", layout.escudo.x + 8, layout.escudo.y + 12, {
       width: Math.max(1, layout.escudo.width - 16),
       align: "center",
       lineBreak: false,
@@ -663,7 +664,7 @@ function drawFooter(doc, pageWidth, pageHeight) {
   });
 
   doc.moveTo(20, pageHeight - 76).lineTo(pageWidth - 20, pageHeight - 76).stroke();
-  doc.font("Helvetica").fontSize(6.8);
+  doc.font("Times-Roman").fontSize(8);
   doc.text("1 / 1", pageWidth / 2 - 10, pageHeight - 65, { width: 20, align: "center", lineBreak: false });
   doc.text("Plataforma Gubernamental de Desarrollo Social", footerInfoX, pageHeight - 68, {
     width: footerInfoWidth,
