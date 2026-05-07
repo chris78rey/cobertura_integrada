@@ -6,6 +6,8 @@ OUTPUT_ROOT="/data_nuevo/coberturas"
 STREAMLIT_SERVICE="cobertura-streamlit.service"
 RESUME_SERVICE="cobertura-auto-resume.service"
 RESUME_TIMER="cobertura-auto-resume.timer"
+WATCHDOG_SERVICE="cobertura-progress-watchdog.service"
+WATCHDOG_TIMER="cobertura-progress-watchdog.timer"
 
 GEN_LOCK="$PROJECT_ROOT/logs/cobertura_generation.lock"
 SYNC_LOCK="$PROJECT_ROOT/logs/cobertura_repo_sync.lock"
@@ -51,6 +53,14 @@ show_status() {
   echo "Recuperador automático:"
   if service_exists "$RESUME_TIMER"; then
     systemctl is-active "$RESUME_TIMER" 2>/dev/null || echo "inactive"
+  else
+    echo "Timer no configurado"
+  fi
+
+  echo ""
+  echo "Watchdog de progreso:"
+  if service_exists "$WATCHDOG_TIMER"; then
+    systemctl is-active "$WATCHDOG_TIMER" 2>/dev/null || echo "inactive"
   else
     echo "Timer no configurado"
   fi
@@ -112,6 +122,13 @@ start_all() {
   else
     echo "Recuperador: no configurado"
   fi
+
+  if service_exists "$WATCHDOG_TIMER"; then
+    systemctl enable --now "$WATCHDOG_TIMER" 2>/dev/null
+    echo "Watchdog: iniciado"
+  else
+    echo "Watchdog: no configurado"
+  fi
 }
 
 stop_all() {
@@ -125,6 +142,11 @@ stop_all() {
   echo "Deteniendo recuperador automático..."
   systemctl stop "$RESUME_TIMER" 2>/dev/null || true
   systemctl stop "$RESUME_SERVICE" 2>/dev/null || true
+
+  echo ""
+  echo "Deteniendo watchdog..."
+  systemctl stop "$WATCHDOG_TIMER" 2>/dev/null || true
+  systemctl stop "$WATCHDOG_SERVICE" 2>/dev/null || true
 
   echo ""
   echo "Deteniendo Streamlit..."
@@ -218,6 +240,8 @@ hard_reset() {
   echo "1. Parando servicios..."
   systemctl stop "$RESUME_TIMER" 2>/dev/null || true
   systemctl stop "$RESUME_SERVICE" 2>/dev/null || true
+  systemctl stop "$WATCHDOG_TIMER" 2>/dev/null || true
+  systemctl stop "$WATCHDOG_SERVICE" 2>/dev/null || true
   systemctl stop "$STREAMLIT_SERVICE" 2>/dev/null || true
 
   echo "2. Matando procesos con lock..."
@@ -244,6 +268,7 @@ hard_reset() {
   echo "4. Reiniciando..."
   systemctl start "$STREAMLIT_SERVICE" 2>/dev/null || true
   systemctl start "$RESUME_TIMER" 2>/dev/null || true
+  systemctl start "$WATCHDOG_TIMER" 2>/dev/null || true
   echo "Listo"
 }
 

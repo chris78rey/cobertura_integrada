@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -29,6 +28,7 @@ from src.cobertura_runner import (  # noqa: E402
     ejecutar_coberturas_con_lock,
     ProcesoCoberturaYaEnEjecucion,
 )
+from src.repo_sync import ejecutar_sync_repo as _ejecutar_sync_repo  # noqa: E402
 from src.oracle_jdbc import oracle_connect  # noqa: E402
 
 
@@ -85,21 +85,12 @@ def contar_pendientes(username: str, password: str, fe_pla_aniomes_desde: str, d
                 except Exception: pass
 
 
+def _marcar_sync_pendiente(detalle: str, error: str = "") -> None:
+    guardar_estado_job({"enabled": True, "status": "WATCHING_NO_PENDING",
+                        "sync_pending": True, "last_error": error, "retry_count": 0, "detalle": detalle})
+
+
 def ejecutar_sync_repo(output_dir: str, dig_tramite: str = "") -> dict:
-    script = PROJECT_ROOT / "scripts" / "sync_coberturas_repo.py"
-    if not script.exists():
-        msg = f"No existe script de sync: {script}"
-        log(f"[WARN] {msg}")
-        return {"ok": False, "already_running": False, "returncode": -1, "stdout": "", "error": msg}
-    cmd = [sys.executable, str(script), "--origen-root", output_dir,
-           "--repo-root", "/data_nuevo/repo_grande/data/datos",
-           "--logs-dir", str(PROJECT_ROOT / "logs"),
-           "--state-db", str(PROJECT_ROOT / "logs" / "cobertura_repo_sync.sqlite"),
-           "--backup-root", str(PROJECT_ROOT / "logs" / "sync_replaced_cc_backups"),
-           "--replace-existing-cc",
-           "--apply"]
-    if dig_tramite:
-        cmd.extend(["--tramite", dig_tramite])
     log("[INFO] Ejecutando sync al repositorio oficial...")
     try:
         estado_sync = leer_estado_job()
@@ -109,48 +100,23 @@ def ejecutar_sync_repo(output_dir: str, dig_tramite: str = "") -> dict:
             sync_active_tramite=str(dig_tramite or "").strip(),
             detalle="Sincronización al repositorio en ejecución.",
         )
-        completed = subprocess.run(cmd, cwd=str(PROJECT_ROOT), text=True,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800, check=False)
-        stdout = completed.stdout or ""
-        log(stdout)
-        if completed.returncode != 0:
-            log(f"[WARN] Sync terminó con código {completed.returncode}")
+        sync_result = _ejecutar_sync_repo(
+            output_dir=output_dir,
+            dig_tramite=dig_tramite,
+        )
+        stdout = sync_result.get("stdout") or ""
+        if stdout:
+            log(stdout)
+        if sync_result.get("returncode") != 0:
+            log(f"[WARN] Sync terminó con código {sync_result.get('returncode')}")
+        return sync_result
+    finally:
         heartbeat_job(
             sync_active=False,
             sync_active_since="",
             sync_active_tramite="",
             detalle="Sincronización al repositorio finalizada.",
         )
-        return {"ok": completed.returncode == 0, "already_running": completed.returncode == 10,
-                "returncode": completed.returncode, "stdout": stdout,
-                "error": "" if completed.returncode == 0 else stdout[-2000:]}
-    except subprocess.TimeoutExpired as exc:
-        msg = f"Timeout ejecutando sync: {exc}"
-        log(f"[ERROR] {msg}")
-        heartbeat_job(
-            sync_active=False,
-            sync_active_since="",
-            sync_active_tramite="",
-            last_error=msg,
-            detalle="Timeout durante la sincronización al repositorio.",
-        )
-        return {"ok": False, "already_running": False, "returncode": -2, "stdout": "", "error": msg}
-    except Exception as exc:
-        msg = f"Error ejecutando sync: {exc}"
-        log(f"[ERROR] {msg}")
-        heartbeat_job(
-            sync_active=False,
-            sync_active_since="",
-            sync_active_tramite="",
-            last_error=msg,
-            detalle="Error durante la sincronización al repositorio.",
-        )
-        return {"ok": False, "already_running": False, "returncode": -3, "stdout": "", "error": msg}
-
-
-def _marcar_sync_pendiente(detalle: str, error: str = "") -> None:
-    guardar_estado_job({"enabled": True, "status": "WATCHING_NO_PENDING",
-                        "sync_pending": True, "last_error": error, "retry_count": 0, "detalle": detalle})
 
 
 def main() -> int:

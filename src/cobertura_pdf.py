@@ -243,6 +243,83 @@ def _guardar_manifest_cc(
     )
 
 
+def _sincronizar_tramite_inmediato(
+    *,
+    output_dir: Path,
+    tramite: str,
+    logger: Any,
+) -> dict[str, Any]:
+    from src.auto_resume_state import (
+        marcar_sync_activo,
+        marcar_sync_finalizado,
+        marcar_tramite_sync_error,
+        marcar_tramite_sync_ok,
+    )
+    from src.repo_sync import ejecutar_sync_repo
+
+    detalle_inicio = f"Sincronización inmediata del trámite {tramite}."
+    logger.event(
+        "SYNC_IMMEDIATE_START",
+        dig_tramite=tramite,
+        output_dir=str(output_dir),
+    )
+    marcar_sync_activo(tramite, detalle_inicio)
+
+    try:
+        sync_result = ejecutar_sync_repo(
+            output_dir=str(output_dir),
+            dig_tramite=tramite,
+        )
+    except Exception as exc:
+        msg = f"Error ejecutando sync inmediato para trámite {tramite}: {exc}"
+        logger.error(
+            "SYNC_IMMEDIATE_EXCEPTION",
+            exc,
+            dig_tramite=tramite,
+            output_dir=str(output_dir),
+        )
+        marcar_tramite_sync_error(tramite, msg)
+        marcar_sync_finalizado(
+            detalle=msg,
+            sync_pending=True,
+        )
+        return {
+            "ok": False,
+            "already_running": False,
+            "returncode": -3,
+            "stdout": "",
+            "error": msg,
+        }
+
+    stdout = str(sync_result.get("stdout") or "")
+    if stdout:
+        logger.event(
+            "SYNC_IMMEDIATE_STDOUT",
+            dig_tramite=tramite,
+            stdout=_limitar_texto(stdout),
+            returncode=sync_result.get("returncode", ""),
+        )
+
+    if sync_result.get("ok") and sync_result.get("returncode") == 0:
+        marcar_tramite_sync_ok(tramite)
+        marcar_sync_finalizado(
+            detalle=f"Sync inmediato OK para trámite {tramite}.",
+            sync_pending=False,
+        )
+    else:
+        error = (
+            sync_result.get("error")
+            or f"Returncode: {sync_result.get('returncode')}"
+        )
+        marcar_tramite_sync_error(tramite, error)
+        marcar_sync_finalizado(
+            detalle=f"Sync inmediato con error para trámite {tramite}.",
+            sync_pending=True,
+        )
+
+    return sync_result
+
+
 def _limitar_texto(value, max_chars=1200):
     text = str(value or "").strip()
     if len(text) <= max_chars:
@@ -1762,6 +1839,89 @@ def generar_coberturas_automaticas_desde_mes(
                         tramite=tramite,
                         source_dir=str(planilla_dir),
                     )
+
+                    sync_result = _sincronizar_tramite_inmediato(
+                        output_dir=output_root,
+                        tramite=tramite,
+                        logger=logger,
+                    )
+                    sync_ok = bool(sync_result.get("ok") and sync_result.get("returncode") == 0)
+                    sync_error = sync_result.get("error") or f"Returncode: {sync_result.get('returncode')}"
+                    sync_stdout = _limitar_texto(sync_result.get("stdout", ""))
+
+                    if not sync_ok:
+                        errores += 1
+                        errores_consecutivos += 1
+                        last_processed_status = "ERROR_SYNC_INMEDIATO"
+                        last_processed_detail = sync_error
+
+                        if clave_exclusion:
+                            dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
+                            poner_en_cuarentena(clave_exclusion, tramite, sync_error)
+
+                        errors_list.append(
+                            {
+                                "dig_tramite": tramite,
+                                "dig_id_tramite": dig_id_tramite,
+                                "cedula": cedula,
+                                "pdf_esperado": "|".join(expected_pdf_names),
+                                "error_tecnico": sync_error,
+                                "categoria": "ERROR_SYNC_INMEDIATO",
+                                "causa": sync_error,
+                                "sugerencia": (
+                                    "Revisar el estado del destino oficial, el lock de sync y "
+                                    "volver a intentar la sincronización de la cola pendiente."
+                                ),
+                                "attempts": "",
+                                "returncode": sync_result.get("returncode", ""),
+                                "stderr": "",
+                                "stdout": sync_stdout,
+                            }
+                        )
+
+                        writer.writerow(
+                            {
+                                "RUN_ID": run_id,
+                                "FE_PLA_ANIOMES": fe_pla,
+                                "DIG_TRAMITE": tramite,
+                                "DIG_ID_TRAMITE": dig_id_tramite,
+                                "DIG_ID_GENERACION": id_generacion,
+                                "DIG_CEDULA": cedula,
+                                "DIG_FECHA_HASTA": fecha_hasta,
+                                "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
+                                "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados),
+                                "ESTADO": "ERROR_SYNC_INMEDIATO",
+                                "PASO": "ERROR",
+                                "ORACLE_AFFECTED": "",
+                                "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
+                                "ESPERA_SEGUNDOS": "",
+                                "ERRORES_CONSECUTIVOS": errores_consecutivos,
+                                "ERROR": sync_error,
+                                "CEDULA_FALLIDA": "",
+                                "PDF_ESPERADO": "|".join(expected_pdf_names),
+                                "ERROR_CATEGORIA": "ERROR_SYNC_INMEDIATO",
+                                "CAUSA_PROBABLE": sync_error,
+                                "SUGERENCIA_REVISION": (
+                                    "Revisar el estado del destino oficial, el lock de sync y "
+                                    "reintentar la cola."
+                                ),
+                                "NODE_ATTEMPTS": "",
+                                "NODE_RETURNCODE": sync_result.get("returncode", ""),
+                                "NODE_STDERR": "",
+                                "NODE_STDOUT": sync_stdout,
+                                "FECHA_PROCESO": timestamp,
+                            }
+                        )
+
+                        marcar_ultimo_procesado(
+                            tramite=tramite,
+                            cedula=cedula,
+                            planilla=tramite,
+                            fe_pla_aniomes=fe_pla,
+                            status=last_processed_status,
+                            detalle=last_processed_detail,
+                        )
+                        continue
 
                     logger.event(
                         "ORACLE_UPDATE_START",

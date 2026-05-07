@@ -125,6 +125,117 @@ def _estado_semaforo(seconds_progress: int | None, sync_active: bool, status: st
     return "alert", "Proceso estancado o sin heartbeat reciente."
 
 
+def _diagnostico_simple_operativo() -> dict[str, object]:
+    """
+    Traduce el estado técnico a una decisión operativa simple.
+
+    Devuelve un resumen corto para la tarjeta superior y decide si se puede
+    intervenir desde la interfaz sin tocar Oracle ni archivos.
+    """
+    estado = leer_estado_operador() or {}
+    job = estado.get("job", {}) or {}
+
+    stop_flag = bool(estado.get("stop_flag"))
+    cuarentena_count = int(estado.get("quarantine_count", 0) or 0)
+    gen_lock = estado.get("generation_lock", {}) or {}
+    sync_lock = estado.get("sync_lock", {}) or {}
+    lock_activo = bool(gen_lock.get("held") or sync_lock.get("held"))
+    lock_huerfano = bool(gen_lock.get("orphan") or sync_lock.get("orphan"))
+
+    job_enabled = bool(job.get("enabled", False))
+    job_status = str(job.get("status", "") or "").strip()
+    sync_active = bool(job.get("sync_active"))
+    last_progress_at = str(job.get("last_progress_at", "") or "").strip()
+    seconds_progress = _segundos_desde(last_progress_at)
+
+    if stop_flag or not job_enabled or job_status in {"PAUSED_BY_OPERATOR", "STOPPED_BY_USER"}:
+        return {
+            "estado": "PAUSADO",
+            "variante": "warn",
+            "motivo": "El proceso está pausado por bandera o por reintento deshabilitado.",
+            "accion": "Reanudar reintento o quitar la parada antes de despachar.",
+            "puede_destrabar": True,
+            "puede_despachar": False,
+            "resumen": "Pausa activa",
+        }
+
+    if lock_huerfano and not lock_activo:
+        return {
+            "estado": "BLOQUEO HUÉRFANO",
+            "variante": "alert",
+            "motivo": "Hay un bloqueo de trabajo sin proceso activo real.",
+            "accion": "Liberar el bloqueo temporal y despachar el siguiente lote.",
+            "puede_destrabar": True,
+            "puede_despachar": False,
+            "resumen": "Bloqueo huérfano",
+        }
+
+    if lock_activo:
+        return {
+            "estado": "TRABAJANDO",
+            "variante": "ok",
+            "motivo": "Hay un proceso activo tomando registros.",
+            "accion": "Esperar a que termine la pasada actual.",
+            "puede_destrabar": False,
+            "puede_despachar": False,
+            "resumen": "Proceso en curso",
+        }
+
+    if sync_active:
+        return {
+            "estado": "SINCRONIZANDO",
+            "variante": "ok",
+            "motivo": "El worker está transfiriendo archivos al destino.",
+            "accion": "Esperar el cierre del sync.",
+            "puede_destrabar": False,
+            "puede_despachar": False,
+            "resumen": "Sync activo",
+        }
+
+    if cuarentena_count > 0:
+        return {
+            "estado": "CUARENTENA",
+            "variante": "warn",
+            "motivo": f"Hay {cuarentena_count} trámite(s) retenidos temporalmente.",
+            "accion": "Revisar cuarentena o liberar el reintento seguro.",
+            "puede_destrabar": True,
+            "puede_despachar": True,
+            "resumen": "Pendientes retenidos",
+        }
+
+    if job_status in {"RUNNING_BY_WORKER", "RETRY_PENDING", "RETRY_PENDING_SLOW"} and seconds_progress is not None and seconds_progress > 180:
+        return {
+            "estado": "ESTADO VIEJO",
+            "variante": "warn",
+            "motivo": "El estado dice que corría, pero ya no hay progreso reciente.",
+            "accion": "Despachar una nueva pasada para refrescar el estado.",
+            "puede_destrabar": False,
+            "puede_despachar": True,
+            "resumen": "Estado desactualizado",
+        }
+
+    if job_status in {"WATCHING_NO_PENDING", "COMPLETED"}:
+        return {
+            "estado": "SIN PENDIENTES",
+            "variante": "ok",
+            "motivo": "No se observan bloqueos ni pendientes visibles en el estado actual.",
+            "accion": "Puede despacharse una pasada si se quiere revalidar Oracle.",
+            "puede_destrabar": False,
+            "puede_despachar": True,
+            "resumen": "Libre para despachar",
+        }
+
+    return {
+        "estado": "LISTO PARA DESPACHAR",
+        "variante": "ok",
+        "motivo": "No hay locks, cuarentena ni sync activo visibles.",
+        "accion": "Despachar siguiente lote si se quiere acelerar.",
+        "puede_destrabar": False,
+        "puede_despachar": True,
+        "resumen": "Listo",
+    }
+
+
 def _render_css():
     st.markdown(
         """
@@ -363,6 +474,76 @@ def _render_tarjeta_resumen(titulo: str, filas: list[tuple[str, str]], variante:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _ejecutar_despacho_inmediato() -> dict:
+    """
+    Lanza una pasada del recuperador sin rearmar el contexto del job.
+
+    Se usa como empuje manual cuando el estado técnico está sano o después
+    de liberar un bloqueo huérfano.
+    """
+    lanzamiento = _disparar_worker_inmediato()
+    if lanzamiento.get("ok"):
+        st.success("Despacho lanzado.")
+        st.info("El worker quedó en segundo plano y volverá a leer el estado persistido.")
+        st.session_state["worker_recien_lanzado"] = True
+    else:
+        st.error("No se pudo lanzar el despacho.")
+        st.code(str(lanzamiento.get("error", "")), language="text")
+    return lanzamiento
+
+
+def _render_estado_simple_operativo():
+    diagnostico = _diagnostico_simple_operativo()
+
+    st.markdown("### 🚦 Estado simple del proceso")
+    st.markdown(
+        f"""
+        <div class="status-card {html.escape(str(diagnostico.get('variante', 'ok')))}">
+            <div style="font-size: 1.15rem; margin-bottom: 0.35rem;">
+                <strong>Estado:</strong> {html.escape(str(diagnostico.get('estado', '-')))}
+            </div>
+            <div style="margin-bottom: 0.25rem;">
+                <strong>Motivo:</strong> {html.escape(str(diagnostico.get('motivo', '-')))}
+            </div>
+            <div>
+                <strong>Acción recomendada:</strong> {html.escape(str(diagnostico.get('accion', '-')))}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3 = st.columns([1.25, 1.25, 1])
+
+    with col1:
+        if st.button(
+            "Liberar bloqueo huérfano",
+            key="btn_liberar_bloqueo_huerfano",
+            use_container_width=True,
+            disabled=not bool(diagnostico.get("puede_destrabar")),
+        ):
+            resultado = destrabar_para_reintento()
+            if resultado.get("ok"):
+                st.success("Bloqueos temporales liberados y reintento habilitado.")
+            else:
+                st.warning("No se habilitó el reintento porque todavía hay un proceso activo.")
+            st.caption("El detalle técnico queda en el panel de operación segura.")
+            st.rerun()
+
+    with col2:
+        if st.button(
+            "Despachar siguiente lote",
+            key="btn_despachar_siguiente_lote",
+            use_container_width=True,
+            disabled=not bool(diagnostico.get("puede_despachar")),
+        ):
+            _ejecutar_despacho_inmediato()
+            st.rerun()
+
+    with col3:
+        st.caption(f"Resumen: {diagnostico.get('resumen', '-')}")
 
 
 def _render_cola_pendiente(username: str, password: str, fe_pla_aniomes_desde: str, dig_tramite: str = ""):
@@ -1176,6 +1357,10 @@ def dashboard_page():
     )
 
     st.markdown('<div class="simple-card">', unsafe_allow_html=True)
+
+    _render_estado_simple_operativo()
+
+    st.markdown("---")
 
     # Sección de configuración de ruta
     pdf_output_dir = _render_config_section()
