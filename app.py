@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from src.oracle_jdbc import test_login
 from src.pages.dashboard import dashboard_page
 from src.pages.cedulas_tramite import cedulas_tramite_page
+from src.pages.auditoria_menor_edad import auditoria_menor_edad_page
 from src.ui import inject_global_css
 
 
@@ -56,13 +57,15 @@ def main():
 
     pagina = st.radio(
         "",
-        ["🏥 Coberturas automáticas", "📝 Corrección de cédulas"],
+        ["🏥 Coberturas automáticas", "📝 Corrección de cédulas", "🔎 Auditoría menores"],
         horizontal=True,
         label_visibility="collapsed",
     )
 
     if pagina == "📝 Corrección de cédulas":
         cedulas_tramite_page()
+    elif pagina == "🔎 Auditoría menores":
+        auditoria_menor_edad_page()
     else:
         dashboard_page()
 

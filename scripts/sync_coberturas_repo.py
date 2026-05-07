@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 PDF_CC_REGEX = re.compile(r"^CC(?:_\d{2})?\.pdf$")
+PDF_CC_LEGACY_REGEX = re.compile(r"^CC(?:\d+)?\.pdf$", re.IGNORECASE)
 
 
 # =========================
@@ -241,6 +242,10 @@ def es_pdf_cc(path: Path) -> bool:
     return path.is_file() and PDF_CC_REGEX.fullmatch(path.name) is not None
 
 
+def es_pdf_cc_legacy(path: Path) -> bool:
+    return path.is_file() and PDF_CC_LEGACY_REGEX.fullmatch(path.name) is not None and not es_pdf_cc(path)
+
+
 def reemplazar_cc_en_destino_con_backup(
     *,
     destino_dir: Path,
@@ -264,6 +269,8 @@ def reemplazar_cc_en_destino_con_backup(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     existentes_cc = sorted([p for p in destino_dir.iterdir() if es_pdf_cc(p)])
+    legacy_cc = sorted([p for p in destino_dir.iterdir() if es_pdf_cc_legacy(p)])
+    reemplazables_cc = sorted(existentes_cc + legacy_cc, key=lambda p: p.name)
 
     manifest = {
         "run_id": run_id,
@@ -272,6 +279,7 @@ def reemplazar_cc_en_destino_con_backup(
         "backup_dir": str(backup_dir),
         "staging_dir": str(staging_dir),
         "existentes_respaldados": [],
+        "legacy_respaldados": [],
         "nuevos_verificados": [],
         "eliminados_destino": [],
         "copiados_nuevos": [],
@@ -283,19 +291,23 @@ def reemplazar_cc_en_destino_con_backup(
         if item.is_file() and not es_pdf_cc(item):
             manifest["otros_archivos_no_tocados"].append(item.name)
 
-    for old_pdf in existentes_cc:
+    for old_pdf in reemplazables_cc:
         backup_pdf = backup_dir / old_pdf.name
         if backup_pdf.exists():
             backup_pdf = backup_dir / f"{old_pdf.stem}_{datetime.now().strftime('%H%M%S_%f')}{old_pdf.suffix}"
         shutil.copy2(old_pdf, backup_pdf)
-        manifest["existentes_respaldados"].append(
-            {
-                "archivo": old_pdf.name,
-                "origen": str(old_pdf),
-                "backup": str(backup_pdf),
-                "sha256": sha256_file(backup_pdf),
-            }
-        )
+        entry = {
+            "archivo": old_pdf.name,
+            "origen": str(old_pdf),
+            "backup": str(backup_pdf),
+            "sha256": sha256_file(backup_pdf),
+        }
+        if es_pdf_cc_legacy(old_pdf):
+            manifest["legacy_respaldados"].append(entry)
+        else:
+            manifest["existentes_respaldados"].append(
+                entry
+            )
 
     for src_pdf in pdfs:
         staged_pdf = staging_dir / src_pdf.name
@@ -314,7 +326,7 @@ def reemplazar_cc_en_destino_con_backup(
         )
 
     try:
-        for old_pdf in existentes_cc:
+        for old_pdf in reemplazables_cc:
             old_pdf.unlink()
             manifest["eliminados_destino"].append(str(old_pdf))
 
@@ -342,7 +354,7 @@ def reemplazar_cc_en_destino_con_backup(
             except Exception:
                 pass
 
-        for item in manifest["existentes_respaldados"]:
+        for item in manifest["existentes_respaldados"] + manifest["legacy_respaldados"]:
             backup_pdf = Path(item["backup"])
             restore_pdf = destino_dir / backup_pdf.name
             try:
@@ -432,6 +444,28 @@ def listar_tramites(origen_root: Path, tramite: str | None) -> list[str]:
             tramites.append(item.name)
 
     return sorted(tramites)
+
+
+def leer_manifest_origen(origen_dir: Path) -> dict:
+    manifest_path = origen_dir / ".cobertura_cc_input_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def inferir_repo_root_scoped(repo_root: Path, origen_dir: Path) -> Path:
+    manifest = leer_manifest_origen(origen_dir)
+    payload = manifest.get("payload") if isinstance(manifest, dict) else {}
+    fe_pla_aniomes = str((payload or {}).get("fe_pla_aniomes", "")).strip()
+    year = fe_pla_aniomes[:4]
+    if re.fullmatch(r"\d{4}", year):
+        candidate = repo_root / year
+        if candidate.exists():
+            return candidate
+    return repo_root
 
 
 def procesar_tramite(
@@ -538,14 +572,15 @@ def procesar_tramite(
 
     destino_dir = destinos[0]
     destination_cc = sorted([p for p in destino_dir.iterdir() if es_pdf_cc(p)])
+    legacy_cc = sorted([p for p in destino_dir.iterdir() if es_pdf_cc_legacy(p)])
     source_names = {pdf.name for pdf in pdfs}
     destination_names = {pdf.name for pdf in destination_cc}
-    destination_identical = bool(destination_cc) and source_names == destination_names and all(
+    destination_identical = bool(destination_cc) and not legacy_cc and source_names == destination_names and all(
         (destino_dir / pdf.name).exists() and sha256_file(pdf) == sha256_file(destino_dir / pdf.name)
         for pdf in pdfs
     )
 
-    if replace_existing_cc and destination_cc and not destination_identical:
+    if replace_existing_cc and (destination_cc or legacy_cc) and not destination_identical:
         if dry_run:
             for old_pdf in destination_cc:
                 registrar(
@@ -580,7 +615,22 @@ def procesar_tramite(
                     "SIMULADO_REEMPLAZARIA_CC",
                     "Simulación: el CC*.pdf del destino sería reemplazado con respaldo reversible.",
                 )
-            resumen["simulados"] += len(pdfs) + len(destination_cc)
+            for old_pdf in legacy_cc:
+                registrar(
+                    conn,
+                    writer,
+                    run_id,
+                    dry_run,
+                    tramite,
+                    old_pdf.name,
+                    "",
+                    str(old_pdf),
+                    "",
+                    sha256_file(old_pdf),
+                    "SIMULADO_RESPALDARIA_CC_OBSOLETO_LEGACY",
+                    "Simulación: el CC legacy del destino sería respaldado y retirado antes del reemplazo.",
+                )
+            resumen["simulados"] += len(pdfs) + len(destination_cc) + len(legacy_cc)
             return resumen
 
         try:
@@ -869,6 +919,12 @@ def main() -> int:
     backup_root.mkdir(parents=True, exist_ok=True)
     lock_path = logs_dir / "cobertura_repo_sync.lock"
 
+    repo_scan_root = repo_root
+    if tramite:
+        repo_scan_root = inferir_repo_root_scoped(repo_root, origen_root / tramite)
+        if repo_scan_root != repo_root:
+            print(f"Acotando búsqueda de destinos a {repo_scan_root} según manifiesto local.")
+
     try:
         with ArchivoLock(lock_path):
             run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -877,7 +933,7 @@ def main() -> int:
                 run_id=run_id,
                 dry_run=dry_run,
                 origen_root=str(origen_root),
-                repo_root=str(repo_root),
+                repo_root=str(repo_scan_root),
                 tramite=tramite or "",
             )
             modo_nombre = "dry_run" if dry_run else "apply"
@@ -886,9 +942,9 @@ def main() -> int:
             tramites = listar_tramites(origen_root, tramite)
 
             print(f"Trámites origen encontrados en {origen_root}: {len(tramites)}")
-            print(f"Construyendo índice de carpetas destino en {repo_root}...")
+            print(f"Construyendo índice de carpetas destino en {repo_scan_root}...")
 
-            indice_destinos = construir_indice_destinos(repo_root)
+            indice_destinos = construir_indice_destinos(repo_scan_root)
 
             print(f"Carpetas destino indexadas: {len(indice_destinos)}")
 
