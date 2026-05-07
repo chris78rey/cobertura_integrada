@@ -85,7 +85,13 @@ def marcar_tramite_sync_pendiente(tramite: str, source_dir: str, detalle: str = 
     conn.execute("""
         INSERT INTO cobertura_sync_queue (tramite, source_dir, status, attempts, created_at, updated_at)
         VALUES (?, ?, 'PENDING', 0, ?, ?)
-        ON CONFLICT(tramite) DO UPDATE SET status='PENDING', attempts=0, last_error='', updated_at=?
+        ON CONFLICT(tramite) DO UPDATE SET
+            source_dir=excluded.source_dir,
+            status='PENDING',
+            attempts=0,
+            last_error='',
+            synced_at='',
+            updated_at=?
     """, (tramite, source_dir, now, now, now))
     conn.commit()
     conn.close()

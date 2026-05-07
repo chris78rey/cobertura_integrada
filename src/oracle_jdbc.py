@@ -215,87 +215,257 @@ def query_dataframe(
             except Exception:
                 pass
 
-def actualizar_cobertura_por_id_tramite(
+def actualizar_cobertura_por_tramite(
     username: str,
     password: str,
-    dig_id_tramite: str,
-    dig_id_generacion: str = "",
-    dig_cedula: str = "",
-    dig_tramite: str = "",
+    dig_tramite: str,
 ) -> dict:
     """
-    Actualiza DIG_COBERTURA='S' solo si está en 'N' y DIG_PLANILLADO='S'.
+    Actualiza DIG_COBERTURA='S' usando DIG_TRAMITE como llave operativa.
 
-    Si DIG_ID_TRAMITE está vacío, usa DIG_ID_GENERACION + DIG_CEDULA
-    como clave alternativa para identificar la fila.
+    Seguridad:
+    - Solo actualiza si DIG_COBERTURA sigue en 'N'.
+    - Solo actualiza si DIG_PLANILLADO está en 'S'.
+    - Exige exactamente 1 fila afectada.
+    - Verifica inmediatamente después del COMMIT que quedó en 'S'.
     """
 
     conn = None
     prepared_statement = None
+    before_statement = None
+    before_result = None
+    after_statement = None
+    after_result = None
 
-    dig_id_tramite = str(dig_id_tramite or "").strip()
-    dig_id_generacion = str(dig_id_generacion or "").strip()
-    dig_cedula = str(dig_cedula or "").strip()
     dig_tramite = str(dig_tramite or "").strip()
-
-    if dig_id_tramite:
-        sql = """
-            UPDATE DIGITALIZACION.DIGITALIZACION
-            SET DIG_COBERTURA = 'S'
-            WHERE DIG_ID_TRAMITE = ?
-              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
-              AND TRIM(DIG_PLANILLADO) = 'S'
-        """
-        params = [dig_id_tramite]
-    elif dig_id_generacion and dig_cedula:
-        sql = """
-            UPDATE DIGITALIZACION.DIGITALIZACION
-            SET DIG_COBERTURA = 'S'
-            WHERE DIG_ID_GENERACION = ?
-              AND DIG_CEDULA = ?
-              AND (DIG_ID_TRAMITE IS NULL OR TRIM(DIG_ID_TRAMITE) IS NULL)
-              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
-              AND TRIM(DIG_PLANILLADO) = 'S'
-        """
-        params = [dig_id_generacion, dig_cedula]
-    elif dig_cedula:
-        # Último recurso: ni DIG_ID_TRAMITE ni DIG_ID_GENERACION existen.
-        # Se usa DIG_TRAMITE + DIG_CEDULA + las condiciones de seguridad.
-        sql = """
-            UPDATE DIGITALIZACION.DIGITALIZACION
-            SET DIG_COBERTURA = 'S'
-            WHERE TO_CHAR(DIG_TRAMITE) = ?
-              AND DIG_CEDULA = ?
-              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
-              AND TRIM(DIG_PLANILLADO) = 'S'
-              AND ROWNUM = 1
-        """
-        params = [dig_tramite, dig_cedula]
-    else:
+    if not dig_tramite:
         return {
             "ok": False,
             "affected": 0,
-            "error": "Sin clave suficiente para actualizar (DIG_ID_TRAMITE y DIG_ID_GENERACION/CEDULA vacíos).",
+            "verified": False,
+            "already_closed": False,
+            "error": "Sin DIG_TRAMITE. No se permite actualizar Oracle.",
+            "criterio": "DIG_TRAMITE",
+            "oracle_context": {},
+            "before_rows": [],
+            "after_rows": [],
         }
+
+    context_sql = """
+        SELECT
+            USER,
+            SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'),
+            SYS_CONTEXT('USERENV', 'DB_NAME'),
+            SYS_CONTEXT('USERENV', 'INSTANCE_NAME'),
+            SYS_CONTEXT('USERENV', 'SERVER_HOST'),
+            SYS_CONTEXT('USERENV', 'SERVICE_NAME')
+        FROM DUAL
+    """
+
+    select_sql = """
+        SELECT
+            TO_CHAR(DIG_TRAMITE),
+            TRIM(NVL(DIG_PLANILLADO, '')),
+            TRIM(NVL(DIG_COBERTURA, 'N')),
+            TRIM(TO_CHAR(FE_PLA_ANIOMES))
+        FROM DIGITALIZACION.DIGITALIZACION
+        WHERE TO_CHAR(DIG_TRAMITE) = ?
+    """
+
+    update_sql = """
+        UPDATE DIGITALIZACION.DIGITALIZACION
+        SET DIG_COBERTURA = 'S'
+        WHERE TO_CHAR(DIG_TRAMITE) = ?
+          AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+          AND TRIM(DIG_PLANILLADO) = 'S'
+    """
+    oracle_context = {}
+    before_rows = []
+    after_rows = []
 
     try:
         conn = oracle_connect(username, password)
         java_conn = conn.jconn
         java_conn.setAutoCommit(False)
 
-        prepared_statement = java_conn.prepareStatement(sql)
+        try:
+            before_statement = java_conn.prepareStatement(select_sql)
+            before_statement.setString(1, dig_tramite)
+            before_result = before_statement.executeQuery()
+            while before_result.next():
+                before_rows.append(
+                    {
+                        "dig_tramite": str(before_result.getString(1) or "").strip(),
+                        "dig_planillado": str(before_result.getString(2) or "").strip(),
+                        "dig_cobertura": str(before_result.getString(3) or "").strip(),
+                        "fe_pla_aniomes": str(before_result.getString(4) or "").strip(),
+                    }
+                )
 
-        for index, value in enumerate(params, start=1):
-            prepared_statement.setString(index, str(value))
+            context_statement = java_conn.prepareStatement(context_sql)
+            try:
+                context_result = context_statement.executeQuery()
+                if context_result.next():
+                    oracle_context = {
+                        "db_user": str(context_result.getString(1) or "").strip(),
+                        "current_schema": str(context_result.getString(2) or "").strip(),
+                        "db_name": str(context_result.getString(3) or "").strip(),
+                        "instance_name": str(context_result.getString(4) or "").strip(),
+                        "server_host": str(context_result.getString(5) or "").strip(),
+                        "service_name": str(context_result.getString(6) or "").strip(),
+                    }
+            finally:
+                try:
+                    context_statement.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            try:
+                java_conn.rollback()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "affected": 0,
+                "verified": False,
+                "already_closed": False,
+                "error": f"No se pudo leer Oracle antes del UPDATE: {exc}",
+                "criterio": "DIG_TRAMITE",
+                "oracle_context": oracle_context,
+                "before_rows": before_rows,
+                "after_rows": after_rows,
+            }
 
-        affected = prepared_statement.executeUpdate()
+        if len(before_rows) != 1:
+            try:
+                java_conn.rollback()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "affected": 0,
+                "verified": False,
+                "already_closed": False,
+                "error": (
+                    f"Antes del UPDATE se esperaba exactamente 1 fila para DIG_TRAMITE={dig_tramite}, "
+                    f"pero se encontraron {len(before_rows)}."
+                ),
+                "criterio": "DIG_TRAMITE",
+                "oracle_context": oracle_context,
+                "before_rows": before_rows,
+                "after_rows": after_rows,
+            }
+
+        before = before_rows[0]
+        if before.get("dig_cobertura") == "S":
+            try:
+                java_conn.rollback()
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "affected": 0,
+                "verified": True,
+                "already_closed": True,
+                "error": "",
+                "criterio": "DIG_TRAMITE",
+                "oracle_context": oracle_context,
+                "before_rows": before_rows,
+                "after_rows": before_rows,
+            }
+
+        if before.get("dig_planillado") != "S":
+            try:
+                java_conn.rollback()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "affected": 0,
+                "verified": False,
+                "already_closed": False,
+                "error": (
+                    f"No se actualiza porque DIG_PLANILLADO={before.get('dig_planillado', '')} "
+                    f"para DIG_TRAMITE={dig_tramite}."
+                ),
+                "criterio": "DIG_TRAMITE",
+                "oracle_context": oracle_context,
+                "before_rows": before_rows,
+                "after_rows": after_rows,
+            }
+
+        prepared_statement = java_conn.prepareStatement(update_sql)
+        prepared_statement.setString(1, dig_tramite)
+
+        affected = int(prepared_statement.executeUpdate())
+
+        if affected != 1:
+            try:
+                java_conn.rollback()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "affected": affected,
+                "verified": False,
+                "already_closed": False,
+                "error": (
+                    f"Actualización Oracle no confirmada. Se esperaba exactamente 1 fila para DIG_TRAMITE={dig_tramite}, "
+                    f"pero se afectaron {affected}. Se aplicó rollback."
+                ),
+                "criterio": "DIG_TRAMITE",
+                "oracle_context": oracle_context,
+                "before_rows": before_rows,
+                "after_rows": after_rows,
+            }
 
         java_conn.commit()
+
+        after_statement = java_conn.prepareStatement(select_sql)
+        after_statement.setString(1, dig_tramite)
+        after_result = after_statement.executeQuery()
+        while after_result.next():
+            after_rows.append(
+                {
+                    "dig_tramite": str(after_result.getString(1) or "").strip(),
+                    "dig_planillado": str(after_result.getString(2) or "").strip(),
+                    "dig_cobertura": str(after_result.getString(3) or "").strip(),
+                    "fe_pla_aniomes": str(after_result.getString(4) or "").strip(),
+                }
+            )
+
+        verified = (
+            len(after_rows) == 1
+            and after_rows[0].get("dig_cobertura") == "S"
+            and after_rows[0].get("dig_planillado") == "S"
+        )
+
+        if not verified:
+            return {
+                "ok": False,
+                "affected": affected,
+                "verified": False,
+                "already_closed": False,
+                "error": (
+                    f"El UPDATE hizo COMMIT con affected=1 para DIG_TRAMITE={dig_tramite}, "
+                    "pero la verificación posterior no confirmó DIG_COBERTURA='S'."
+                ),
+                "criterio": "DIG_TRAMITE",
+                "oracle_context": oracle_context,
+                "before_rows": before_rows,
+                "after_rows": after_rows,
+            }
 
         return {
             "ok": True,
             "affected": affected,
-            "error": None,
+            "verified": True,
+            "already_closed": False,
+            "error": "",
+            "criterio": "DIG_TRAMITE",
+            "oracle_context": oracle_context,
+            "before_rows": before_rows,
+            "after_rows": after_rows,
         }
 
     except Exception as exc:
@@ -308,10 +478,40 @@ def actualizar_cobertura_por_id_tramite(
         return {
             "ok": False,
             "affected": 0,
+            "verified": False,
+            "already_closed": False,
             "error": str(exc),
+            "criterio": "DIG_TRAMITE",
+            "oracle_context": oracle_context,
+            "before_rows": before_rows,
+            "after_rows": after_rows,
         }
 
     finally:
+        if after_result:
+            try:
+                after_result.close()
+            except Exception:
+                pass
+
+        if after_statement:
+            try:
+                after_statement.close()
+            except Exception:
+                pass
+
+        if before_result:
+            try:
+                before_result.close()
+            except Exception:
+                pass
+
+        if before_statement:
+            try:
+                before_statement.close()
+            except Exception:
+                pass
+
         if prepared_statement:
             try:
                 prepared_statement.close()

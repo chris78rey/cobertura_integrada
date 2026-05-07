@@ -15,6 +15,9 @@ from src.auto_resume_state import (  # noqa: E402
     leer_estado_job,
     job_debe_reanudarse,
     guardar_estado_job,
+    heartbeat_job,
+    marcar_sync_activo,
+    marcar_sync_finalizado,
     marcar_job_completado,
     marcar_job_reintento,
     marcar_job_vigilando_sin_pendientes,
@@ -91,27 +94,57 @@ def ejecutar_sync_repo(output_dir: str, dig_tramite: str = "") -> dict:
     cmd = [sys.executable, str(script), "--origen-root", output_dir,
            "--repo-root", "/data_nuevo/repo_grande/data/datos",
            "--logs-dir", str(PROJECT_ROOT / "logs"),
-           "--state-db", str(PROJECT_ROOT / "logs" / "cobertura_repo_sync.sqlite"), "--apply"]
+           "--state-db", str(PROJECT_ROOT / "logs" / "cobertura_repo_sync.sqlite"),
+           "--backup-root", str(PROJECT_ROOT / "logs" / "sync_replaced_cc_backups"),
+           "--replace-existing-cc",
+           "--apply"]
     if dig_tramite:
         cmd.extend(["--tramite", dig_tramite])
     log("[INFO] Ejecutando sync al repositorio oficial...")
     try:
+        estado_sync = leer_estado_job()
+        heartbeat_job(
+            sync_active=True,
+            sync_active_since=str(estado_sync.get("sync_active_since") or estado_sync.get("updated_at") or ""),
+            sync_active_tramite=str(dig_tramite or "").strip(),
+            detalle="Sincronización al repositorio en ejecución.",
+        )
         completed = subprocess.run(cmd, cwd=str(PROJECT_ROOT), text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800, check=False)
         stdout = completed.stdout or ""
         log(stdout)
         if completed.returncode != 0:
             log(f"[WARN] Sync terminó con código {completed.returncode}")
+        heartbeat_job(
+            sync_active=False,
+            sync_active_since="",
+            sync_active_tramite="",
+            detalle="Sincronización al repositorio finalizada.",
+        )
         return {"ok": completed.returncode == 0, "already_running": completed.returncode == 10,
                 "returncode": completed.returncode, "stdout": stdout,
                 "error": "" if completed.returncode == 0 else stdout[-2000:]}
     except subprocess.TimeoutExpired as exc:
         msg = f"Timeout ejecutando sync: {exc}"
         log(f"[ERROR] {msg}")
+        heartbeat_job(
+            sync_active=False,
+            sync_active_since="",
+            sync_active_tramite="",
+            last_error=msg,
+            detalle="Timeout durante la sincronización al repositorio.",
+        )
         return {"ok": False, "already_running": False, "returncode": -2, "stdout": "", "error": msg}
     except Exception as exc:
         msg = f"Error ejecutando sync: {exc}"
         log(f"[ERROR] {msg}")
+        heartbeat_job(
+            sync_active=False,
+            sync_active_since="",
+            sync_active_tramite="",
+            last_error=msg,
+            detalle="Error durante la sincronización al repositorio.",
+        )
         return {"ok": False, "already_running": False, "returncode": -3, "stdout": "", "error": msg}
 
 
@@ -132,16 +165,23 @@ def main() -> int:
         for item in pendientes_sync:
             t = item["tramite"]
             log(f"[INFO] Sincronizando trámite {t} desde cola pendiente...")
-            sync_result = ejecutar_sync_repo(output_dir="/data_nuevo/coberturas", dig_tramite=t)
-            if sync_result.get("ok") and sync_result.get("returncode") == 0:
-                marcar_tramite_sync_ok(t)
-                log(f"[INFO] Sync OK para {t}")
-            elif sync_result.get("returncode") == 20:
-                marcar_tramite_sync_error(t, "DESTINO_NO_ENCONTRADO - esperando que otra app restaure la carpeta")
-                log(f"[WARN] Destino no encontrado para {t}. Se espera a que otra app restaure.")
-            else:
-                marcar_tramite_sync_error(t, sync_result.get("error", "Error desconocido"))
-                log(f"[WARN] Sync falló para {t}")
+            marcar_sync_activo(t, f"Sync de cola pendiente para trámite {t}.")
+            try:
+                sync_result = ejecutar_sync_repo(output_dir="/data_nuevo/coberturas", dig_tramite=t)
+                if sync_result.get("ok") and sync_result.get("returncode") == 0:
+                    marcar_tramite_sync_ok(t)
+                    log(f"[INFO] Sync OK para {t}")
+                elif sync_result.get("returncode") == 20:
+                    marcar_tramite_sync_error(t, "DESTINO_NO_ENCONTRADO - esperando que otra app restaure la carpeta")
+                    log(f"[WARN] Destino no encontrado para {t}. Se espera a que otra app restaure.")
+                else:
+                    marcar_tramite_sync_error(t, sync_result.get("error", "Error desconocido"))
+                    log(f"[WARN] Sync falló para {t}")
+            finally:
+                marcar_sync_finalizado(
+                    detalle=f"Sync de cola finalizado para trámite {t}.",
+                    sync_pending=True,
+                )
 
     if not job_debe_reanudarse():
         return 0
@@ -163,6 +203,16 @@ def main() -> int:
     modo_vigilante = _es_modo_vigilante(dig_tramite)
     pendientes_antes = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
     log(f"[INFO] Pendientes antes de ejecutar: {pendientes_antes}")
+
+    heartbeat_job(
+        enabled=True,
+        status="RUNNING_BY_WORKER" if pendientes_antes > 0 else "WATCHING_NO_PENDING",
+        pendientes_antes=pendientes_antes,
+        detalle=(
+            f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
+            + (f" y trámite {dig_tramite}" if dig_tramite else "")
+        ),
+    )
 
     if pendientes_antes <= 0:
         sync_pending = bool(estado.get("sync_pending"))
@@ -208,10 +258,31 @@ def main() -> int:
                         })
 
     try:
+        heartbeat_job(
+            enabled=True,
+            status="RUNNING_BY_WORKER",
+            sync_active=False,
+            detalle="Generación de coberturas en ejecución.",
+        )
         result = ejecutar_coberturas_con_lock(
             username=username, password=password, fe_pla_aniomes_desde=fe_pla_aniomes_desde,
             dig_tramite=dig_tramite, output_dir=output_dir, progress_callback=None)
         log(f"[INFO] Resultado generación: generados={result.get('generados',0)}, actualizados={result.get('actualizados',0)}, errores={result.get('errores',0)}")
+        heartbeat_job(
+            enabled=True,
+            status="RUNNING_BY_WORKER",
+            last_generados=result.get("generados", 0),
+            last_actualizados=result.get("actualizados", 0),
+            last_errores=result.get("errores", 0),
+            last_run_id=result.get("run_id", ""),
+            last_manifest_path=result.get("manifest_path", ""),
+            detalle=(
+                f"Generación terminada. "
+                f"Generados={result.get('generados', 0)}, "
+                f"actualizados={result.get('actualizados', 0)}, "
+                f"errores={result.get('errores', 0)}."
+            ),
+        )
         # Guardar métricas del último ciclo para que la UI las muestre
         guardar_estado_job({
             "enabled": True, "status": "RUNNING_BY_WORKER",
@@ -228,6 +299,7 @@ def main() -> int:
             ),
         })
     except ProcesoCoberturaYaEnEjecucion as exc:
+        marcar_sync_finalizado(detalle="Proceso principal en ejecución detectado; se esperará al siguiente ciclo.", sync_pending=True)
         estado = leer_estado_job()
         retries = int(estado.get("retry_count", 0)) + 1
         if retries >= 5:
@@ -239,15 +311,27 @@ def main() -> int:
                                 "last_error": str(exc), "retry_count": retries})
         return 0
     except Exception as exc:
+        marcar_sync_finalizado(detalle=f"Error en sincronización: {exc}", sync_pending=True)
         marcar_job_reintento(str(exc))
         return 1
 
     sync_result = ejecutar_sync_repo(output_dir=output_dir, dig_tramite=dig_tramite)
     sync_ok = bool(sync_result.get("ok"))
     sync_error = sync_result.get("error") or f"Returncode: {sync_result.get('returncode')}"
+    marcar_sync_finalizado(
+        detalle="Sync del ciclo principal finalizado.",
+        sync_pending=not sync_ok,
+    )
 
     pendientes_despues = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
     log(f"[INFO] Pendientes después de ejecutar: {pendientes_despues}")
+
+    heartbeat_job(
+        pendientes_despues=pendientes_despues,
+        detalle=(
+            f"Revisión posterior a la generación. Pendientes restantes: {pendientes_despues}."
+        ),
+    )
 
     if pendientes_despues <= 0:
         if not sync_ok:

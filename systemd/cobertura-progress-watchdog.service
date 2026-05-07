@@ -1,0 +1,11 @@
+[Unit]
+Description=Cobertura MSP - watchdog de progreso
+After=network-online.target cobertura-auto-resume.timer
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/data_nuevo/cobertura_integrada
+ExecStart=/data_nuevo/cobertura_integrada/scripts/cobertura_watchdog.py
+Environment="PYTHONUNBUFFERED=1"

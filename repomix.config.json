@@ -1,0 +1,64 @@
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "include": [
+    "src/**/*",
+    "scripts/**/*",
+    "systemd/**/*",
+    "config/**/*",
+    "app.py",
+    "README.md",
+    "MANUAL_OPERATIVO.md",
+    "AYUDA_MEMORIA.md",
+    "requirements.txt",
+    "package.json",
+    "package-lock.json",
+    ".gitignore",
+    "skills/**/*"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDotIgnore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "backups/**",
+      "duplica/**",
+      "coberturas_generadas/**",
+      "venv/**",
+      "node_modules/**",
+      "logs/**",
+      "streamlit.log",
+      "repomix-output.xml",
+      "*.bak",
+      "*.tmp",
+      "*.log",
+      "*.sqlite",
+      "*.jsonl",
+      "*.csv",
+      "__pycache__/**"
+    ]
+  },
+  "output": {
+    "style": "xml",
+    "fileSummary": true,
+    "directoryStructure": true,
+    "files": true,
+    "showLineNumbers": false,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "includeEmptyDirectories": false,
+    "includeFullDirectoryStructure": false,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100,
+      "includeDiffs": false,
+      "includeLogs": false,
+      "includeLogsCount": 50
+    }
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}

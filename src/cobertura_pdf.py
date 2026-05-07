@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
 import random
 import re
 import subprocess
 import time
+import shutil
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -105,6 +108,139 @@ def _nombre_cc_por_secuencia(indice: int, total: int) -> str:
     if total <= 1:
         return "CC"
     return f"CC_{indice:02d}"
+
+
+PDF_CC_REGEX = re.compile(r"^CC(?:_\d{2})?\.pdf$", re.IGNORECASE)
+CC_INPUT_MANIFEST_NAME = ".cobertura_cc_input_manifest.json"
+CC_LOCAL_BACKUP_ROOT = Path("/data_nuevo/cobertura_integrada/logs/backup_cc_locales_por_reproceso")
+
+
+def _listar_cc_locales(planilla_dir: Path) -> list[Path]:
+    if not planilla_dir.exists() or not planilla_dir.is_dir():
+        return []
+    return sorted(
+        p for p in planilla_dir.iterdir()
+        if p.is_file() and PDF_CC_REGEX.fullmatch(p.name)
+    )
+
+
+def _cc_manifest_path(planilla_dir: Path) -> Path:
+    return planilla_dir / CC_INPUT_MANIFEST_NAME
+
+
+def _payload_firma_cc(
+    registro: dict[str, str],
+    cedulas_a_generar: list[dict[str, str]],
+    expected_pdf_names: list[str],
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "dig_tramite": str(registro.get("dig_tramite", "")).strip(),
+        "dig_id_tramite": str(registro.get("dig_id_tramite", "")).strip(),
+        "dig_id_generacion": str(registro.get("dig_id_generacion", "")).strip(),
+        "fe_pla_aniomes": str(registro.get("fe_pla_aniomes", "")).strip(),
+        "dig_fecha_hasta": str(registro.get("dig_fecha_hasta", "")).strip(),
+        "dig_menor_edad": str(registro.get("dig_menor_edad", "")).strip(),
+        "cedulas": [
+            {
+                "orden": index,
+                "tipo": str(item.get("tipo", "")).strip(),
+                "cedula": str(item.get("cedula", "")).strip(),
+            }
+            for index, item in enumerate(cedulas_a_generar, start=1)
+        ],
+        "expected_pdf_names": list(expected_pdf_names),
+    }
+
+
+def _firma_cc(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _leer_manifest_cc(planilla_dir: Path) -> dict[str, Any]:
+    path = _cc_manifest_path(planilla_dir)
+    try:
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _cc_locales_corresponden_a_oracle(
+    planilla_dir: Path,
+    expected_pdf_names: list[str],
+    firma_actual: str,
+) -> bool:
+    manifest = _leer_manifest_cc(planilla_dir)
+    if manifest.get("firma") != firma_actual:
+        return False
+    if list(manifest.get("expected_pdf_names") or []) != list(expected_pdf_names):
+        return False
+    actuales = [p.name for p in _listar_cc_locales(planilla_dir)]
+    return actuales == list(expected_pdf_names)
+
+
+def _resguardar_cc_locales(
+    *,
+    planilla_dir: Path,
+    run_id: str,
+    tramite: str,
+) -> list[tuple[Path, Path]]:
+    existentes = _listar_cc_locales(planilla_dir)
+    if not existentes:
+        return []
+
+    backup_dir = CC_LOCAL_BACKUP_ROOT / _safe_name(run_id) / _safe_name(tramite)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    respaldados: list[tuple[Path, Path]] = []
+    for pdf in existentes:
+        backup_path = backup_dir / pdf.name
+        if backup_path.exists():
+            backup_path = backup_dir / f"{pdf.stem}_{datetime.now().strftime('%H%M%S_%f')}{pdf.suffix}"
+        shutil.move(str(pdf), str(backup_path))
+        respaldados.append((backup_path, pdf))
+    return respaldados
+
+
+def _restaurar_cc_locales(respaldados: list[tuple[Path, Path]], planilla_dir: Path, expected_pdf_names: list[str]) -> None:
+    for name in expected_pdf_names:
+        pdf_actual = planilla_dir / name
+        if pdf_actual.exists():
+            try:
+                pdf_actual.unlink()
+            except Exception:
+                pass
+
+    for backup_path, original_path in reversed(respaldados):
+        try:
+            if backup_path.exists():
+                shutil.move(str(backup_path), str(original_path))
+        except Exception:
+            pass
+
+
+def _guardar_manifest_cc(
+    *,
+    planilla_dir: Path,
+    payload: dict[str, Any],
+    firma_actual: str,
+    expected_pdf_names: list[str],
+    run_id: str,
+) -> None:
+    manifest = {
+        "firma": firma_actual,
+        "payload": payload,
+        "expected_pdf_names": list(expected_pdf_names),
+        "run_id": run_id,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _cc_manifest_path(planilla_dir).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _limitar_texto(value, max_chars=1200):
@@ -1126,7 +1262,7 @@ def generar_coberturas_automaticas_desde_mes(
         output_root = _get_output_root()
     node_project_dir = _get_node_project_dir()
 
-    from src.oracle_jdbc import actualizar_cobertura_por_id_tramite
+    from src.oracle_jdbc import actualizar_cobertura_por_tramite
     from src.observability import RunLogger, build_run_id, mask_cedula
     from src.quarantine import (
         obtener_claves_en_cuarentena,
@@ -1468,6 +1604,25 @@ def generar_coberturas_automaticas_desde_mes(
                 pdfs_generados: list[Path] = []
                 error_en_pdf = ""
                 error_en_pdf_detalle: dict[str, str] = {}
+                expected_output_names = [
+                    _nombre_cc_por_secuencia(indice=secuencia, total=total_pdfs_tramite)
+                    for secuencia in range(1, total_pdfs_tramite + 1)
+                ]
+                expected_pdf_names = [f"{name}.pdf" for name in expected_output_names]
+                payload_cc_actual = _payload_firma_cc(reg, cedulas_a_generar, expected_pdf_names)
+                firma_cc_actual = _firma_cc(payload_cc_actual)
+                respaldos_cc_locales: list[tuple[Path, Path]] = []
+
+                if not _cc_locales_corresponden_a_oracle(
+                    planilla_dir=planilla_dir,
+                    expected_pdf_names=expected_pdf_names,
+                    firma_actual=firma_cc_actual,
+                ):
+                    respaldos_cc_locales = _resguardar_cc_locales(
+                        planilla_dir=planilla_dir,
+                        run_id=run_id,
+                        tramite=tramite,
+                    )
 
                 for secuencia_pdf, item_cedula in enumerate(cedulas_a_generar, start=1):
                     c = item_cedula["cedula"]
@@ -1563,6 +1718,12 @@ def generar_coberturas_automaticas_desde_mes(
                             node_stderr=error_en_pdf_detalle["stderr"],
                             node_stdout=error_en_pdf_detalle["stdout"],
                         )
+                        if respaldos_cc_locales:
+                            _restaurar_cc_locales(
+                                respaldos_cc_locales,
+                                planilla_dir=planilla_dir,
+                                expected_pdf_names=expected_pdf_names,
+                            )
                         break
 
                 # =========================
@@ -1579,6 +1740,23 @@ def generar_coberturas_automaticas_desde_mes(
                 last_processed_detail = "Fila procesada."
 
                 if todos_los_pdfs_ok:
+                    try:
+                        _guardar_manifest_cc(
+                            planilla_dir=planilla_dir,
+                            payload=payload_cc_actual,
+                            firma_actual=firma_cc_actual,
+                            expected_pdf_names=expected_pdf_names,
+                            run_id=run_id,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "PDF_CC_MANIFEST_WRITE_ERROR",
+                            exc,
+                            index=index,
+                            dig_tramite=tramite,
+                            dig_id_tramite=dig_id_tramite,
+                        )
+
                     # Marcar como sync pendiente ANTES de actualizar Oracle
                     marcar_tramite_sync_pendiente(
                         tramite=tramite,
@@ -1596,10 +1774,9 @@ def generar_coberturas_automaticas_desde_mes(
                         nuevo_valor="DIG_COBERTURA=S",
                     )
 
-                    update_result = actualizar_cobertura_por_id_tramite(
-                        username, password, dig_id_tramite,
-                        dig_id_generacion=id_generacion,
-                        dig_cedula=cedula,
+                    update_result = actualizar_cobertura_por_tramite(
+                        username=username,
+                        password=password,
                         dig_tramite=tramite,
                     )
 
@@ -1611,10 +1788,23 @@ def generar_coberturas_automaticas_desde_mes(
                         dig_id_generacion=id_generacion,
                         ok=bool(update_result.get("ok")),
                         affected=update_result.get("affected", 0),
+                        verified=bool(update_result.get("verified")),
+                        already_closed=bool(update_result.get("already_closed")),
                         error=update_result.get("error", ""),
+                        criterio=update_result.get("criterio", ""),
+                        oracle_context=update_result.get("oracle_context", {}),
+                        before_rows=update_result.get("before_rows", []),
+                        after_rows=update_result.get("after_rows", []),
                     )
 
-                    if update_result["ok"] and update_result["affected"] > 0:
+                    if (
+                        update_result.get("ok")
+                        and update_result.get("verified") is True
+                        and (
+                            update_result.get("affected") == 1
+                            or update_result.get("already_closed") is True
+                        )
+                    ):
                         generados += 1
                         actualizados += 1
                         errores_consecutivos = 0
@@ -1686,7 +1876,7 @@ def generar_coberturas_automaticas_desde_mes(
                                 "pdf_esperado": "",
                                 "categoria": "ERROR_ACTUALIZANDO_ORACLE",
                                 "causa": err_msg,
-                                "sugerencia": "Revisar condición del UPDATE, DIG_ID_TRAMITE, DIG_ID_GENERACION, DIG_CEDULA y estado DIG_PLANILLADO.",
+                                "sugerencia": "Revisar condición del UPDATE, DIG_TRAMITE y estado DIG_PLANILLADO.",
                                 "error": err_msg,
                             }
                         )

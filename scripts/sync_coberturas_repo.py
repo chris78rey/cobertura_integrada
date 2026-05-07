@@ -241,6 +241,154 @@ def es_pdf_cc(path: Path) -> bool:
     return path.is_file() and PDF_CC_REGEX.fullmatch(path.name) is not None
 
 
+def reemplazar_cc_en_destino_con_backup(
+    *,
+    destino_dir: Path,
+    pdfs: list[Path],
+    backup_root: Path,
+    run_id: str,
+    tramite: str,
+) -> dict:
+    """
+    Reemplaza únicamente los PDFs CC*.pdf del destino.
+
+    No toca otros archivos de la carpeta destino.
+    Deja respaldo reversible de los CC existentes y de los nuevos PDFs copiados.
+    """
+
+    destino_dir = destino_dir.resolve()
+    backup_dir = backup_root / run_id / tramite
+    staging_dir = backup_dir / "nuevos_verificados"
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    existentes_cc = sorted([p for p in destino_dir.iterdir() if es_pdf_cc(p)])
+
+    manifest = {
+        "run_id": run_id,
+        "tramite": tramite,
+        "destino_dir": str(destino_dir),
+        "backup_dir": str(backup_dir),
+        "staging_dir": str(staging_dir),
+        "existentes_respaldados": [],
+        "nuevos_verificados": [],
+        "eliminados_destino": [],
+        "copiados_nuevos": [],
+        "restauracion_por_error": [],
+        "otros_archivos_no_tocados": [],
+    }
+
+    for item in sorted(destino_dir.iterdir()):
+        if item.is_file() and not es_pdf_cc(item):
+            manifest["otros_archivos_no_tocados"].append(item.name)
+
+    for old_pdf in existentes_cc:
+        backup_pdf = backup_dir / old_pdf.name
+        if backup_pdf.exists():
+            backup_pdf = backup_dir / f"{old_pdf.stem}_{datetime.now().strftime('%H%M%S_%f')}{old_pdf.suffix}"
+        shutil.copy2(old_pdf, backup_pdf)
+        manifest["existentes_respaldados"].append(
+            {
+                "archivo": old_pdf.name,
+                "origen": str(old_pdf),
+                "backup": str(backup_pdf),
+                "sha256": sha256_file(backup_pdf),
+            }
+        )
+
+    for src_pdf in pdfs:
+        staged_pdf = staging_dir / src_pdf.name
+        shutil.copy2(src_pdf, staged_pdf)
+        src_hash = sha256_file(src_pdf)
+        staged_hash = sha256_file(staged_pdf)
+        if src_hash != staged_hash:
+            raise RuntimeError(f"Hash no coincide en staging para {src_pdf.name}")
+        manifest["nuevos_verificados"].append(
+            {
+                "archivo": src_pdf.name,
+                "origen": str(src_pdf),
+                "staging": str(staged_pdf),
+                "sha256": staged_hash,
+            }
+        )
+
+    try:
+        for old_pdf in existentes_cc:
+            old_pdf.unlink()
+            manifest["eliminados_destino"].append(str(old_pdf))
+
+        for staged_pdf in sorted(staging_dir.iterdir()):
+            if not es_pdf_cc(staged_pdf):
+                continue
+            dst_pdf = destino_dir / staged_pdf.name
+            shutil.copy2(staged_pdf, dst_pdf)
+            staged_hash = sha256_file(staged_pdf)
+            dst_hash = sha256_file(dst_pdf)
+            if staged_hash != dst_hash:
+                raise RuntimeError(f"Hash no coincide luego de copiar {staged_pdf.name}")
+            manifest["copiados_nuevos"].append(
+                {
+                    "archivo": staged_pdf.name,
+                    "origen": str(staged_pdf),
+                    "destino": str(dst_pdf),
+                    "sha256": dst_hash,
+                }
+            )
+    except Exception as exc:
+        for current_cc in sorted([p for p in destino_dir.iterdir() if es_pdf_cc(p)]):
+            try:
+                current_cc.unlink()
+            except Exception:
+                pass
+
+        for item in manifest["existentes_respaldados"]:
+            backup_pdf = Path(item["backup"])
+            restore_pdf = destino_dir / backup_pdf.name
+            try:
+                shutil.copy2(backup_pdf, restore_pdf)
+                manifest["restauracion_por_error"].append(
+                    {
+                        "archivo": backup_pdf.name,
+                        "backup": str(backup_pdf),
+                        "restaurado": str(restore_pdf),
+                    }
+                )
+            except Exception as restore_exc:
+                manifest["restauracion_por_error"].append(
+                    {
+                        "archivo": backup_pdf.name,
+                        "backup": str(backup_pdf),
+                        "error_restaurando": str(restore_exc),
+                    }
+                )
+
+        manifest_path = backup_dir / "manifest_reemplazo_cc_error.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            f"Falló el reemplazo de CC*.pdf. Se intentó restaurar. Detalle: {exc}"
+        ) from exc
+
+    manifest_path = backup_dir / "manifest_reemplazo_cc.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "backup_dir": str(backup_dir),
+        "manifest_path": str(manifest_path),
+        "eliminados": len(manifest["eliminados_destino"]),
+        "copiados": len(manifest["copiados_nuevos"]),
+        "otros_no_tocados": len(manifest["otros_archivos_no_tocados"]),
+        "detalle": manifest,
+    }
+
+
 def construir_indice_destinos(repo_root: Path) -> dict[str, list[Path]]:
     """
     Recorre una sola vez el repositorio oficial.
@@ -293,6 +441,8 @@ def procesar_tramite(
     dry_run: bool,
     origen_root: Path,
     indice_destinos: dict[str, list[Path]],
+    backup_root: Path,
+    replace_existing_cc: bool,
     tramite: str,
 ) -> dict[str, int]:
     origen_dir = origen_root / tramite
@@ -387,6 +537,114 @@ def procesar_tramite(
         return resumen
 
     destino_dir = destinos[0]
+    destination_cc = sorted([p for p in destino_dir.iterdir() if es_pdf_cc(p)])
+    source_names = {pdf.name for pdf in pdfs}
+    destination_names = {pdf.name for pdf in destination_cc}
+    destination_identical = bool(destination_cc) and source_names == destination_names and all(
+        (destino_dir / pdf.name).exists() and sha256_file(pdf) == sha256_file(destino_dir / pdf.name)
+        for pdf in pdfs
+    )
+
+    if replace_existing_cc and destination_cc and not destination_identical:
+        if dry_run:
+            for old_pdf in destination_cc:
+                registrar(
+                    conn,
+                    writer,
+                    run_id,
+                    dry_run,
+                    tramite,
+                    old_pdf.name,
+                    "",
+                    str(old_pdf),
+                    "",
+                    sha256_file(old_pdf),
+                    "SIMULADO_RESPALDARIA_CC_OBSOLETO",
+                    "Simulación: el CC*.pdf del destino sería respaldado y retirado antes del reemplazo.",
+                )
+            for pdf in pdfs:
+                destino_pdf = destino_dir / pdf.name
+                source_hash = sha256_file(pdf)
+                dest_hash = sha256_file(destino_pdf) if destino_pdf.exists() else ""
+                registrar(
+                    conn,
+                    writer,
+                    run_id,
+                    dry_run,
+                    tramite,
+                    pdf.name,
+                    str(pdf),
+                    str(destino_pdf),
+                    source_hash,
+                    dest_hash,
+                    "SIMULADO_REEMPLAZARIA_CC",
+                    "Simulación: el CC*.pdf del destino sería reemplazado con respaldo reversible.",
+                )
+            resumen["simulados"] += len(pdfs) + len(destination_cc)
+            return resumen
+
+        try:
+            reemplazo = reemplazar_cc_en_destino_con_backup(
+                destino_dir=destino_dir,
+                pdfs=pdfs,
+                backup_root=backup_root,
+                run_id=run_id,
+                tramite=tramite,
+            )
+        except Exception as exc:
+            detalle = f"Error reemplazando CC*.pdf con backup: {exc}"
+            for pdf in pdfs:
+                registrar(
+                    conn,
+                    writer,
+                    run_id,
+                    dry_run,
+                    tramite,
+                    pdf.name,
+                    str(pdf),
+                    str(destino_dir / pdf.name),
+                    sha256_file(pdf),
+                    "",
+                    "ERROR_REEMPLAZO_CC",
+                    detalle,
+                )
+            resumen["fallidos"] += len(pdfs)
+            return resumen
+
+        for item in reemplazo["detalle"]["existentes_respaldados"]:
+            registrar(
+                conn,
+                writer,
+                run_id,
+                dry_run,
+                tramite,
+                item["archivo"],
+                item["origen"],
+                item["backup"],
+                item["sha256"],
+                "",
+                "RESPALDADO_CC_OBSOLETO",
+                "CC*.pdf obsoleto respaldado y retirado del destino antes del reemplazo.",
+            )
+
+        for item in reemplazo["detalle"]["copiados_nuevos"]:
+            registrar(
+                conn,
+                writer,
+                run_id,
+                dry_run,
+                tramite,
+                item["archivo"],
+                item["origen"],
+                item["destino"],
+                item["sha256"],
+                item["sha256"],
+                "REEMPLAZADO_CON_BACKUP",
+                "CC*.pdf reemplazado en destino con respaldo reversible.",
+            )
+
+        resumen["copiados"] += len(pdfs)
+        return resumen
 
     for pdf in pdfs:
         destino_pdf = destino_dir / pdf.name
@@ -544,6 +802,16 @@ def main() -> int:
         "--state-db",
         default="/data_nuevo/cobertura_integrada/logs/cobertura_repo_sync.sqlite",
     )
+    parser.add_argument(
+        "--backup-root",
+        default="/data_nuevo/cobertura_integrada/logs/sync_replaced_cc_backups",
+        help="Carpeta raíz para respaldar CC*.pdf cuando se reemplazan en destino.",
+    )
+    parser.add_argument(
+        "--replace-existing-cc",
+        action="store_true",
+        help="Permite respaldar y reemplazar solo CC*.pdf cuando el origen difiere del destino.",
+    )
 
     # =========================
     # NUEVO: salida viva para Streamlit
@@ -574,8 +842,10 @@ def main() -> int:
     repo_root = Path(args.repo_root).resolve()
     logs_dir = Path(args.logs_dir).resolve()
     state_db = Path(args.state_db).resolve()
+    backup_root = Path(args.backup_root).resolve()
     tramite = args.tramite.strip() or None
     dry_run = bool(args.dry_run)
+    replace_existing_cc = bool(args.replace_existing_cc)
 
     # =========================
     # NUEVO: configuración de eventos vivos
@@ -596,6 +866,7 @@ def main() -> int:
         raise RuntimeError(f"No existe repo-root: {repo_root}")
 
     logs_dir.mkdir(parents=True, exist_ok=True)
+    backup_root.mkdir(parents=True, exist_ok=True)
     lock_path = logs_dir / "cobertura_repo_sync.lock"
 
     try:
@@ -676,6 +947,8 @@ def main() -> int:
                         dry_run=dry_run,
                         origen_root=origen_root,
                         indice_destinos=indice_destinos,
+                        backup_root=backup_root,
+                        replace_existing_cc=replace_existing_cc,
                         tramite=item_tramite,
                     )
 
