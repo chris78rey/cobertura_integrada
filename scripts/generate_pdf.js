@@ -292,12 +292,16 @@ function buildFooterImages(outDir) {
   let footerX = PAGE_WIDTH / 2 - 205;
   const footerImages = [];
   for (let index = 0; index < footerLogos.length; index += 1) {
-    const href = svgAssetHref(outDir, footerLogos[index]);
     const [width, height] = footerSizes[index];
-    if (href) {
-      footerImages.push(`<image href="${escapeXml(href)}" x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}"/>`);
+    if (index === 0) {
+      footerImages.push(`<rect x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}" fill="#ffffff" stroke="none"/>`);
     } else {
-      footerImages.push(`<rect x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}" fill="none" stroke="#000" stroke-width="0.8"/>`);
+      const href = svgAssetHref(outDir, footerLogos[index]);
+      if (href) {
+      footerImages.push(`<image href="${escapeXml(href)}" x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}"/>`);
+      } else {
+        footerImages.push(`<rect x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}" fill="none" stroke="#000" stroke-width="0.8"/>`);
+      }
     }
     footerX += width + 16;
   }
@@ -644,12 +648,16 @@ function drawFooter(doc, pageWidth, pageHeight) {
     ["isspol.jpg", 46, 22],
   ];
   let x = pageWidth / 2 - 205;
-  logos.forEach(([fileName, width, height]) => {
-    const filePath = path.resolve("assets", fileName);
-    if (fs.existsSync(filePath)) {
-      doc.image(filePath, x, logoY, { fit: [width, height], align: "center", valign: "center" });
+  logos.forEach(([fileName, width, height], index) => {
+    if (index === 0) {
+      doc.rect(x, logoY, width, height).fill("#ffffff");
     } else {
-      doc.rect(x, logoY, width, height).stroke();
+      const filePath = path.resolve("assets", fileName);
+      if (fs.existsSync(filePath)) {
+        doc.image(filePath, x, logoY, { fit: [width, height], align: "center", valign: "center" });
+      } else {
+        doc.rect(x, logoY, width, height).stroke();
+      }
     }
     x += width + 16;
   });
