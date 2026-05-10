@@ -345,7 +345,6 @@ function buildSvgPage({
 
   ${body}
 
-  <line x1="20" y1="${PAGE_HEIGHT - 108}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 108}" stroke="#000" stroke-width="1.1"/>
   ${footerImages.join("\n")}
   <line x1="20" y1="${PAGE_HEIGHT - 76}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 76}" stroke="#000" stroke-width="1.1"/>
   ${svgText({ text: `${pageNumber} / ${totalPages}`, x: PAGE_WIDTH / 2, y: PAGE_HEIGHT - 61, size: 8, anchor: "middle", fontFamily: "Times New Roman, Times, serif" })}
@@ -662,7 +661,6 @@ function drawFooter(doc, pageWidth, pageHeight) {
   const footerInfoX = pageWidth - 212;
   const footerInfoWidth = 178;
   doc.lineWidth(1.1);
-  doc.moveTo(20, pageHeight - 108).lineTo(pageWidth - 20, pageHeight - 108).stroke();
   const logoY = pageHeight - 99;
   const logos = [
     ["logomsp.jpg", 76, 22],
