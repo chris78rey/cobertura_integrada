@@ -30,6 +30,10 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 AUDIT_LOG = LOGS_DIR / "cedulas_tramite_audit.jsonl"
 BACKUP_CC_ROOT = LOGS_DIR / "backup_cc_reemplazados"
 PDF_CC_REGEX = re.compile(r"^CC(?:_\d{2})?\.pdf$", re.IGNORECASE)
+PDF_CC_LEGACY_REGEXES = [
+    re.compile(r"^CC(?:\d+)?\.pdf$", re.IGNORECASE),
+    re.compile(r"^C[1-6]\.pdf$", re.IGNORECASE),
+]
 
 
 def _ahora_id() -> str:
@@ -47,6 +51,14 @@ def _sha256_file(path: Path) -> str:
 
 def _is_pdf_cc(path: Path) -> bool:
     return path.is_file() and PDF_CC_REGEX.fullmatch(path.name) is not None
+
+def _is_pdf_cc_legacy(path: Path) -> bool:
+    return path.is_file() and any(regex.fullmatch(path.name) for regex in PDF_CC_LEGACY_REGEXES) and not _is_pdf_cc(path)
+
+def _listar_cc_legacy(path: Path) -> list[str]:
+    if not path.exists() or not path.is_dir():
+        return []
+    return sorted(p.name for p in path.iterdir() if _is_pdf_cc_legacy(p))
 
 def _json_hash(data: dict) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
@@ -95,6 +107,15 @@ def _buscar_destinos_tramite(tramite: str) -> list[Path]:
         resolved = p.resolve()
         if str(resolved).startswith(str(repo_root)): destinos.append(resolved)
     return sorted(destinos)
+
+def _resumen_legado_cc(tramite: str) -> dict[str, list[str]]:
+    local_dir = OUTPUT_ROOT / tramite
+    destinos = _buscar_destinos_tramite(tramite)
+    destino_dir = destinos[0] if len(destinos) == 1 else None
+    return {
+        "local": _listar_cc_legacy(local_dir),
+        "destino": _listar_cc_legacy(destino_dir) if destino_dir else [],
+    }
 
 def _backup_y_reemplazar_solo_cc(destino_dir: Path, tramite: str, nuevos_pdfs: list[Path], usuario: str) -> dict:
     destino_dir = destino_dir.resolve()
@@ -499,6 +520,14 @@ def cedulas_tramite_page():
 
     if not fila.get("DIG_TRAMITE"): st.error("Sin DIG_TRAMITE. No se permite modificar."); st.markdown("</div>", unsafe_allow_html=True); return
     if str(fila.get("DIG_PLANILLADO", "")).strip() != "S": st.error("Sin DIG_PLANILLADO='S'."); st.markdown("</div>", unsafe_allow_html=True); return
+
+    legado = _resumen_legado_cc(str(fila.get("DIG_TRAMITE", "")).strip())
+    if legado["local"] or legado["destino"]:
+        st.warning(
+            "Hay PDFs legado visibles en este trámite. Se muestran solo para borrado manual: "
+            f"local={', '.join(legado['local']) or '-'}; "
+            f"destino={', '.join(legado['destino']) or '-'}."
+        )
 
     fe_pla_fila = str(fila.get("FE_PLA_ANIOMES", "") or "").strip()
     if fe_pla_fila:

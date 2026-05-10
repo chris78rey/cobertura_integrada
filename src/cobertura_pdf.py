@@ -58,6 +58,15 @@ def _safe_name(value: str) -> str:
     return value.strip("._-") or "SIN_NOMBRE"
 
 
+def _es_cedula_valida_para_pdf(value: str | None) -> bool:
+    """
+    Valida la cédula antes de invocar Node.
+    Evita retries lentos cuando Oracle trae datos claramente malformados.
+    """
+    cedula = str(value or "").strip()
+    return bool(re.fullmatch(r"\d{10}", cedula))
+
+
 def _next_cc_output_name(
     output_dir: Path,
     used_names: set[str],
@@ -388,6 +397,45 @@ def _diagnosticar_fallo_pdf(
         "attempts": str(result_node.get("attempts", "")),
         "returncode": str(result_node.get("returncode", "")),
     }
+
+
+def _registrar_resumen_ciclico(
+    *,
+    run_id: str,
+    tramite: str,
+    cedula: str,
+    estado: str,
+    fecha_hasta: str,
+    fecha_alta: str,
+    pdfs_generados: list[Path],
+    sync_ok: bool = False,
+    sync_returncode: int | str | None = None,
+    oracle_ok: bool = False,
+    oracle_affected: int | str | None = None,
+    detalle: str = "",
+    error_categoria: str = "",
+) -> None:
+    append_cyclic_jsonl(
+        CYCLIC_SUMMARY_LOG,
+        {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "run_id": run_id,
+            "tramite": str(tramite or "").strip(),
+            "cedula": str(cedula or "").strip(),
+            "estado": str(estado or "").strip(),
+            "fecha_hasta": str(fecha_hasta or "").strip(),
+            "fecha_alta": str(fecha_alta or "").strip(),
+            "pdfs": [p.name for p in pdfs_generados],
+            "pdf_count": len(pdfs_generados),
+            "sync_ok": bool(sync_ok),
+            "sync_returncode": "" if sync_returncode is None else str(sync_returncode),
+            "oracle_ok": bool(oracle_ok),
+            "oracle_affected": "" if oracle_affected is None else str(oracle_affected),
+            "detalle": str(detalle or "").strip(),
+            "error_categoria": str(error_categoria or "").strip(),
+        },
+        max_records=20,
+    )
 
 
 def _crear_zip_coberturas(
@@ -1369,6 +1417,7 @@ def generar_coberturas_automaticas_desde_mes(
 
     from src.oracle_jdbc import actualizar_cobertura_por_tramite
     from src.observability import RunLogger, build_run_id, mask_cedula
+    from src.observability import append_cyclic_jsonl, CYCLIC_SUMMARY_LOG
     from src.quarantine import (
         obtener_claves_en_cuarentena,
         poner_en_cuarentena,
@@ -1771,6 +1820,50 @@ def generar_coberturas_automaticas_desde_mes(
                         )
                         continue
 
+                    if not _es_cedula_valida_para_pdf(c):
+                        error_en_pdf_detalle = {
+                            "categoria": "CEDULA_INVALIDA",
+                            "causa": "La cédula debe tener 10 dígitos.",
+                            "sugerencia": (
+                                "La fila viene mal formada desde Oracle. "
+                                "Se marca en cuarentena y el proceso continúa con el resto."
+                            ),
+                            "attempts": "0",
+                            "returncode": "",
+                            "stderr": "",
+                            "stdout": "",
+                            "cedula": c,
+                            "pdf_esperado": output_name,
+                            "error_tecnico": "La cédula debe tener 10 dígitos.",
+                        }
+                        error_en_pdf = error_en_pdf_detalle["error_tecnico"]
+
+                        logger.error(
+                            "PDF_GENERATION_ERROR",
+                            error_en_pdf,
+                            index=index,
+                            dig_tramite=tramite,
+                            dig_id_tramite=dig_id_tramite,
+                            cedula=mask_cedula(c),
+                            tipo_persona=tipo_persona,
+                            pdf_path=str(pdf_path),
+                            segundos_pdf=0.0,
+                            error_categoria=error_en_pdf_detalle["categoria"],
+                            causa_probable=error_en_pdf_detalle["causa"],
+                            sugerencia_revision=error_en_pdf_detalle["sugerencia"],
+                            node_attempts=error_en_pdf_detalle["attempts"],
+                            node_returncode=error_en_pdf_detalle["returncode"],
+                            node_stderr=error_en_pdf_detalle["stderr"],
+                            node_stdout=error_en_pdf_detalle["stdout"],
+                        )
+                        if respaldos_cc_locales:
+                            _restaurar_cc_locales(
+                                respaldos_cc_locales,
+                                planilla_dir=planilla_dir,
+                                expected_pdf_names=expected_pdf_names,
+                            )
+                        break
+
                     inicio_pdf = time.monotonic()
 
                     result_node = _run_node_pdf_generator(
@@ -1945,6 +2038,22 @@ def generar_coberturas_automaticas_desde_mes(
                             }
                         )
 
+                        _registrar_resumen_ciclico(
+                            run_id=run_id,
+                            tramite=tramite,
+                            cedula=cedula,
+                            estado=last_processed_status,
+                            fecha_hasta=fecha_hasta,
+                            fecha_alta=fecha_alta,
+                            pdfs_generados=pdfs_generados,
+                            sync_ok=False,
+                            sync_returncode=sync_result.get("returncode", ""),
+                            oracle_ok=False,
+                            oracle_affected=0,
+                            detalle=last_processed_detail,
+                            error_categoria="ERROR_SYNC_INMEDIATO",
+                        )
+
                         marcar_ultimo_procesado(
                             tramite=tramite,
                             cedula=cedula,
@@ -2051,6 +2160,21 @@ def generar_coberturas_automaticas_desde_mes(
                                     "lote_numero": str(lote_numero),
                                 },
                             )
+
+                        _registrar_resumen_ciclico(
+                            run_id=run_id,
+                            tramite=tramite,
+                            cedula=cedula,
+                            estado=last_processed_status,
+                            fecha_hasta=fecha_hasta,
+                            fecha_alta=fecha_alta,
+                            pdfs_generados=pdfs_generados,
+                            sync_ok=True,
+                            sync_returncode=sync_result.get("returncode", ""),
+                            oracle_ok=True,
+                            oracle_affected=update_result.get("affected", 0),
+                            detalle=last_processed_detail,
+                        )
                     else:
                         errores += 1
                         errores_consecutivos += 1
@@ -2074,6 +2198,22 @@ def generar_coberturas_automaticas_desde_mes(
                                 "error": err_msg,
                             }
                         )
+
+                        _registrar_resumen_ciclico(
+                            run_id=run_id,
+                            tramite=tramite,
+                            cedula=cedula,
+                            estado=last_processed_status,
+                            fecha_hasta=fecha_hasta,
+                            fecha_alta=fecha_alta,
+                            pdfs_generados=pdfs_generados,
+                            sync_ok=True,
+                            sync_returncode=sync_result.get("returncode", ""),
+                            oracle_ok=False,
+                            oracle_affected=update_result.get("affected", 0),
+                            detalle=last_processed_detail,
+                            error_categoria="ERROR_ACTUALIZANDO_ORACLE",
+                        )
                 else:
                     errores += 1
                     errores_consecutivos += 1
@@ -2081,6 +2221,128 @@ def generar_coberturas_automaticas_desde_mes(
                     err_msg = error_en_pdf or "No se generaron todos los PDFs esperados del trámite."
                     last_processed_status = "NO_ACTUALIZADO_PDFS_INCOMPLETOS"
                     last_processed_detail = err_msg
+
+                    if error_en_pdf_detalle.get("categoria") == "CEDULA_INVALIDA":
+                        # El dato es malo, pero no debe castigar el ritmo del resto.
+                        errores_consecutivos = 0
+
+                    logger.event(
+                        "ORACLE_FORCE_CLOSE_AFTER_PDF_ERROR_START",
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        dig_id_generacion=id_generacion,
+                        error_categoria=error_en_pdf_detalle.get("categoria", "PDF_INCOMPLETO"),
+                        error=err_msg,
+                    )
+
+                    force_close_result = actualizar_cobertura_por_tramite(
+                        username=username,
+                        password=password,
+                        dig_tramite=tramite,
+                    )
+
+                    logger.event(
+                        "ORACLE_FORCE_CLOSE_AFTER_PDF_ERROR_END",
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        dig_id_generacion=id_generacion,
+                        ok=bool(force_close_result.get("ok")),
+                        affected=force_close_result.get("affected", 0),
+                        verified=bool(force_close_result.get("verified")),
+                        already_closed=bool(force_close_result.get("already_closed")),
+                        error=force_close_result.get("error", ""),
+                        criterio=force_close_result.get("criterio", ""),
+                    )
+
+                    if (
+                        force_close_result.get("ok")
+                        and force_close_result.get("verified") is True
+                        and (
+                            force_close_result.get("affected") == 1
+                            or force_close_result.get("already_closed") is True
+                        )
+                    ):
+                        actualizados += 1
+                        errores_consecutivos = 0
+                        last_processed_status = "CERRADO_FORZADO_POR_FALLO_PDF"
+                        last_processed_detail = (
+                            "Oracle se cerró en S aunque la generación PDF no completó."
+                        )
+
+                        writer.writerow(
+                            {
+                                "RUN_ID": run_id,
+                                "FE_PLA_ANIOMES": fe_pla,
+                                "DIG_TRAMITE": tramite,
+                                "DIG_ID_TRAMITE": dig_id_tramite,
+                                "DIG_ID_GENERACION": id_generacion,
+                                "DIG_CEDULA": cedula,
+                                "DIG_FECHA_HASTA": fecha_hasta,
+                                "DIG_FECHA_ALTA": fecha_alta,
+                                "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
+                                "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados) if pdfs_generados else 0,
+                                "ESTADO": "CERRADO_FORZADO_POR_FALLO_PDF",
+                                "PASO": "OK",
+                                "ORACLE_AFFECTED": force_close_result.get("affected", 0),
+                                "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
+                                "ESPERA_SEGUNDOS": "",
+                                "ERRORES_CONSECUTIVOS": "",
+                                "ERROR": err_msg,
+                                "CEDULA_FALLIDA": error_en_pdf_detalle.get("cedula", ""),
+                                "PDF_ESPERADO": error_en_pdf_detalle.get("pdf_esperado", ""),
+                                "ERROR_CATEGORIA": error_en_pdf_detalle.get("categoria", "PDFS_INCOMPLETOS"),
+                                "CAUSA_PROBABLE": error_en_pdf_detalle.get("causa", err_msg),
+                                "SUGERENCIA_REVISION": error_en_pdf_detalle.get("sugerencia", ""),
+                                "NODE_ATTEMPTS": error_en_pdf_detalle.get("attempts", ""),
+                                "NODE_RETURNCODE": error_en_pdf_detalle.get("returncode", ""),
+                                "NODE_STDERR": error_en_pdf_detalle.get("stderr", ""),
+                                "NODE_STDOUT": error_en_pdf_detalle.get("stdout", ""),
+                                "FECHA_PROCESO": timestamp,
+                            }
+                        )
+
+                        if progress_callback:
+                            progress_callback(
+                                index,
+                                total,
+                                {
+                                    "fe_pla_aniomes": fe_pla,
+                                    "dig_tramite": tramite,
+                                    "dig_id_tramite": dig_id_tramite,
+                                    "dig_cedula": cedula,
+                                    "dig_fecha_hasta": fecha_hasta,
+                                    "dig_fecha_alta": fecha_alta,
+                                    "estado": "CERRADO_FORZADO_POR_FALLO_PDF",
+                                    "procesados_global": str(procesados_global),
+                                    "lote_numero": str(lote_numero),
+                                },
+                            )
+                        _registrar_resumen_ciclico(
+                            run_id=run_id,
+                            tramite=tramite,
+                            cedula=cedula,
+                            estado=last_processed_status,
+                            fecha_hasta=fecha_hasta,
+                            fecha_alta=fecha_alta,
+                            pdfs_generados=pdfs_generados,
+                            sync_ok=True,
+                            sync_returncode=sync_result.get("returncode", ""),
+                            oracle_ok=True,
+                            oracle_affected=force_close_result.get("affected", 0),
+                            detalle=last_processed_detail,
+                            error_categoria=error_en_pdf_detalle.get("categoria", "PDF_INCOMPLETO"),
+                        )
+                        marcar_ultimo_procesado(
+                            tramite=tramite,
+                            cedula=cedula,
+                            planilla=tramite,
+                            fe_pla_aniomes=fe_pla,
+                            status=last_processed_status,
+                            detalle=last_processed_detail,
+                        )
+                        continue
 
                     if clave_exclusion:
                         dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
@@ -2116,6 +2378,20 @@ def generar_coberturas_automaticas_desde_mes(
                             "NODE_STDOUT": error_en_pdf_detalle.get("stdout", ""),
                             "FECHA_PROCESO": timestamp,
                         }
+                    )
+
+                    _registrar_resumen_ciclico(
+                        run_id=run_id,
+                        tramite=tramite,
+                        cedula=cedula,
+                        estado=last_processed_status,
+                        fecha_hasta=fecha_hasta,
+                        fecha_alta=fecha_alta,
+                        pdfs_generados=pdfs_generados,
+                        sync_ok=False,
+                        oracle_ok=False,
+                        detalle=last_processed_detail,
+                        error_categoria=error_en_pdf_detalle.get("categoria", "PDFS_INCOMPLETOS"),
                     )
 
                 marcar_ultimo_procesado(

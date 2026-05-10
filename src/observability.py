@@ -13,6 +13,7 @@ from typing import Any
 
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+CYCLIC_SUMMARY_LOG = LOG_DIR / "cobertura_auto_resumen_ciclico.jsonl"
 
 
 def now_iso() -> str:
@@ -22,6 +23,37 @@ def now_iso() -> str:
 def ensure_log_dir() -> Path:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     return LOG_DIR
+
+
+def append_cyclic_jsonl(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    max_records: int = 20,
+) -> None:
+    """
+    Guarda un JSONL cíclico con los últimos N registros.
+
+    Útil para tener un resumen compacto del proceso sin abrir el log técnico completo.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records: list[str] = []
+        if path.exists():
+            try:
+                records = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                records = []
+
+        records.append(json.dumps(payload, ensure_ascii=False, default=str))
+        if max_records > 0 and len(records) > max_records:
+            records = records[-max_records:]
+
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text("\n".join(records) + ("\n" if records else ""), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception:
+        pass
 
 
 def mask_cedula(value: str | None) -> str:

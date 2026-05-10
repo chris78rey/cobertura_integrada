@@ -32,7 +32,10 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 AUDIT_LOG = LOGS_DIR / "auditoria_menor_edad_sync.jsonl"
 BACKUP_CC_ROOT = LOGS_DIR / "backup_auditoria_menor_edad_cc"
 PDF_CC_REGEX = re.compile(r"^CC(?:_\d{2})?\.pdf$", re.IGNORECASE)
-PDF_CC_LEGACY_REGEX = re.compile(r"^CC(?:\d+)?\.pdf$", re.IGNORECASE)
+PDF_CC_LEGACY_REGEXES = [
+    re.compile(r"^CC(?:\d+)?\.pdf$", re.IGNORECASE),
+    re.compile(r"^C[1-6]\.pdf$", re.IGNORECASE),
+]
 
 
 def _ahora_iso() -> str:
@@ -82,7 +85,7 @@ def _is_pdf_cc(path: Path) -> bool:
 
 
 def _is_pdf_cc_legacy(path: Path) -> bool:
-    return path.is_file() and PDF_CC_LEGACY_REGEX.fullmatch(path.name) is not None and not _is_pdf_cc(path)
+    return path.is_file() and any(regex.fullmatch(path.name) for regex in PDF_CC_LEGACY_REGEXES) and not _is_pdf_cc(path)
 
 
 def _listar_cc(path: Path) -> list[str]:

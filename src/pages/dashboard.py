@@ -518,29 +518,10 @@ def _render_estado_simple_operativo():
     col1, col2, col3 = st.columns([1.25, 1.25, 1])
 
     with col1:
-        if st.button(
-            "Liberar bloqueo huérfano",
-            key="btn_liberar_bloqueo_huerfano",
-            use_container_width=True,
-            disabled=not bool(diagnostico.get("puede_destrabar")),
-        ):
-            resultado = destrabar_para_reintento()
-            if resultado.get("ok"):
-                st.success("Bloqueos temporales liberados y reintento habilitado.")
-            else:
-                st.warning("No se habilitó el reintento porque todavía hay un proceso activo.")
-            st.caption("El detalle técnico queda en el panel de operación segura.")
-            st.rerun()
+        st.info("La recuperación es automática. No hace falta liberar bloqueo manualmente.")
 
     with col2:
-        if st.button(
-            "Despachar siguiente lote",
-            key="btn_despachar_siguiente_lote",
-            use_container_width=True,
-            disabled=not bool(diagnostico.get("puede_despachar")),
-        ):
-            _ejecutar_despacho_inmediato()
-            st.rerun()
+        st.info("Si Oracle tiene pendientes, el worker los toma solo en el siguiente ciclo.")
 
     with col3:
         st.caption(f"Resumen: {diagnostico.get('resumen', '-')}")
@@ -1298,42 +1279,11 @@ def _render_operator_panel():
             st.caption("No hay errores recientes relevantes.")
 
     st.markdown("#### Acciones seguras")
-    st.caption(
-        "Estas acciones no borran PDFs, no modifican Oracle y no matan procesos activos. "
-        "Solo liberan bloqueos temporales de la aplicación."
+    st.info(
+        "La operación quedó en modo autónomo. "
+        "Si aparece una cuarentena temporal o un bloqueo huérfano, el worker y el watchdog "
+        "lo reintentan o corrigen sin intervención manual."
     )
-
-    confirmar = st.checkbox(
-        "Confirmo que el proceso no está avanzando y deseo liberar bloqueos temporales",
-        key="confirmar_destrabe_seguro",
-    )
-
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        if st.button(
-            "Liberar cuarentena y permitir reintento",
-            key="btn_destrabar_reintento_seguro",
-            use_container_width=True,
-            disabled=not confirmar or lock_activo,
-        ):
-            resultado = destrabar_para_reintento()
-            if resultado.get("ok"):
-                st.success("Listo. Se liberó cuarentena, se limpió parada y se habilitó reintento.")
-            else:
-                st.warning("No se habilitó reintento porque hay un proceso activo.")
-            st.json(resultado)
-            st.rerun()
-
-    with col2:
-        if st.button(
-            "Pausar reintento automático",
-            key="btn_pausar_reintento_auto",
-            use_container_width=True,
-        ):
-            pausar_reintento_automatico()
-            st.warning("Reintento automático pausado.")
-            st.rerun()
 
     with st.expander("Copiar diagnóstico para soporte", expanded=False):
         st.code(exportar_estado_json(), language="json")
