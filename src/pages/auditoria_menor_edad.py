@@ -519,6 +519,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
             }
             timeout_node = int(os.environ.get("COBERTURA_NODE_TIMEOUT_SECONDS", "45" if fast_mode else "120") or ("45" if fast_mode else "120"))
             retries_node = int(os.environ.get("COBERTURA_NODE_MAX_RETRIES", "1" if fast_mode else "2") or ("1" if fast_mode else "2"))
+            retries_node = max(3, retries_node)
             delay_node = float(os.environ.get("COBERTURA_NODE_RETRY_DELAY", "0.5" if fast_mode else "1.0") or ("0.5" if fast_mode else "1.0"))
 
             result_node = _run_node_pdf_generator(
@@ -530,6 +531,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
                 single_timeout_seconds=timeout_node,
                 max_retries=retries_node,
                 delay_seconds=delay_node,
+                expected_pdf_path=pdf_path,
             )
 
             if not result_node.get("ok"):

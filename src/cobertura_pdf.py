@@ -76,11 +76,12 @@ def _modo_fast_activo() -> bool:
 def _parametros_node_rendimiento() -> tuple[int, int, float]:
     fast_mode = _modo_fast_activo()
     timeout_default = "30" if fast_mode else "120"
-    retries_default = "1" if fast_mode else "2"
+    retries_default = "3" if fast_mode else "3"
     delay_default = "0.25" if fast_mode else "1.0"
 
     timeout_seconds = int(os.environ.get("COBERTURA_NODE_TIMEOUT_SECONDS", timeout_default) or timeout_default)
     max_retries = int(os.environ.get("COBERTURA_NODE_MAX_RETRIES", retries_default) or retries_default)
+    max_retries = max(3, max_retries)
     delay_seconds = float(os.environ.get("COBERTURA_NODE_RETRY_DELAY", delay_default) or delay_default)
 
     return timeout_seconds, max_retries, delay_seconds
@@ -92,6 +93,15 @@ def _pausa_menor_edad_entre_peticiones() -> float:
         pausa = float(valor)
     except Exception:
         pausa = 3.0
+    return max(0.0, pausa)
+
+
+def _pausa_entre_tramites() -> float:
+    valor = os.environ.get("COBERTURA_PAUSA_ENTRE_TRAMITES_SEGUNDOS", "7").strip()
+    try:
+        pausa = float(valor)
+    except Exception:
+        pausa = 7.0
     return max(0.0, pausa)
 
 
@@ -962,6 +972,7 @@ def _run_node_pdf_generator(
     single_timeout_seconds: int,
     max_retries: int,
     delay_seconds: float,
+    expected_pdf_path: Path | None = None,
 ) -> dict[str, Any]:
     node_bin = os.environ.get("COBERTURA_NODE_BIN", "node").strip() or "node"
 
@@ -996,14 +1007,32 @@ def _run_node_pdf_generator(
             )
 
             if completed.returncode == 0:
-                return {
-                    "ok": True,
-                    "stdout": completed.stdout,
-                    "stderr": completed.stderr,
-                    "attempts": attempt,
-                    "returncode": completed.returncode,
-                    "cmd": " ".join(cmd),
-                }
+                if expected_pdf_path is not None:
+                    if expected_pdf_path.exists() and expected_pdf_path.stat().st_size > 0:
+                        return {
+                            "ok": True,
+                            "stdout": completed.stdout,
+                            "stderr": completed.stderr,
+                            "attempts": attempt,
+                            "returncode": completed.returncode,
+                            "cmd": " ".join(cmd),
+                        }
+                    last_error = (
+                        f"El generador terminó con código 0 pero no dejó el PDF esperado: "
+                        f"{expected_pdf_path}"
+                    )
+                    last_stdout = completed.stdout
+                    last_stderr = completed.stderr
+                    last_returncode = completed.returncode
+                else:
+                    return {
+                        "ok": True,
+                        "stdout": completed.stdout,
+                        "stderr": completed.stderr,
+                        "attempts": attempt,
+                        "returncode": completed.returncode,
+                        "cmd": " ".join(cmd),
+                    }
 
             last_error = (
                 completed.stderr.strip()
@@ -1149,19 +1178,6 @@ def generar_hojas_cobertura_por_id(
 
             timeout_node, retries_node, delay_node = _parametros_node_rendimiento()
 
-            carpeta_resguardada = _resguardar_carpeta_tramite_existente(planilla_dir)
-            if carpeta_resguardada is not None:
-                logger.event(
-                    "LOCAL_DIR_RESGUARDED_BEFORE_REGEN",
-                    planilla=str(planilla),
-                    planilla_dir_original=str(planilla_dir),
-                    planilla_dir_resguardada=str(carpeta_resguardada),
-                )
-
-            if not planilla_dir.exists():
-                planilla_dir.mkdir(parents=True, exist_ok=True)
-                folders_created.add(str(planilla_dir))
-
             result = _run_node_pdf_generator(
                 node_project_dir=node_project_dir,
                 cedula=cedula,
@@ -1171,6 +1187,7 @@ def generar_hojas_cobertura_por_id(
                 single_timeout_seconds=timeout_node if fast_mode else single_timeout_seconds,
                 max_retries=retries_node if fast_mode else max_retries,
                 delay_seconds=delay_node if fast_mode else delay_seconds,
+                expected_pdf_path=pdf_path,
             )
 
             if result["ok"] and pdf_path.exists():
@@ -2002,22 +2019,6 @@ def generar_coberturas_automaticas_desde_mes(
                         )
                         break
 
-                    if not carpeta_tramite_resguardada:
-                        carpeta_resguardada = _resguardar_carpeta_tramite_existente(planilla_dir)
-                        if carpeta_resguardada is not None:
-                            carpeta_tramite_resguardada = True
-                            logger.event(
-                                "LOCAL_DIR_RESGUARDED_BEFORE_REGEN",
-                                index=index,
-                                dig_tramite=tramite,
-                                dig_id_tramite=dig_id_tramite,
-                                planilla_dir_original=str(planilla_dir),
-                                planilla_dir_resguardada=str(carpeta_resguardada),
-                            )
-
-                    if not planilla_dir.exists():
-                        planilla_dir.mkdir(parents=True, exist_ok=True)
-
                     inicio_pdf = time.monotonic()
 
                     timeout_node, retries_node, delay_node = _parametros_node_rendimiento()
@@ -2030,6 +2031,7 @@ def generar_coberturas_automaticas_desde_mes(
                         single_timeout_seconds=timeout_node,
                         max_retries=retries_node,
                         delay_seconds=delay_node,
+                        expected_pdf_path=pdf_path,
                     )
 
                     ultimo_segundos_pdf = time.monotonic() - inicio_pdf
@@ -2484,6 +2486,7 @@ def generar_coberturas_automaticas_desde_mes(
                     detalle=last_processed_detail,
                 )
                 if index < total:
+                    pausa_tramite = _pausa_entre_tramites()
                     if progress_callback:
                         progress_callback(
                             index,
@@ -2493,9 +2496,11 @@ def generar_coberturas_automaticas_desde_mes(
                                 "dig_tramite": tramite,
                                 "dig_cedula": cedula,
                                 "dig_fecha_hasta": fecha_hasta,
-                                "estado": "Sin espera entre trámites.",
+                                "estado": f"Esperando {pausa_tramite:.0f}s antes del siguiente trámite.",
                             },
                         )
+                    if pausa_tramite > 0:
+                        time.sleep(pausa_tramite)
 
             if dig_tramite:
                 logger.event(

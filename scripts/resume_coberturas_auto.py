@@ -100,7 +100,9 @@ def _run_cycle() -> int:
     _limpiar_logs_antiguos()
 
     estado = leer_estado_job()
-    fe_pla_aniomes_desde = str(estado.get("fe_pla_aniomes_desde", "")).strip()
+    fe_pla_aniomes_desde_estado = str(estado.get("fe_pla_aniomes_desde", "")).strip()
+    fe_pla_aniomes_desde_env = str(os.environ.get("AUTO_FE_PLA_ANIOMES_DESDE", "202605")).strip()
+    fe_pla_aniomes_desde = fe_pla_aniomes_desde_estado or fe_pla_aniomes_desde_env
     dig_tramite = str(estado.get("dig_tramite", "") or "").strip()
     output_dir = "/data_nuevo/coberturas"
     username = os.environ.get("ORACLE_AUTO_USER", "").strip()
@@ -110,8 +112,24 @@ def _run_cycle() -> int:
         marcar_job_reintento("Faltan ORACLE_AUTO_USER u ORACLE_AUTO_PASSWORD en .env")
         return 1
     if not fe_pla_aniomes_desde:
-        marcar_job_reintento("No existe fe_pla_aniomes_desde en el estado.")
+        marcar_job_reintento("No existe fe_pla_aniomes_desde en el estado ni en AUTO_FE_PLA_ANIOMES_DESDE.")
         return 1
+
+    if not fe_pla_aniomes_desde_estado:
+        guardar_estado_job(
+            {
+                "enabled": True,
+                "status": "WATCHING_NO_PENDING",
+                "fe_pla_aniomes_desde": fe_pla_aniomes_desde,
+                "output_dir": output_dir,
+                "last_error": "",
+                "retry_count": 0,
+                "detalle": (
+                    "Mes de trabajo restaurado desde AUTO_FE_PLA_ANIOMES_DESDE "
+                    f"({fe_pla_aniomes_desde})."
+                ),
+            }
+        )
 
     modo_vigilante = _es_modo_vigilante(dig_tramite)
     pendientes_antes = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
@@ -239,7 +257,7 @@ def _run_cycle() -> int:
 
 
 def main() -> int:
-    sleep_sequence = (2, 4)
+    sleep_sequence = (7,)
     loop_index = 0
 
     while True:
