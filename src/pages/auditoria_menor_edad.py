@@ -17,6 +17,7 @@ import streamlit as st
 from src.cobertura_runner import ArchivoLock, LOCK_PATH, ProcesoCoberturaYaEnEjecucion
 from src.cobertura_pdf import (
     _expandir_cedulas_para_cobertura,
+    _limpiar_local_post_sincronizacion,
     _nombre_cc_por_secuencia,
     _resguardar_cc_locales,
     _run_node_pdf_generator,
@@ -471,7 +472,6 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
         raise RuntimeError(f"No hay cédulas válidas para regenerar el trámite {tramite}.")
 
     output_dir = OUTPUT_ROOT / tramite
-    output_dir.mkdir(parents=True, exist_ok=True)
     expected_output_names = [
         _nombre_cc_por_secuencia(indice=i, total=len(cedulas_a_generar))
         for i in range(1, len(cedulas_a_generar) + 1)
@@ -505,15 +505,31 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
                 nuevos_pdfs.append(pdf_path)
                 continue
 
+            if not output_dir.exists():
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+            fast_mode = str(os.environ.get("COBERTURA_FAST_MODE", "1") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "si",
+                "sí",
+                "on",
+            }
+            timeout_node = int(os.environ.get("COBERTURA_NODE_TIMEOUT_SECONDS", "45" if fast_mode else "120") or ("45" if fast_mode else "120"))
+            retries_node = int(os.environ.get("COBERTURA_NODE_MAX_RETRIES", "1" if fast_mode else "2") or ("1" if fast_mode else "2"))
+            delay_node = float(os.environ.get("COBERTURA_NODE_RETRY_DELAY", "0.5" if fast_mode else "1.0") or ("0.5" if fast_mode else "1.0"))
+
             result_node = _run_node_pdf_generator(
                 node_project_dir=node_project_dir,
                 cedula=c,
                 fecha_pdf=fecha_pdf,
                 output_dir=output_dir,
                 output_name=output_name,
-                single_timeout_seconds=120,
-                max_retries=2,
-                delay_seconds=1.0,
+                single_timeout_seconds=timeout_node,
+                max_retries=retries_node,
+                delay_seconds=delay_node,
             )
 
             if not result_node.get("ok"):
@@ -526,6 +542,12 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
                 raise RuntimeError(f"El generador no dejó el PDF esperado: {pdf_path}")
 
             nuevos_pdfs.append(pdf_path)
+
+        if output_dir.exists() and not any(output_dir.iterdir()):
+            try:
+                output_dir.rmdir()
+            except Exception:
+                pass
 
         destinos = [Path(p) for p in _buscar_destinos_tramite(tramite)]
         if len(destinos) != 1:
@@ -552,6 +574,31 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
                 "reemplazo": reemplazo.get("manifest_path", ""),
             }
         )
+
+        if str(os.environ.get("COBERTURA_CLEAN_LOCAL_AFTER_SUCCESS", "1") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "si",
+            "sí",
+            "on",
+        }:
+            limpieza_local = _limpiar_local_post_sincronizacion(
+                planilla_dir=output_dir,
+                pdfs_generados=nuevos_pdfs,
+            )
+            _auditar_evento(
+                {
+                    "evento": "LOCAL_CLEANUP_AFTER_SUCCESS",
+                    "usuario": usuario,
+                    "tramite": tramite,
+                    "fe_pla_aniomes": fe_pla,
+                    "removed_files": limpieza_local.get("removed_files", []),
+                    "removed_manifest": bool(limpieza_local.get("removed_manifest")),
+                    "removed_dir": bool(limpieza_local.get("removed_dir")),
+                }
+            )
 
         return {
             "ok": True,

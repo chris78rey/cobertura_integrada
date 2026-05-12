@@ -179,14 +179,13 @@ def registrar_job_activo(fe_pla_aniomes_desde: str, output_dir: str, dig_tramite
         "dig_tramite": str(dig_tramite or "").strip(),
         "output_dir": str(output_dir).strip(),
         "started_at": _now(), "completed_at": "", "last_error": "",
-        "retry_count": 0, "watch_empty_cycles": 0, "sync_pending": False,
+        "retry_count": 0, "sync_pending": False,
         "detalle": "Proceso activo.",
     })
 
 
 def marcar_job_vigilando_sin_pendientes(detalle: str = "", sync_pending: bool | None = None) -> None:
     estado = leer_estado_job()
-    ciclos = int(estado.get("watch_empty_cycles", 0)) + 1
     if sync_pending is None:
         sync_pending_final = bool(estado.get("sync_pending", False))
     else:
@@ -194,7 +193,6 @@ def marcar_job_vigilando_sin_pendientes(detalle: str = "", sync_pending: bool | 
     guardar_estado_job({
         "enabled": True, "status": "WATCHING_NO_PENDING",
         "completed_at": "", "last_error": "", "retry_count": 0,
-        "watch_empty_cycles": ciclos, "last_watch_at": _now(),
         "sync_pending": sync_pending_final,
         "detalle": detalle or "No hay pendientes. El sistema sigue vigilando Oracle.",
     })
@@ -211,17 +209,11 @@ def marcar_job_completado(detalle: str = "") -> None:
 def marcar_job_reintento(error: str) -> None:
     estado = leer_estado_job()
     retries = int(estado.get("retry_count", 0)) + 1
-    if retries >= 5:
-        guardar_estado_job({
-            "enabled": True, "status": "RETRY_PENDING_SLOW",
-            "last_error": str(error), "retry_count": retries,
-            "detalle": "5 reintentos. Se mantiene en reintento lento.",
-        })
-    else:
-        guardar_estado_job({
-            "enabled": True, "status": "RETRY_PENDING",
-            "last_error": str(error), "retry_count": retries,
-        })
+    guardar_estado_job({
+        "enabled": True, "status": "RETRY_PENDING",
+        "last_error": str(error), "retry_count": retries,
+        "detalle": str(error),
+    })
 
 
 def marcar_sync_activo(tramite: str, detalle: str = "") -> None:
@@ -274,8 +266,8 @@ def job_debe_reanudarse() -> bool:
         return False
     status = str(estado.get("status", "")).strip()
     if status not in {
-        "RUNNING", "RETRY_PENDING", "RETRY_PENDING_SLOW",
-        "RUNNING_BY_WORKER", "WAITING_OTHER_PROCESS", "WATCHING_NO_PENDING",
+        "RUNNING", "RETRY_PENDING",
+        "RUNNING_BY_WORKER", "WATCHING_NO_PENDING",
     }:
         return False
     updated_at = estado.get("updated_at", "")
@@ -285,10 +277,6 @@ def job_debe_reanudarse() -> bool:
         if status in ("RUNNING", "RUNNING_BY_WORKER") and segundos < 60:
             return False
         if status == "RETRY_PENDING" and segundos < 60:
-            return False
-        if status == "RETRY_PENDING_SLOW" and segundos < 600:
-            return False
-        if status == "WAITING_OTHER_PROCESS" and segundos < 120:
             return False
         if status == "WATCHING_NO_PENDING" and segundos < _watch_interval_seconds():
             return False

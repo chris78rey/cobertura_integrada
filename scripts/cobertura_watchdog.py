@@ -21,8 +21,8 @@ WATCHDOG_STATE_PATH = PROJECT_ROOT / "logs" / "cobertura_watchdog_state.json"
 WATCHDOG_LOG_PATH = PROJECT_ROOT / "logs" / "cobertura_watchdog.log"
 SERVICE_NAME = "cobertura-auto-resume.service"
 TIMER_NAME = "cobertura-auto-resume.timer"
-DEFAULT_STALE_MINUTES = 20
-DEFAULT_COOLDOWN_MINUTES = 30
+DEFAULT_STALE_MINUTES = 5
+DEFAULT_COOLDOWN_MINUTES = 10
 
 
 def log(msg: str) -> None:

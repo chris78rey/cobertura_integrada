@@ -215,19 +215,20 @@ def query_dataframe(
             except Exception:
                 pass
 
-def actualizar_cobertura_por_tramite(
+def actualizar_cobertura_por_tramite_valor(
     username: str,
     password: str,
     dig_tramite: str,
+    valor: str,
 ) -> dict:
     """
-    Actualiza DIG_COBERTURA='S' usando DIG_TRAMITE como llave operativa.
+    Actualiza DIG_COBERTURA con un valor controlado usando DIG_TRAMITE como llave operativa.
 
     Seguridad:
-    - Solo actualiza si DIG_COBERTURA sigue en 'N'.
+    - Solo permite S, N o X.
     - Solo actualiza si DIG_PLANILLADO está en 'S'.
     - Exige exactamente 1 fila afectada.
-    - Verifica inmediatamente después del COMMIT que quedó en 'S'.
+    - Verifica inmediatamente después del COMMIT que quedó aplicado el valor solicitado.
     """
 
     conn = None
@@ -238,6 +239,21 @@ def actualizar_cobertura_por_tramite(
     after_result = None
 
     dig_tramite = str(dig_tramite or "").strip()
+    valor = str(valor or "").strip().upper()
+
+    if valor not in {"S", "N", "X"}:
+        return {
+            "ok": False,
+            "affected": 0,
+            "verified": False,
+            "already_closed": False,
+            "error": f"Valor inválido de cobertura: {valor!r}. Solo se permite S, N o X.",
+            "criterio": "DIG_TRAMITE",
+            "oracle_context": {},
+            "before_rows": [],
+            "after_rows": [],
+        }
+
     if not dig_tramite:
         return {
             "ok": False,
@@ -274,9 +290,8 @@ def actualizar_cobertura_por_tramite(
 
     update_sql = """
         UPDATE DIGITALIZACION.DIGITALIZACION
-        SET DIG_COBERTURA = 'S'
+        SET DIG_COBERTURA = ?
         WHERE TO_CHAR(DIG_TRAMITE) = ?
-          AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
           AND TRIM(DIG_PLANILLADO) = 'S'
     """
     oracle_context = {}
@@ -357,7 +372,7 @@ def actualizar_cobertura_por_tramite(
             }
 
         before = before_rows[0]
-        if before.get("dig_cobertura") == "S":
+        if before.get("dig_cobertura") == valor:
             try:
                 java_conn.rollback()
             except Exception:
@@ -395,7 +410,8 @@ def actualizar_cobertura_por_tramite(
             }
 
         prepared_statement = java_conn.prepareStatement(update_sql)
-        prepared_statement.setString(1, dig_tramite)
+        prepared_statement.setString(1, valor)
+        prepared_statement.setString(2, dig_tramite)
 
         affected = int(prepared_statement.executeUpdate())
 
@@ -436,7 +452,7 @@ def actualizar_cobertura_por_tramite(
 
         verified = (
             len(after_rows) == 1
-            and after_rows[0].get("dig_cobertura") == "S"
+            and after_rows[0].get("dig_cobertura") == valor
             and after_rows[0].get("dig_planillado") == "S"
         )
 
@@ -448,7 +464,7 @@ def actualizar_cobertura_por_tramite(
                 "already_closed": False,
                 "error": (
                     f"El UPDATE hizo COMMIT con affected=1 para DIG_TRAMITE={dig_tramite}, "
-                    "pero la verificación posterior no confirmó DIG_COBERTURA='S'."
+                    f"pero la verificación posterior no confirmó DIG_COBERTURA={valor!r}."
                 ),
                 "criterio": "DIG_TRAMITE",
                 "oracle_context": oracle_context,
@@ -525,6 +541,23 @@ def actualizar_cobertura_por_tramite(
                 pass
 
 
+def actualizar_cobertura_por_tramite(
+    username: str,
+    password: str,
+    dig_tramite: str,
+) -> dict:
+    """
+    Mantiene el comportamiento histórico: cerrar un trámite en S.
+    """
+
+    return actualizar_cobertura_por_tramite_valor(
+        username=username,
+        password=password,
+        dig_tramite=dig_tramite,
+        valor="S",
+    )
+
+
 def obtener_tramites_en_cola(
     username: str,
     password: str,
@@ -560,9 +593,10 @@ def obtener_tramites_en_cola(
               AND TRIM(d.DIG_PLANILLADO) = 'S'
               AND (? IS NULL OR TO_CHAR(d.DIG_TRAMITE) = ?)
             ORDER BY
-                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)),
-                TO_CHAR(d.DIG_TRAMITE),
-                TO_CHAR(d.DIG_ID_TRAMITE)
+                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) DESC,
+                TO_DATE(NVL(TO_CHAR(d.DIG_FECHA_HASTA, 'YYYY-MM-DD'), '1900-01-01'), 'YYYY-MM-DD') DESC,
+                TO_CHAR(d.DIG_TRAMITE) DESC,
+                TO_CHAR(d.DIG_ID_TRAMITE) DESC
         )
         WHERE ROWNUM <= ?
     """
@@ -580,6 +614,101 @@ def obtener_tramites_en_cola(
         else:
             pstmt.setNull(2, 12)  # VARCHAR
             pstmt.setNull(3, 12)  # VARCHAR
+        pstmt.setInt(4, int(limite))
+
+        try:
+            pstmt.setQueryTimeout(20)
+        except Exception:
+            pass
+
+        rs = pstmt.executeQuery()
+        meta = rs.getMetaData()
+        total_cols = meta.getColumnCount()
+
+        while rs.next():
+            row = {}
+            for idx in range(1, total_cols + 1):
+                col_name = meta.getColumnLabel(idx)
+                value = rs.getString(idx)
+                row[col_name] = value.strip() if isinstance(value, str) else value
+            rows.append(row)
+
+        return rows
+
+    finally:
+        try:
+            if rs:
+                rs.close()
+        except Exception:
+            pass
+        try:
+            if pstmt:
+                pstmt.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def obtener_tramites_en_x(
+    username: str,
+    password: str,
+    fe_pla_aniomes_desde: str,
+    limite: int = 200,
+    dig_tramite: str | None = None,
+) -> list[dict]:
+    """
+    Devuelve los trámites marcados con DIG_COBERTURA = 'X'.
+
+    Solo lectura. No actualiza nada.
+    """
+
+    conn = oracle_connect(username, password)
+    rows: list[dict] = []
+
+    sql = """
+        SELECT *
+        FROM (
+            SELECT
+                TO_CHAR(d.DIG_ID_TRAMITE)      AS DIG_ID_TRAMITE,
+                TO_CHAR(d.DIG_ID_GENERACION)   AS DIG_ID_GENERACION,
+                TO_CHAR(d.DIG_TRAMITE)         AS DIG_TRAMITE,
+                TRIM(d.DIG_CEDULA)             AS DIG_CEDULA,
+                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) AS FE_PLA_ANIOMES,
+                TRIM(NVL(d.DIG_PLANILLADO, '')) AS DIG_PLANILLADO,
+                TRIM(NVL(d.DIG_COBERTURA, ''))  AS DIG_COBERTURA,
+                TRIM(NVL(d.DIG_DEPENDIENTE_01, '')) AS DIG_DEPENDIENTE_01,
+                TRIM(NVL(d.DIG_DEPENDIENTE_02, '')) AS DIG_DEPENDIENTE_02,
+                TO_CHAR(d.DIG_FECHA_PLANILLA, 'YYYY-MM-DD HH24:MI:SS') AS DIG_FECHA_PLANILLA
+            FROM DIGITALIZACION.DIGITALIZACION d
+            WHERE TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) >= ?
+              AND TRIM(NVL(d.DIG_COBERTURA, '')) = 'X'
+              AND TRIM(d.DIG_PLANILLADO) = 'S'
+              AND (? IS NULL OR TO_CHAR(d.DIG_TRAMITE) = ?)
+            ORDER BY
+                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) DESC,
+                TO_DATE(NVL(TO_CHAR(d.DIG_FECHA_HASTA, 'YYYY-MM-DD'), '1900-01-01'), 'YYYY-MM-DD') DESC,
+                TO_CHAR(d.DIG_TRAMITE) DESC,
+                TO_CHAR(d.DIG_ID_TRAMITE) DESC
+        )
+        WHERE ROWNUM <= ?
+    """
+
+    pstmt = None
+    rs = None
+
+    try:
+        pstmt = conn.jconn.prepareStatement(sql)
+        pstmt.setString(1, str(fe_pla_aniomes_desde))
+        if dig_tramite and str(dig_tramite).strip():
+            tramite = str(dig_tramite).strip()
+            pstmt.setString(2, tramite)
+            pstmt.setString(3, tramite)
+        else:
+            pstmt.setNull(2, 12)
+            pstmt.setNull(3, 12)
         pstmt.setInt(4, int(limite))
 
         try:

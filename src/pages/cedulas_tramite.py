@@ -18,7 +18,7 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
-from src.oracle_jdbc import oracle_connect
+from src.oracle_jdbc import oracle_connect, actualizar_cobertura_por_tramite_valor
 from src.cobertura_runner import ArchivoLock, LOCK_PATH, ProcesoCoberturaYaEnEjecucion
 from src.cobertura_pdf import generar_coberturas_automaticas_desde_mes
 
@@ -528,6 +528,7 @@ def cedulas_tramite_page():
             f"local={', '.join(legado['local']) or '-'}; "
             f"destino={', '.join(legado['destino']) or '-'}."
         )
+    st.info("DIG_COBERTURA='X' significa fallo/manual. El worker automático solo toma trámites en 'N'.")
 
     fe_pla_fila = str(fila.get("FE_PLA_ANIOMES", "") or "").strip()
     if fe_pla_fila:
@@ -555,6 +556,46 @@ def cedulas_tramite_page():
             )
         else:
             st.caption(f"Sin errores registrados para {fe_pla_fila}")
+
+    st.markdown("### Estado manual")
+    st.caption("Usar solo para sacar un trámite del flujo automático. `X` no lo toma el worker.")
+    with st.form("form_marcar_cobertura_x_manual"):
+        confirmar_x = st.checkbox("Confirmo marcar el trámite como X manual/fallido", key="confirmar_marcar_x_manual")
+        frase_x = st.text_input("Escribir MARCAR X para confirmar", value="", key="frase_confirmacion_marcar_x")
+        submitted_x = st.form_submit_button("Marcar DIG_COBERTURA='X' manualmente", use_container_width=True)
+
+        if submitted_x:
+            if not confirmar_x or frase_x.strip().upper() != "MARCAR X":
+                st.warning("Falta confirmar y escribir MARCAR X.")
+                st.markdown("</div>", unsafe_allow_html=True)
+                return
+            with st.spinner("Marcando DIG_COBERTURA='X' en Oracle..."):
+                resultado_x = actualizar_cobertura_por_tramite_valor(
+                    username=username,
+                    password=password,
+                    dig_tramite=str(fila.get("DIG_TRAMITE", "")).strip(),
+                    valor="X",
+                )
+            if resultado_x.get("ok"):
+                st.success("Trámite marcado como X manual/fallido.")
+                st.json(
+                    {
+                        "dig_tramite": fila.get("DIG_TRAMITE"),
+                        "affected": resultado_x.get("affected"),
+                        "verified": resultado_x.get("verified"),
+                        "oracle_context": resultado_x.get("oracle_context"),
+                    }
+                )
+                st.session_state["cedulas_filas_encontradas"] = _buscar_por_tramite(
+                    username,
+                    password,
+                    str(fila.get("DIG_TRAMITE", "")).strip(),
+                )
+                st.rerun()
+            else:
+                st.error("No se pudo marcar como X.")
+                st.code(resultado_x.get("error", "Error desconocido"), language="text")
+                st.json(resultado_x)
 
     col1, col2 = st.columns(2)
     with col1:

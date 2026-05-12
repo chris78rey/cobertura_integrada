@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 from collections import Counter, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -24,20 +24,15 @@ from src.cobertura_pdf import (
 from src.auto_resume_state import (
     leer_estado_job,
     _parse_ts,
-    guardar_estado_job,
-    registrar_job_activo,
-    marcar_job_completado,
-    marcar_job_reintento,
-    marcar_job_detenido_por_usuario,
-    marcar_job_vigilando_sin_pendientes,
 )
 from src.operator_tools import (
-    leer_estado_operador,
-    destrabar_para_reintento,
-    pausar_reintento_automatico,
     exportar_estado_json,
 )
-from src.oracle_jdbc import obtener_tramites_en_cola
+from src.oracle_jdbc import (
+    actualizar_cobertura_por_tramite_valor,
+    obtener_tramites_en_cola,
+    obtener_tramites_en_x,
+)
 
 
 def _reset_all():
@@ -116,6 +111,8 @@ def _estado_semaforo(seconds_progress: int | None, sync_active: bool, status: st
         return "ok", "Sync en curso con heartbeat activo."
     if status in {"WATCHING_NO_PENDING", "COMPLETED", "STOPPED_BY_USER"}:
         return "ok", "Sin trabajo activo."
+    if status in {"RETRY_PENDING", "RUNNING_BY_WORKER"}:
+        return "warn", "Hay reintentos o una pasada en curso; el proceso sigue vivo."
     if seconds_progress is None:
         return "warn", "Todavía no hay heartbeat suficiente para medir progreso."
     if seconds_progress < 300:
@@ -132,107 +129,68 @@ def _diagnostico_simple_operativo() -> dict[str, object]:
     Devuelve un resumen corto para la tarjeta superior y decide si se puede
     intervenir desde la interfaz sin tocar Oracle ni archivos.
     """
-    estado = leer_estado_operador() or {}
-    job = estado.get("job", {}) or {}
-
-    stop_flag = bool(estado.get("stop_flag"))
-    cuarentena_count = int(estado.get("quarantine_count", 0) or 0)
-    gen_lock = estado.get("generation_lock", {}) or {}
-    sync_lock = estado.get("sync_lock", {}) or {}
-    lock_activo = bool(gen_lock.get("held") or sync_lock.get("held"))
-    lock_huerfano = bool(gen_lock.get("orphan") or sync_lock.get("orphan"))
+    job = leer_estado_job() or {}
 
     job_enabled = bool(job.get("enabled", False))
     job_status = str(job.get("status", "") or "").strip()
     sync_active = bool(job.get("sync_active"))
     last_progress_at = str(job.get("last_progress_at", "") or "").strip()
     seconds_progress = _segundos_desde(last_progress_at)
+    try:
+        pendientes_antes = int(float(str(job.get("pendientes_antes", 0) or 0)))
+    except Exception:
+        pendientes_antes = 0
+    try:
+        pendientes_despues = int(float(str(job.get("pendientes_despues", 0) or 0)))
+    except Exception:
+        pendientes_despues = 0
+    pendientes_vivos = max(pendientes_antes, pendientes_despues)
 
-    if stop_flag or not job_enabled or job_status in {"PAUSED_BY_OPERATOR", "STOPPED_BY_USER"}:
+    if not job_enabled or job_status in {"PAUSED_BY_OPERATOR", "STOPPED_BY_USER"}:
         return {
-            "estado": "PAUSADO",
+            "estado": "SIN EJECUCIÓN",
             "variante": "warn",
-            "motivo": "El proceso está pausado por bandera o por reintento deshabilitado.",
-            "accion": "Reanudar reintento o quitar la parada antes de despachar.",
-            "puede_destrabar": True,
-            "puede_despachar": False,
-            "resumen": "Pausa activa",
-        }
-
-    if lock_huerfano and not lock_activo:
-        return {
-            "estado": "BLOQUEO HUÉRFANO",
-            "variante": "alert",
-            "motivo": "Hay un bloqueo de trabajo sin proceso activo real.",
-            "accion": "Liberar el bloqueo temporal y despachar el siguiente lote.",
-            "puede_destrabar": True,
-            "puede_despachar": False,
-            "resumen": "Bloqueo huérfano",
-        }
-
-    if lock_activo:
-        return {
-            "estado": "TRABAJANDO",
-            "variante": "ok",
-            "motivo": "Hay un proceso activo tomando registros.",
-            "accion": "Esperar a que termine la pasada actual.",
-            "puede_destrabar": False,
-            "puede_despachar": False,
-            "resumen": "Proceso en curso",
+            "motivo": "El proceso no está tomando registros en este momento.",
+            "accion": "Esperar a que el loop vuelva a leer Oracle.",
+            "resumen": "Sin ejecución",
         }
 
     if sync_active:
         return {
-            "estado": "SINCRONIZANDO",
+            "estado": "EN EJECUCIÓN",
             "variante": "ok",
             "motivo": "El worker está transfiriendo archivos al destino.",
-            "accion": "Esperar el cierre del sync.",
-            "puede_destrabar": False,
-            "puede_despachar": False,
-            "resumen": "Sync activo",
+            "accion": "Esperar; el flujo sigue activo.",
+            "resumen": "En ejecución",
         }
 
-    if cuarentena_count > 0:
+    if pendientes_vivos > 0:
         return {
-            "estado": "CUARENTENA",
-            "variante": "warn",
-            "motivo": f"Hay {cuarentena_count} trámite(s) retenidos temporalmente.",
-            "accion": "Revisar cuarentena o liberar el reintento seguro.",
-            "puede_destrabar": True,
-            "puede_despachar": True,
-            "resumen": "Pendientes retenidos",
-        }
-
-    if job_status in {"RUNNING_BY_WORKER", "RETRY_PENDING", "RETRY_PENDING_SLOW"} and seconds_progress is not None and seconds_progress > 180:
-        return {
-            "estado": "ESTADO VIEJO",
-            "variante": "warn",
-            "motivo": "El estado dice que corría, pero ya no hay progreso reciente.",
-            "accion": "Despachar una nueva pasada para refrescar el estado.",
-            "puede_destrabar": False,
-            "puede_despachar": True,
-            "resumen": "Estado desactualizado",
+            "estado": "EN REINTENTO AUTOMÁTICO",
+            "variante": "ok",
+            "motivo": (
+                f"Oracle todavía tiene {pendientes_vivos} trámite(s) pendientes. "
+                "El sistema debe seguir reintentando sin intervención manual."
+            ),
+            "accion": "Esperar; el loop sigue leyendo Oracle.",
+            "resumen": f"{pendientes_vivos} pendientes activos",
         }
 
     if job_status in {"WATCHING_NO_PENDING", "COMPLETED"}:
         return {
             "estado": "SIN PENDIENTES",
             "variante": "ok",
-            "motivo": "No se observan bloqueos ni pendientes visibles en el estado actual.",
-            "accion": "Puede despacharse una pasada si se quiere revalidar Oracle.",
-            "puede_destrabar": False,
-            "puede_despachar": True,
-            "resumen": "Libre para despachar",
+            "motivo": "No se observan pendientes visibles en el estado actual.",
+            "accion": "El loop queda vigilando Oracle.",
+            "resumen": "Sin pendientes",
         }
 
     return {
-        "estado": "LISTO PARA DESPACHAR",
+        "estado": "EN EJECUCIÓN",
         "variante": "ok",
-        "motivo": "No hay locks, cuarentena ni sync activo visibles.",
-        "accion": "Despachar siguiente lote si se quiere acelerar.",
-        "puede_destrabar": False,
-        "puede_despachar": True,
-        "resumen": "Listo",
+        "motivo": "El loop está vivo y puede seguir tomando trámites.",
+        "accion": "Esperar; el flujo sigue solo.",
+        "resumen": "En ejecución",
     }
 
 
@@ -660,6 +618,149 @@ def _render_cola_pendiente(username: str, password: str, fe_pla_aniomes_desde: s
     )
 
 
+def _render_tramites_x_reprocesar(username: str, password: str, fe_pla_aniomes_desde: str) -> None:
+    st.markdown("### Trámites en X para reprocesar")
+    st.caption("Busca trámites marcados como X y vuelve a ponerlos en N para que el loop los tome otra vez.")
+
+    if not username or not password:
+        st.info("Inicia sesión en Oracle para buscar y reprocesar trámites en X.")
+        return
+
+    col1, col2 = st.columns([1.1, 1.0])
+    with col1:
+        mes_x = st.text_input(
+            "Mes desde para X",
+            value=str(fe_pla_aniomes_desde).strip(),
+            max_chars=6,
+            key="x_mes_desde",
+            help="Formato YYYYMM. Ejemplo: 202605.",
+        ).strip()
+    with col2:
+        filtro_x = st.text_input(
+            "Trámite X exacto (opcional)",
+            value="",
+            max_chars=30,
+            key="x_tramite_exacto",
+            help="Si lo llenas, solo buscará ese DIG_TRAMITE.",
+        ).strip()
+
+    buscar = st.button(
+        "Buscar trámites en X",
+        key="btn_buscar_tramites_x",
+        use_container_width=True,
+    )
+
+    cache_key = f"tramites_x::{mes_x}::{filtro_x}"
+    if buscar:
+        st.session_state.pop(cache_key, None)
+
+    filas = st.session_state.get(cache_key)
+    if filas is None and mes_x:
+        with st.spinner("Consultando trámites en X..."):
+            try:
+                filas = obtener_tramites_en_x(
+                    username=username,
+                    password=password,
+                    fe_pla_aniomes_desde=mes_x,
+                    limite=100,
+                    dig_tramite=filtro_x or None,
+                )
+                st.session_state[cache_key] = filas
+            except Exception as exc:
+                st.error("No se pudieron consultar los trámites en X.")
+                st.code(str(exc), language="text")
+                return
+
+    filas = filas or []
+    st.caption(f"Se encontraron {len(filas)} trámite(s) en X.")
+
+    if not filas:
+        st.info("No hay trámites en X con los filtros actuales.")
+        return
+
+    df = pd.DataFrame(filas).copy()
+    columnas = [
+        c
+        for c in [
+            "DIG_TRAMITE",
+            "DIG_ID_TRAMITE",
+            "DIG_CEDULA",
+            "FE_PLA_ANIOMES",
+            "DIG_PLANILLADO",
+            "DIG_COBERTURA",
+            "DIG_DEPENDIENTE_01",
+            "DIG_DEPENDIENTE_02",
+            "DIG_FECHA_PLANILLA",
+        ]
+        if c in df.columns
+    ]
+    st.dataframe(df[columnas], use_container_width=True, hide_index=True)
+
+    opciones: dict[str, dict[str, str]] = {}
+    for fila in filas:
+        tramite = str(fila.get("DIG_TRAMITE", "") or "").strip()
+        if not tramite:
+            continue
+        etiqueta = (
+            f"{tramite} | ID {str(fila.get('DIG_ID_TRAMITE', '') or '').strip()} | "
+            f"Céd {str(fila.get('DIG_CEDULA', '') or '').strip()} | "
+            f"Mes {str(fila.get('FE_PLA_ANIOMES', '') or '').strip()}"
+        )
+        opciones[etiqueta] = fila
+
+    if not opciones:
+        st.warning("No se encontraron opciones válidas para reprocesar.")
+        return
+
+    seleccion = st.selectbox(
+        "Seleccionar trámite X",
+        options=list(opciones.keys()),
+        key="select_tramite_x_reprocesar",
+    )
+    confirmar = st.checkbox(
+        "Confirmo volver el trámite a N y dejar que el loop lo reprocesse",
+        key="confirmar_reprocesar_x",
+    )
+
+    if st.button(
+        "Volver a N y reprocesar",
+        key="btn_reprocesar_x",
+        use_container_width=True,
+    ):
+        if not confirmar:
+            st.warning("Confirma la acción antes de reprocesar.")
+            return
+
+        fila = opciones.get(seleccion, {})
+        tramite = str(fila.get("DIG_TRAMITE", "") or "").strip()
+        if not tramite:
+            st.error("No se pudo identificar el trámite seleccionado.")
+            return
+
+        with st.spinner(f"Marcando {tramite} como N..."):
+            resultado = actualizar_cobertura_por_tramite_valor(
+                username=username,
+                password=password,
+                dig_tramite=tramite,
+                valor="N",
+            )
+
+        if resultado.get("ok") and resultado.get("verified"):
+            st.success(
+                f"Trámite {tramite} volvió a N. El loop lo tomará en el siguiente ciclo."
+            )
+            lanzamiento = _disparar_worker_inmediato()
+            if lanzamiento.get("ok"):
+                st.info("Se lanzó un ciclo inmediato del worker para tomar el trámite.")
+            else:
+                st.warning("No se pudo lanzar el worker inmediato; el loop lo tomará solo en el siguiente ciclo.")
+            st.session_state.pop(cache_key, None)
+            st.rerun()
+        else:
+            st.error("No se pudo devolver el trámite a N.")
+            st.code(str(resultado), language="json")
+
+
 def _ejecutar_sync_coberturas_repo(
     origen_root: str,
     dig_tramite: str = "",
@@ -941,6 +1042,273 @@ def _leer_json_seguro(path: Path) -> dict:
         return {}
 
 
+def _contar_tramites_en_destino_recientes(ventana_segundos: int = 120) -> dict[str, object]:
+    """
+    Cuenta los trámites que sí copiaron al destino en la ventana reciente.
+
+    Se toma del evento SYNC_IMMEDIATE_STDOUT porque ahí el sync ya terminó
+    y el resumen trae "Copiados: N". Si N > 0, el trámite ya quedó en destino.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(ventana_segundos)))
+    eventos: dict[str, dict[str, object]] = {}
+
+    logs_dir = Path("/data_nuevo/cobertura_integrada/logs")
+    archivos = sorted(
+        logs_dir.glob("cobertura_auto_*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    for path in archivos:
+        try:
+            if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) < cutoff:
+                continue
+        except Exception:
+            continue
+
+        try:
+            lineas = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+
+        for line in reversed(lineas):
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+
+            if payload.get("event") != "SYNC_IMMEDIATE_STDOUT":
+                continue
+
+            dt = _parse_ts(payload.get("ts"))
+            if not dt or dt < cutoff:
+                break
+
+            tramite = str(payload.get("dig_tramite", "") or "").strip()
+            if not tramite:
+                continue
+
+            stdout = str(payload.get("stdout", "") or "")
+            match = re.search(r"Copiados:\s*(\d+)", stdout)
+            copiados = int(match.group(1)) if match else 0
+            if copiados <= 0:
+                continue
+
+            eventos[tramite] = {
+                "tramite": tramite,
+                "ts": dt,
+                "run_id": str(payload.get("run_id", "") or "").strip(),
+                "dig_id_generacion": str(payload.get("dig_id_generacion", "") or "").strip(),
+                "copiados": copiados,
+            }
+
+    if eventos:
+        ultimo = max(eventos.values(), key=lambda x: x["ts"])
+        return {
+            "tramites": len(eventos),
+            "ultimo_tramite": str(ultimo.get("tramite", "") or ""),
+            "ultimo_ts": ultimo.get("ts"),
+            "run_id": str(ultimo.get("run_id", "") or ""),
+        }
+
+    return {
+        "tramites": 0,
+        "ultimo_tramite": "",
+        "ultimo_ts": None,
+        "run_id": "",
+    }
+
+
+def _parse_ts_evento(valor: object) -> datetime | None:
+    if isinstance(valor, datetime):
+        return valor if valor.tzinfo else valor.replace(tzinfo=timezone.utc)
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+    try:
+        if texto.endswith("Z"):
+            texto = texto[:-1] + "+00:00"
+        dt = datetime.fromisoformat(texto)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return _parse_ts(texto)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _resumen_rendimiento_reciente(limit: int = 20, horas: int = 24) -> dict[str, object]:
+    """
+    Resume los últimos trámites completos usando logs técnicos recientes.
+
+    Calcula:
+    - tiempo de generación
+    - tiempo de sync
+    - tiempo total
+    - trámites por minuto
+    """
+    logs_dir = Path("/data_nuevo/cobertura_integrada/logs")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(horas)))
+
+    archivos = sorted(
+        logs_dir.glob("cobertura_auto_*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    eventos_por_tramite: dict[tuple[str, str], dict[str, object]] = {}
+
+    def _get_group(run_id: str, tramite: str) -> dict[str, object]:
+        key = (run_id, tramite)
+        if key not in eventos_por_tramite:
+            eventos_por_tramite[key] = {
+                "run_id": run_id,
+                "tramite": tramite,
+                "pdf_start": None,
+                "pdf_end": None,
+                "sync_start": None,
+                "sync_end": None,
+                "oracle_end": None,
+                "oracle_ok": False,
+                "sync_ok": False,
+                "pdfs": 0,
+            }
+        return eventos_por_tramite[key]
+
+    for path in archivos:
+        try:
+            if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) < cutoff:
+                continue
+        except Exception:
+            continue
+
+        try:
+            lineas = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+
+        for line in lineas:
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+
+            event = str(payload.get("event", "") or "").strip()
+            if event not in {
+                "PDF_GENERATION_START",
+                "PDF_GENERATION_END",
+                "SYNC_IMMEDIATE_START",
+                "SYNC_IMMEDIATE_STDOUT",
+                "ORACLE_UPDATE_END",
+            }:
+                continue
+
+            run_id = str(payload.get("run_id", "") or "").strip()
+            tramite = str(payload.get("dig_tramite", "") or "").strip()
+            if not run_id or not tramite:
+                continue
+
+            dt = _parse_ts_evento(payload.get("ts"))
+            if not dt:
+                continue
+
+            group = _get_group(run_id, tramite)
+
+            if event == "PDF_GENERATION_START":
+                current = group.get("pdf_start")
+                if current is None or dt < current:
+                    group["pdf_start"] = dt
+
+            elif event == "PDF_GENERATION_END":
+                current = group.get("pdf_end")
+                if current is None or dt > current:
+                    group["pdf_end"] = dt
+                group["pdfs"] = max(int(group.get("pdfs", 0) or 0) + 1, int(group.get("pdfs", 0) or 0))
+
+            elif event == "SYNC_IMMEDIATE_START":
+                current = group.get("sync_start")
+                if current is None or dt < current:
+                    group["sync_start"] = dt
+
+            elif event == "SYNC_IMMEDIATE_STDOUT":
+                stdout = str(payload.get("stdout", "") or "")
+                match = re.search(r"Copiados:\s*(\d+)", stdout)
+                copiados = int(match.group(1)) if match else 0
+                if copiados > 0:
+                    group["sync_ok"] = True
+                    current = group.get("sync_end")
+                    if current is None or dt > current:
+                        group["sync_end"] = dt
+
+            elif event == "ORACLE_UPDATE_END":
+                current = group.get("oracle_end")
+                if current is None or dt > current:
+                    group["oracle_end"] = dt
+                group["oracle_ok"] = bool(payload.get("ok")) and bool(payload.get("verified"))
+
+    completados: list[dict[str, object]] = []
+    for item in eventos_por_tramite.values():
+        pdf_start = item.get("pdf_start")
+        pdf_end = item.get("pdf_end")
+        sync_start = item.get("sync_start")
+        sync_end = item.get("sync_end")
+        oracle_end = item.get("oracle_end")
+
+        if not (pdf_start and pdf_end and sync_start and sync_end and oracle_end):
+            continue
+        if not item.get("oracle_ok"):
+            continue
+
+        gen_s = max(0.0, (pdf_end - pdf_start).total_seconds())  # type: ignore[operator]
+        sync_s = max(0.0, (sync_end - sync_start).total_seconds())  # type: ignore[operator]
+        total_s = max(0.0, (oracle_end - pdf_start).total_seconds())  # type: ignore[operator]
+
+        completados.append(
+            {
+                "run_id": str(item.get("run_id", "") or ""),
+                "tramite": str(item.get("tramite", "") or ""),
+                "gen_s": gen_s,
+                "sync_s": sync_s,
+                "total_s": total_s,
+                "pdfs": int(item.get("pdfs", 0) or 0),
+                "oracle_ok": bool(item.get("oracle_ok")),
+                "oracle_end": oracle_end,
+            }
+        )
+
+    completados.sort(key=lambda x: x["oracle_end"], reverse=True)
+    completados = completados[: max(1, int(limit))]
+
+    if not completados:
+        return {
+            "tramites": 0,
+            "prom_gen_s": 0.0,
+            "prom_sync_s": 0.0,
+            "prom_total_s": 0.0,
+            "tramites_por_minuto": 0.0,
+            "ultimo_tramite": "",
+            "ultimo_ts": None,
+            "pdf_promedio": 0.0,
+        }
+
+    prom_gen = sum(x["gen_s"] for x in completados) / len(completados)
+    prom_sync = sum(x["sync_s"] for x in completados) / len(completados)
+    prom_total = sum(x["total_s"] for x in completados) / len(completados)
+    ventana_min = max(1.0, (completados[0]["oracle_end"] - completados[-1]["oracle_end"]).total_seconds() / 60.0)  # type: ignore[operator]
+    tpm = len(completados) / ventana_min if ventana_min > 0 else float(len(completados))
+    ultimo = completados[0]
+    pdf_promedio = sum(x["pdfs"] for x in completados) / len(completados)
+
+    return {
+        "tramites": len(completados),
+        "prom_gen_s": round(prom_gen, 2),
+        "prom_sync_s": round(prom_sync, 2),
+        "prom_total_s": round(prom_total, 2),
+        "tramites_por_minuto": round(tpm, 2),
+        "ultimo_tramite": ultimo.get("tramite", ""),
+        "ultimo_ts": ultimo.get("oracle_end"),
+        "pdf_promedio": round(pdf_promedio, 2),
+    }
+
+
 @st.fragment(run_every="5s")
 def _render_monitor_progreso():
     """Muestra el estado real del worker y del watchdog en una sola tarjeta."""
@@ -1210,85 +1578,6 @@ def _validar_fe_pla_aniomes_desde(valor: str) -> tuple[bool, str, str]:
     return True, mes, ""
 
 
-def _render_operator_panel():
-    st.markdown("---")
-    st.markdown("### 🛠️ Panel de operación segura")
-
-    estado = leer_estado_operador()
-
-    cuarentena_count = int(estado.get("quarantine_count", 0))
-    stop_flag = bool(estado.get("stop_flag"))
-    gen_lock = estado.get("generation_lock", {})
-    sync_lock = estado.get("sync_lock", {})
-    job = estado.get("job", {})
-
-    lock_activo = bool(gen_lock.get("held") or sync_lock.get("held"))
-    lock_huerfano = bool(gen_lock.get("orphan") or sync_lock.get("orphan"))
-
-    col_a, col_b, col_c, col_d = st.columns(4)
-
-    with col_a:
-        st.metric("Cuarentena", cuarentena_count)
-    with col_b:
-        st.metric("Parada", "Activa" if stop_flag else "Inactiva")
-    with col_c:
-        if lock_activo:
-            st.metric("Proceso", "Trabajando")
-        elif lock_huerfano:
-            st.metric("Proceso", "Bloq. huérfano")
-        else:
-            st.metric("Proceso", "Libre")
-    with col_d:
-        st.metric("Reintento", str(job.get("status", "Sin estado")))
-
-    if lock_activo:
-        st.info(
-            "Hay un proceso activo. No se debe destrabar todavía. "
-            "Si los PDFs siguen apareciendo, el sistema está trabajando."
-        )
-    elif cuarentena_count > 0:
-        st.warning(
-            "Hay trámites en cuarentena temporal. Si el proceso no avanza, "
-            "podés liberar la cuarentena y permitir un nuevo intento."
-        )
-    elif lock_huerfano:
-        st.warning("Existe un bloqueo huérfano. Esto puede ocurrir tras un corte inesperado.")
-    elif stop_flag:
-        st.warning("La bandera de parada está activa. El proceso no tomará nuevos registros.")
-    else:
-        st.success("El estado operativo no muestra bloqueos críticos.")
-
-    with st.expander("Ver trámites en cuarentena", expanded=cuarentena_count > 0):
-        rows = estado.get("quarantine_rows", [])
-        if rows:
-            df = pd.DataFrame(rows)
-            columnas = ["tramite", "minutos_restantes", "retry_count", "motivo", "created_at_local", "expires_at_local", "clave"]
-            columnas_existentes = [c for c in columnas if c in df.columns]
-            st.dataframe(df[columnas_existentes], use_container_width=True, hide_index=True)
-        else:
-            st.caption("No hay trámites en cuarentena activa.")
-
-    with st.expander("Ver estado interno", expanded=False):
-        st.json(job)
-
-    with st.expander("Ver últimos eventos técnicos", expanded=False):
-        errores = estado.get("last_errors", [])
-        if errores:
-            st.code("\n".join(errores[-40:]), language="text")
-        else:
-            st.caption("No hay errores recientes relevantes.")
-
-    st.markdown("#### Acciones seguras")
-    st.info(
-        "La operación quedó en modo autónomo. "
-        "Si aparece una cuarentena temporal o un bloqueo huérfano, el worker y el watchdog "
-        "lo reintentan o corrigen sin intervención manual."
-    )
-
-    with st.expander("Copiar diagnóstico para soporte", expanded=False):
-        st.code(exportar_estado_json(), language="json")
-
-
 def dashboard_page():
     _init_state()
     _render_css()
@@ -1299,7 +1588,7 @@ def dashboard_page():
         """
         <div class="main-title">Cobertura automática MSP</div>
         <div class="main-subtitle">
-            Monitor operativo. El worker corre solo por timer cada 2 min.
+            Monitor operativo. El worker corre en loop continuo con pausas alternadas de 2 y 4 segundos.
             Usar contingencia solo si el sistema no responde.
         </div>
         """,
@@ -1317,6 +1606,8 @@ def dashboard_page():
     st.markdown('<div class="simple-card">', unsafe_allow_html=True)
 
     _render_estado_simple_operativo()
+
+    st.caption("Flujo simple: Oracle manda, el loop alterna 2 s y 4 s, y cada fallo sale como X.")
 
     st.markdown("---")
 
@@ -1436,87 +1727,47 @@ def dashboard_page():
 
     st.markdown("---")
 
+    if vista_simple:
+        with st.expander("Ver métricas y detalle técnico", expanded=False):
+            st.caption("La vista simple deja el detalle técnico plegado.")
+            st.code(exportar_estado_json(), language="json")
+    else:
+        st.markdown("### Resumen operativo")
+        st.metric("Pendientes en Oracle", f"{int(pendientes_oracle_actuales or 0):,}")
+        st.caption("En modo simple el detalle técnico queda plegado abajo.")
+
+    st.markdown("---")
+    _render_tramites_x_reprocesar(
+        username=username,
+        password=password,
+        fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+    )
+
     with st.expander(
         "Ver detalle técnico, cola y soporte",
         expanded=not vista_simple,
     ):
-        if mes_valido and tramite_valido:
-            _render_cola_pendiente(
-                username=username,
-                password=password,
-                fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-                dig_tramite=dig_tramite_input if modo_procesamiento == "Procesar por trámite específico" else "",
-            )
-
-        st.markdown("---")
-
-        # Monitor del worker autónomo
-        _render_estado_worker()
-
-        st.markdown("---")
-
-    puede_generar = ruta_valida and mes_valido and tramite_valido
-
-    with st.expander("⚙️ Contingencia: forzar corrida manual", expanded=False):
-        st.caption("El sistema corre solo por timer. Usar solo si el worker no responde o para trámite puntual urgente.")
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            generar = st.button(
-                "Forzar corrida manual",
-                key="generar_auto_button",
-                use_container_width=True,
-                disabled=not puede_generar,
-            )
-        with col2:
-            parar = st.button(
-                "Parar proceso",
-                key="parar_auto_button",
-                use_container_width=True,
-            )
-        with col3:
-            limpiar = st.button(
-                "Limpiar",
-                key="limpiar_auto_button",
-                use_container_width=True,
-            )
-
-    if parar:
-        _crear_bandera_parada()
-        st.warning("Se solicitó detener el proceso. Terminará la fila actual y no tomará una nueva.")
-
-    if limpiar:
-        _limpiar_bandera_parada()
-        _reset_all()
-        st.rerun()
-
-    if generar:
-        _limpiar_bandera_parada()
-        registrar_job_activo(
-            fe_pla_aniomes_desde=fe_pla_aniomes_desde,
-            output_dir=str(pdf_output_dir),
-            dig_tramite=dig_tramite_input,
-        )
-
-        lanzamiento = _disparar_worker_inmediato()
-
-        if lanzamiento.get("ok"):
-            guardar_estado_job({
-                "launcher_pid": lanzamiento.get("pid"),
-                "detalle": (
-                    f"Trabajo armado desde Streamlit. "
-                    f"Worker inmediato lanzado PID={lanzamiento.get('pid')}."
-                ),
-                "last_error": "",
-            })
-            st.success("Modo autónomo activado.")
-            st.info("El worker seguirá vigilando Oracle y procesará nuevos trámites sin más clics.")
-            st.session_state["worker_recien_lanzado"] = True
+        if vista_simple:
+            st.caption("El detalle técnico quedó oculto para simplificar la operación diaria.")
+            with st.expander("Copiar diagnóstico para soporte", expanded=False):
+                st.code(exportar_estado_json(), language="json")
         else:
-            marcar_job_reintento(lanzamiento.get("error", "No se pudo lanzar el worker."))
-            st.error("No se pudo lanzar el worker inmediato.")
-            st.code(str(lanzamiento.get("error", "")), language="text")
+            st.markdown("---")
 
-        st.rerun()
+            if mes_valido and tramite_valido:
+                _render_cola_pendiente(
+                    username=username,
+                    password=password,
+                    fe_pla_aniomes_desde=fe_pla_aniomes_desde,
+                    dig_tramite=dig_tramite_input if modo_procesamiento == "Procesar por trámite específico" else "",
+                )
+
+            st.markdown("---")
+
+            # Monitor del worker autónomo
+            _render_estado_worker()
+
+            st.markdown("---")
 
     with st.expander(
         "Ver estado vivo, resultado y soporte",
@@ -1524,7 +1775,6 @@ def dashboard_page():
     ):
         _render_monitor_progreso()
         _render_auto_result()
-        _render_operator_panel()
 
     st.markdown("</div>", unsafe_allow_html=True)
 

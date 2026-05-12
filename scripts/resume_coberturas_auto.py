@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import time
+import os
 import sys
 from pathlib import Path
 
@@ -12,10 +14,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.auto_resume_state import (  # noqa: E402
     leer_estado_job,
-    job_debe_reanudarse,
     guardar_estado_job,
     heartbeat_job,
-    marcar_job_completado,
     marcar_job_reintento,
     marcar_job_vigilando_sin_pendientes,
 )
@@ -24,6 +24,7 @@ from src.cobertura_runner import (  # noqa: E402
     ProcesoCoberturaYaEnEjecucion,
 )
 from src.oracle_jdbc import oracle_connect  # noqa: E402
+from src.oracle_jdbc import actualizar_cobertura_por_tramite_valor  # noqa: E402
 
 
 def log(msg: str) -> None:
@@ -78,44 +79,22 @@ def contar_pendientes(username: str, password: str, fe_pla_aniomes_desde: str, d
                 try: obj.close()
                 except Exception: pass
 
-def _reactivar_vigilancia_mensual_si_corresponde(fe_pla_aniomes_desde: str, output_dir: str) -> bool:
-    """
-    Si el modo mensual quedó apagado, lo devuelve a vigilancia para que el timer
-    siga mirando Oracle sin intervención humana.
-    """
-    estado = leer_estado_job()
-    status = str(estado.get("status", "") or "").strip()
-    dig_tramite = str(estado.get("dig_tramite", "") or "").strip()
+def _marcar_tramite_x(username: str, password: str, tramite: str, motivo: str) -> None:
+    tramite = str(tramite or "").strip()
+    if not tramite:
+        return
 
-    if dig_tramite:
-        return False
-
-    if status in {"STOPPED_BY_USER", "PAUSED_BY_OPERATOR"}:
-        return False
-
-    enabled = bool(estado.get("enabled"))
-    if enabled and status == "WATCHING_NO_PENDING":
-        return False
-
-    guardar_estado_job(
-        {
-            "enabled": True,
-            "status": "WATCHING_NO_PENDING",
-            "fe_pla_aniomes_desde": str(fe_pla_aniomes_desde or "").strip(),
-            "dig_tramite": "",
-            "output_dir": str(output_dir).strip(),
-            "completed_at": "",
-            "last_error": "",
-            "retry_count": 0,
-            "sync_pending": False,
-            "detalle": "Modo mensual reactivado para vigilar Oracle sin cola.",
-        }
-    )
-    log("[INFO] Modo mensual reactivado a WATCHING_NO_PENDING.")
-    return True
+    try:
+        res = actualizar_cobertura_por_tramite_valor(username, password, tramite, "X")
+        log(
+            f"[INFO] Trámite {tramite} marcado en X "
+            f"(ok={res.get('ok')}, affected={res.get('affected', 0)}). Motivo: {motivo}"
+        )
+    except Exception as exc:
+        log(f"[ERROR] No se pudo marcar trámite {tramite} en X: {exc}")
 
 
-def main() -> int:
+def _run_cycle() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     import os
     _limpiar_logs_antiguos()
@@ -133,10 +112,6 @@ def main() -> int:
     if not fe_pla_aniomes_desde:
         marcar_job_reintento("No existe fe_pla_aniomes_desde en el estado.")
         return 1
-
-    reactivado = _reactivar_vigilancia_mensual_si_corresponde(fe_pla_aniomes_desde, output_dir)
-    if not reactivado and not job_debe_reanudarse():
-        return 0
 
     modo_vigilante = _es_modo_vigilante(dig_tramite)
     pendientes_antes = contar_pendientes(username, password, fe_pla_aniomes_desde, dig_tramite)
@@ -157,14 +132,11 @@ def main() -> int:
             marcar_job_vigilando_sin_pendientes(
                 f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. Sistema vigilando.",
                 sync_pending=False)
-            log("[INFO] Sin pendientes. Modo vigilante activo.")
-        else:
-            marcar_job_completado("No queda pendiente el trámite solicitado.")
-            log("[INFO] Trabajo completado para trámite específico.")
+            log("[INFO] Sin pendientes. El loop sigue vigilando.")
         return 0
 
-    guardar_estado_job({"enabled": True, "status": "RUNNING_BY_WORKER",
-                        "last_error": "", "retry_count": 0, "watch_empty_cycles": 0,
+        guardar_estado_job({"enabled": True, "status": "RUNNING_BY_WORKER",
+                        "last_error": "", "retry_count": 0,
                         "pendientes_antes": pendientes_antes,
                         "pendientes_despues": "",
                         "last_generados": "",
@@ -220,13 +192,13 @@ def main() -> int:
     except ProcesoCoberturaYaEnEjecucion as exc:
         estado = leer_estado_job()
         retries = int(estado.get("retry_count", 0)) + 1
-        if retries >= 5:
-            guardar_estado_job({"enabled": True, "status": "RETRY_PENDING_SLOW",
-                                "last_error": str(exc), "retry_count": retries,
-                                "detalle": "Lock ocupado 5 veces. Reintento lento."})
-        else:
-            guardar_estado_job({"enabled": True, "status": "WAITING_OTHER_PROCESS",
-                                "last_error": str(exc), "retry_count": retries})
+        guardar_estado_job({
+            "enabled": True,
+            "status": "RETRY_PENDING",
+            "last_error": str(exc),
+            "retry_count": retries,
+            "detalle": "Lock ocupado. Reintento automático.",
+        })
         return 0
     except Exception as exc:
         marcar_job_reintento(str(exc))
@@ -246,19 +218,45 @@ def main() -> int:
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
                 f"Terminados pendientes actuales con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
-                "Sistema vigilando.", sync_pending=False)
-            log("[INFO] Pendientes actuales terminados. Modo vigilante activo.")
-        else:
-            marcar_job_completado("Proceso terminado para el trámite solicitado.")
-            log("[INFO] Trabajo completado para trámite específico.")
+                "Sistema vigilando.",
+                sync_pending=False,
+            )
+            log("[INFO] Sin pendientes. El loop sigue vigilando.")
     else:
-        guardar_estado_job({"enabled": True, "status": "RETRY_PENDING",
-                            "pendientes_despues": pendientes_despues,
-                            "last_error": "", "retry_count": 0,
-                            "sync_pending": False,
-                            "detalle": "Aún quedan pendientes. El timer volverá a ejecutar."})
-        log("[INFO] Aún quedan pendientes. El timer volverá a ejecutar.")
+        guardar_estado_job(
+            {
+                "enabled": True,
+                "status": "RETRY_PENDING",
+                "pendientes_despues": pendientes_despues,
+                "last_error": "",
+                "retry_count": 0,
+                "sync_pending": False,
+                "detalle": "Aún quedan pendientes. El loop sigue ejecutando.",
+            }
+        )
+        log("[INFO] Aún quedan pendientes. El loop sigue ejecutando.")
     return 0
+
+
+def main() -> int:
+    sleep_sequence = (2, 4)
+    loop_index = 0
+
+    while True:
+        loop_index += 1
+        loop_sleep_seconds = sleep_sequence[(loop_index - 1) % len(sleep_sequence)]
+
+        try:
+            _run_cycle()
+        except KeyboardInterrupt:
+            return 0
+        except Exception as exc:
+            log(f"[ERROR] Ciclo inesperado del recuperador: {exc}")
+            time.sleep(loop_sleep_seconds)
+            continue
+
+        log(f"[INFO] Pausa del loop: {loop_sleep_seconds}s.")
+        time.sleep(loop_sleep_seconds)
 
 
 if __name__ == "__main__":

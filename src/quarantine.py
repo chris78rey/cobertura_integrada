@@ -60,6 +60,27 @@ def poner_en_cuarentena(
     conn.close()
 
 
+def poner_tramite_en_cuarentena(
+    tramite: str,
+    motivo: str,
+    duracion_segundos: int = 3600,
+) -> None:
+    """
+    Cuarentena por DIG_TRAMITE.
+
+    Se usa para aislar trámites problemáticos sin frenar todo el lote mensual.
+    """
+    tramite = str(tramite or "").strip()
+    if not tramite:
+        return
+    poner_en_cuarentena(
+        clave=f"TRAMITE_{tramite}",
+        tramite=tramite,
+        motivo=motivo,
+        duracion_segundos=duracion_segundos,
+    )
+
+
 def obtener_claves_en_cuarentena() -> set[str]:
     conn = _get_conn()
     now = time.time()
@@ -68,6 +89,26 @@ def obtener_claves_en_cuarentena() -> set[str]:
     ).fetchall()
     conn.close()
     return {row[0] for row in rows}
+
+
+def obtener_tramites_en_cuarentena() -> set[str]:
+    conn = _get_conn()
+    now = time.time()
+    rows = conn.execute(
+        """
+        SELECT tramite
+        FROM quarantine
+        WHERE expires_at > ?
+          AND clave LIKE 'TRAMITE_%'
+        """,
+        (now,),
+    ).fetchall()
+    conn.close()
+    return {
+        str(row[0] or "").strip()
+        for row in rows
+        if str(row[0] or "").strip()
+    }
 
 
 def limpiar_cuarentena_expirada() -> int:

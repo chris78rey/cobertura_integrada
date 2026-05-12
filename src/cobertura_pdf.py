@@ -16,7 +16,8 @@ from typing import Any, Callable
 
 import psutil
 
-from src.oracle_jdbc import oracle_connect
+from src.oracle_jdbc import actualizar_cobertura_por_tramite_valor, oracle_connect
+from src.observability import CYCLIC_SUMMARY_LOG, append_cyclic_jsonl
 
 
 def _validate_id_generacion(value: str) -> str:
@@ -65,6 +66,33 @@ def _es_cedula_valida_para_pdf(value: str | None) -> bool:
     """
     cedula = str(value or "").strip()
     return bool(re.fullmatch(r"\d{10}", cedula))
+
+
+def _modo_fast_activo() -> bool:
+    valor = str(os.environ.get("COBERTURA_FAST_MODE", "1") or "").strip().lower()
+    return valor in {"1", "true", "yes", "y", "si", "sí", "on"}
+
+
+def _parametros_node_rendimiento() -> tuple[int, int, float]:
+    fast_mode = _modo_fast_activo()
+    timeout_default = "30" if fast_mode else "120"
+    retries_default = "1" if fast_mode else "2"
+    delay_default = "0.25" if fast_mode else "1.0"
+
+    timeout_seconds = int(os.environ.get("COBERTURA_NODE_TIMEOUT_SECONDS", timeout_default) or timeout_default)
+    max_retries = int(os.environ.get("COBERTURA_NODE_MAX_RETRIES", retries_default) or retries_default)
+    delay_seconds = float(os.environ.get("COBERTURA_NODE_RETRY_DELAY", delay_default) or delay_default)
+
+    return timeout_seconds, max_retries, delay_seconds
+
+
+def _pausa_menor_edad_entre_peticiones() -> float:
+    valor = os.environ.get("COBERTURA_MENOR_EDAD_PAUSA_SEGUNDOS", "3").strip()
+    try:
+        pausa = float(valor)
+    except Exception:
+        pausa = 3.0
+    return max(0.0, pausa)
 
 
 def _next_cc_output_name(
@@ -218,6 +246,8 @@ def _resguardar_cc_locales(
 
 
 def _restaurar_cc_locales(respaldados: list[tuple[Path, Path]], planilla_dir: Path, expected_pdf_names: list[str]) -> None:
+    planilla_dir.mkdir(parents=True, exist_ok=True)
+
     for name in expected_pdf_names:
         pdf_actual = planilla_dir / name
         if pdf_actual.exists():
@@ -255,6 +285,81 @@ def _guardar_manifest_cc(
     )
 
 
+def _limpiar_local_post_sincronizacion(
+    *,
+    planilla_dir: Path,
+    pdfs_generados: list[Path],
+) -> dict[str, Any]:
+    """
+    Limpia la evidencia local cuando el trámite ya fue generado, sincronizado y cerrado.
+
+    Se borran:
+    - los PDFs generados en esta corrida
+    - el manifiesto local de CC, si existe
+    - la carpeta del trámite si queda vacía
+    """
+
+    removed_files: list[str] = []
+    removed_manifest = False
+    removed_dir = False
+
+    for pdf in pdfs_generados:
+        try:
+            if pdf.exists():
+                pdf.unlink()
+                removed_files.append(str(pdf))
+        except Exception:
+            pass
+
+    manifest_path = _cc_manifest_path(planilla_dir)
+    try:
+        if manifest_path.exists():
+            manifest_path.unlink()
+            removed_manifest = True
+    except Exception:
+        pass
+
+    try:
+        if planilla_dir.exists() and planilla_dir.is_dir() and not any(planilla_dir.iterdir()):
+            planilla_dir.rmdir()
+            removed_dir = True
+    except Exception:
+        pass
+
+    return {
+        "removed_files": removed_files,
+        "removed_manifest": removed_manifest,
+        "removed_dir": removed_dir,
+    }
+
+
+def _resguardar_carpeta_tramite_existente(planilla_dir: Path) -> Path | None:
+    """
+    Si ya existe la carpeta del trámite, la renombra para no mezclar restos viejos
+    con una nueva regeneración.
+
+    Ejemplos:
+    - 5967477 -> 5967477_
+    - 5967477_ -> 5967477_20260511_190000
+    """
+
+    if not planilla_dir.exists():
+        return None
+
+    base_name = planilla_dir.name.rstrip("_") or planilla_dir.name
+    parent = planilla_dir.parent
+    candidato = parent / f"{base_name}_"
+
+    if candidato.exists():
+        candidato = parent / f"{base_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    try:
+        shutil.move(str(planilla_dir), str(candidato))
+        return candidato
+    except Exception:
+        return None
+
+
 def _sincronizar_tramite_inmediato(
     *,
     output_dir: Path,
@@ -278,9 +383,13 @@ def _sincronizar_tramite_inmediato(
     marcar_sync_activo(tramite, detalle_inicio)
 
     try:
+        sync_timeout_seconds = int(
+            os.environ.get("COBERTURA_SYNC_TIMEOUT_SECONDS", "1200") or "1200"
+        )
         sync_result = ejecutar_sync_repo(
             output_dir=str(output_dir),
             dig_tramite=tramite,
+            timeout_seconds=sync_timeout_seconds,
         )
     except Exception as exc:
         msg = f"Error ejecutando sync inmediato para trámite {tramite}: {exc}"
@@ -332,6 +441,45 @@ def _sincronizar_tramite_inmediato(
     return sync_result
 
 
+def _marcar_tramite_x_en_oracle(
+    *,
+    username: str,
+    password: str,
+    tramite: str,
+    motivo: str,
+    logger: Any | None = None,
+    dig_id_tramite: str = "",
+) -> None:
+    tramite = str(tramite or "").strip()
+    if not tramite:
+        return
+
+    try:
+        res = actualizar_cobertura_por_tramite_valor(username, password, tramite, "X")
+        if logger is not None:
+            logger.event(
+                "ORACLE_UPDATE_END",
+                dig_tramite=tramite,
+                dig_id_tramite=str(dig_id_tramite or "").strip(),
+                ok=bool(res.get("ok")),
+                affected=res.get("affected", 0),
+                verified=bool(res.get("verified")),
+                already_closed=bool(res.get("already_closed")),
+                error=res.get("error", ""),
+                nuevo_valor="DIG_COBERTURA=X",
+                motivo=motivo,
+            )
+    except Exception as exc:
+        if logger is not None:
+            logger.error(
+                "ORACLE_UPDATE_ERROR_X",
+                exc,
+                dig_tramite=tramite,
+                dig_id_tramite=str(dig_id_tramite or "").strip(),
+                motivo=motivo,
+            )
+
+
 def _limitar_texto(value, max_chars=1200):
     text = str(value or "").strip()
     if len(text) <= max_chars:
@@ -367,6 +515,10 @@ def _diagnosticar_fallo_pdf(
         causa = "Hubo un problema de red al consultar el portal."
         sugerencia = "Revisar conexi\u00f3n a internet, disponibilidad del portal y estabilidad de red."
         categoria = "RED_PORTAL"
+    elif "503 service temporarily unavailable" in texto or "<title>503 service temporarily unavailable</title>" in texto:
+        causa = "El portal respondi\u00f3 503 y no pudo atender la consulta en ese momento."
+        sugerencia = "Marcar el trámite como X y dejarlo fuera del flujo automático hasta revisión manual."
+        categoria = "PORTAL_503"
     elif "captcha" in texto or "forbidden" in texto or "403" in texto or "429" in texto:
         causa = "El portal rechaz\u00f3 o limit\u00f3 temporalmente la consulta."
         sugerencia = "Bajar el ritmo de consultas, reintentar m\u00e1s tarde y revisar si el portal cambi\u00f3 su comportamiento."
@@ -942,6 +1094,7 @@ def generar_hojas_cobertura_por_id(
         writer.writeheader()
 
         total_registros = len(registros)
+        fast_mode = _modo_fast_activo()
 
         for index, registro in enumerate(registros, start=1):
             planilla = registro["planilla"]
@@ -962,9 +1115,6 @@ def generar_hojas_cobertura_por_id(
                 )
 
             planilla_dir = output_root / _safe_name(planilla)
-            planilla_dir.mkdir(parents=True, exist_ok=True)
-            folders_created.add(str(planilla_dir))
-
             planilla_key = _safe_name(planilla)
             total_en_planilla = total_por_planilla.get(planilla_key, 1)
 
@@ -979,6 +1129,11 @@ def generar_hojas_cobertura_por_id(
             if pdf_path.exists() and not overwrite:
                 skipped += 1
                 zip_files.append(pdf_path)
+                if planilla_dir.exists() and not any(planilla_dir.iterdir()):
+                    try:
+                        planilla_dir.rmdir()
+                    except Exception:
+                        pass
                 writer.writerow(
                     {
                         "planilla": planilla,
@@ -992,15 +1147,30 @@ def generar_hojas_cobertura_por_id(
                 )
                 continue
 
+            timeout_node, retries_node, delay_node = _parametros_node_rendimiento()
+
+            carpeta_resguardada = _resguardar_carpeta_tramite_existente(planilla_dir)
+            if carpeta_resguardada is not None:
+                logger.event(
+                    "LOCAL_DIR_RESGUARDED_BEFORE_REGEN",
+                    planilla=str(planilla),
+                    planilla_dir_original=str(planilla_dir),
+                    planilla_dir_resguardada=str(carpeta_resguardada),
+                )
+
+            if not planilla_dir.exists():
+                planilla_dir.mkdir(parents=True, exist_ok=True)
+                folders_created.add(str(planilla_dir))
+
             result = _run_node_pdf_generator(
                 node_project_dir=node_project_dir,
                 cedula=cedula,
                 fecha_pdf=fecha_pdf,
                 output_dir=planilla_dir,
                 output_name=output_name,
-                single_timeout_seconds=single_timeout_seconds,
-                max_retries=max_retries,
-                delay_seconds=delay_seconds,
+                single_timeout_seconds=timeout_node if fast_mode else single_timeout_seconds,
+                max_retries=retries_node if fast_mode else max_retries,
+                delay_seconds=delay_node if fast_mode else delay_seconds,
             )
 
             if result["ok"] and pdf_path.exists():
@@ -1040,7 +1210,14 @@ def generar_hojas_cobertura_por_id(
                     }
                 )
 
-            time.sleep(delay_seconds)
+                if planilla_dir.exists() and not any(planilla_dir.iterdir()):
+                    try:
+                        planilla_dir.rmdir()
+                    except Exception:
+                        pass
+
+            if not (fast_mode and result.get("ok") and pdf_path.exists()):
+                time.sleep(delay_seconds)
 
     zip_path = None
 
@@ -1079,6 +1256,7 @@ def _obtener_registros_automaticos(
     fe_pla_aniomes_desde: str = "",
     dig_tramite: str = "",
     excluir_dig_id_tramite: set[str] | None = None,
+    excluir_dig_tramite: set[str] | None = None,
     batch_size: int = 100,
     timeout_seconds: int = 300,
     fetch_size: int = 500,
@@ -1101,6 +1279,7 @@ def _obtener_registros_automaticos(
 
     # INICIO NUEVO: exclusión segura de cuarentena
     excluir_dig_id_tramite = excluir_dig_id_tramite or set()
+    excluir_dig_tramite = excluir_dig_tramite or set()
 
     excluir_lista_raw = [
         str(x).strip()
@@ -1128,6 +1307,13 @@ def _obtener_registros_automaticos(
         if x.startswith("GEN_")
     ][:450]
     # FIN NUEVO
+
+    excluir_tramites = [
+        str(x).strip()
+        for x in excluir_dig_tramite
+        if str(x).strip()
+    ]
+    excluir_tramites = list(dict.fromkeys(excluir_tramites))[:450]
 
     sql = """
         SELECT *
@@ -1159,9 +1345,16 @@ def _obtener_registros_automaticos(
 
     if dig_tramite:
         sql += """
-              AND TO_CHAR(DIG_TRAMITE) = ?
-        """
+          AND TO_CHAR(DIG_TRAMITE) = ?
+    """
         params.append(dig_tramite)
+
+    if not dig_tramite and excluir_tramites:
+        placeholders_tramite = ",".join(["?"] * len(excluir_tramites))
+        sql += f"""
+          AND TRIM(TO_CHAR(DIG_TRAMITE)) NOT IN ({placeholders_tramite})
+        """
+        params.extend(excluir_tramites)
 
     # INICIO NUEVO: no excluir accidentalmente registros con DIG_ID_TRAMITE NULL
     if excluir_ids:
@@ -1192,7 +1385,11 @@ def _obtener_registros_automaticos(
     # FIN NUEVO
 
     sql += """
-            ORDER BY FE_PLA_ANIOMES, DIG_TRAMITE, DIG_ID_TRAMITE
+            ORDER BY
+                TRIM(TO_CHAR(FE_PLA_ANIOMES)) DESC,
+                TO_DATE(NVL(TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD'), '1900-01-01'), 'YYYY-MM-DD') DESC,
+                TO_CHAR(DIG_TRAMITE) DESC,
+                TO_CHAR(DIG_ID_TRAMITE) DESC
         )
         WHERE ROWNUM <= ?
     """
@@ -1386,8 +1583,8 @@ def generar_coberturas_automaticas_desde_mes(
     output_dir: str | Path | None = None,
     progress_callback: Callable[[int, int, dict[str, str]], None] | None = None,
     batch_size: int = 100,
-    rondas_vacias_maximas: int = 3,
-    espera_ronda_vacia_segundos: float = 5.0,
+    rondas_vacias_maximas: int = 0,
+    espera_ronda_vacia_segundos: float = 0.0,
 ) -> dict[str, Any]:
     """
     Flujo automático:
@@ -1416,15 +1613,12 @@ def generar_coberturas_automaticas_desde_mes(
     node_project_dir = _get_node_project_dir()
 
     from src.oracle_jdbc import actualizar_cobertura_por_tramite
-    from src.observability import RunLogger, build_run_id, mask_cedula
-    from src.observability import append_cyclic_jsonl, CYCLIC_SUMMARY_LOG
-    from src.quarantine import (
-        obtener_claves_en_cuarentena,
-        poner_en_cuarentena,
-        limpiar_cuarentena_expirada,
-        contar_en_cuarentena,
-        segundos_hasta_proxima_expiracion,
-        resumen_cuarentena_activa,
+    from src.observability import (
+        RunLogger,
+        build_run_id,
+        mask_cedula,
+        append_cyclic_jsonl,
+        CYCLIC_SUMMARY_LOG,
     )
     from src.auto_resume_state import marcar_ultimo_procesado
 
@@ -1486,12 +1680,6 @@ def generar_coberturas_automaticas_desde_mes(
     lote_numero = 0
     rondas_vacias = 0
     dig_id_tramite_fallidos_en_corrida: set[str] = set()
-    limpiar_cuarentena_expirada()
-    cuarentena_inicial = contar_en_cuarentena()
-    logger.event(
-        "QUARANTINE_INITIAL",
-        en_cuarentena=cuarentena_inicial,
-    )
 
     with manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(
@@ -1548,15 +1736,12 @@ def generar_coberturas_automaticas_desde_mes(
             )
 
             try:
-                # Combinar exclusión en memoria con cuarentena persistente
-                exclusion_total = dig_id_tramite_fallidos_en_corrida | obtener_claves_en_cuarentena()
-
                 registros = _obtener_registros_automaticos(
                     username=username,
                     password=password,
                     fe_pla_aniomes_desde=fe_pla_aniomes_desde,
                     dig_tramite=dig_tramite,
-                    excluir_dig_id_tramite=exclusion_total,
+                    excluir_dig_id_tramite=dig_id_tramite_fallidos_en_corrida,
                     batch_size=batch_size,
                 )
             except Exception as exc:
@@ -1571,70 +1756,6 @@ def generar_coberturas_automaticas_desde_mes(
                 raise
 
             total = len(registros)
-
-            if pendientes_previo > 0 and total == 0:
-                en_cuarentena_actual = contar_en_cuarentena()
-                excluidos_en_memoria = len(dig_id_tramite_fallidos_en_corrida)
-
-                if en_cuarentena_actual > 0 or excluidos_en_memoria > 0:
-                    resumen_q = resumen_cuarentena_activa()
-
-                    logger.event(
-                        "DB_ONLY_QUARANTINED_RETURNING_CONTROL",
-                        pendientes_oracle=pendientes_previo,
-                        en_cuarentena=en_cuarentena_actual,
-                        excluidos_en_memoria=excluidos_en_memoria,
-                        resumen_cuarentena=resumen_q,
-                        mensaje=(
-                            "Oracle reporta pendientes, pero los candidatos actuales están "
-                            "temporalmente en cuarentena o excluidos en memoria. "
-                            "Se devuelve el control para no dejar la pantalla esperando. "
-                            "El recuperador automático retomará después."
-                        ),
-                    )
-
-                    if progress_callback:
-                        progress_callback(
-                            procesados_global,
-                            max(pendientes_previo, 1),
-                            {
-                                "fe_pla_aniomes": fe_pla_aniomes_desde,
-                                "dig_tramite": "",
-                                "dig_cedula": "",
-                                "dig_fecha_hasta": "",
-                                "estado": (
-                                    "Pendientes en cuarentena temporal. "
-                                    "Se libera la pantalla y el recuperador automático retomará."
-                                ),
-                                "procesados_global": str(procesados_global),
-                                "lote_numero": str(lote_numero),
-                            },
-                        )
-
-                    return {
-                        "ok": True,
-                        "solo_cuarentena": True,
-                        "run_id": run_id,
-                        "fe_pla_aniomes_desde": fe_pla_aniomes_desde,
-                        "dig_tramite": dig_tramite,
-                        "total": procesados_global,
-                        "generados": generados,
-                        "actualizados": actualizados,
-                        "errores": errores,
-                        "output_root": str(output_root),
-                        "manifest_path": str(manifest_path),
-                        "errors": errors_list,
-                        "mensaje": (
-                            "Los pendientes actuales están temporalmente en cuarentena. "
-                            "No se mantiene Streamlit esperando indefinidamente."
-                        ),
-                    }
-
-                raise RuntimeError(
-                    "Inconsistencia crítica: Oracle reporta pendientes, pero la consulta de trabajo devolvió 0 registros. "
-                    f"Pendientes detectados por la app: {pendientes_previo}. "
-                    "Revisar ORACLE_TARGETS, usuario Oracle, filtro de trámite, FE_PLA_ANIOMES y versión/carpeta desde donde corre Streamlit."
-                )
 
             if total == 0 and procesados_global == 0:
                 return {
@@ -1690,16 +1811,7 @@ def generar_coberturas_automaticas_desde_mes(
                         },
                     )
 
-                if rondas_vacias >= rondas_vacias_maximas:
-                    break
-
-                inicio_espera_vacia = time.monotonic()
-                while time.monotonic() - inicio_espera_vacia < espera_ronda_vacia_segundos:
-                    if _get_stop_flag().exists():
-                        break
-                    time.sleep(0.5)
-
-                continue
+                break
 
             rondas_vacias = 0
 
@@ -1749,10 +1861,7 @@ def generar_coberturas_automaticas_desde_mes(
                         },
                     )
 
-                # Expandir cédulas a generar (titular + dependientes)
-                # Carpeta por trámite
                 planilla_dir = output_root / _safe_name(tramite)
-                planilla_dir.mkdir(parents=True, exist_ok=True)
 
                 cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
                 total_pdfs_tramite = len(cedulas_a_generar)
@@ -1767,6 +1876,7 @@ def generar_coberturas_automaticas_desde_mes(
                 payload_cc_actual = _payload_firma_cc(reg, cedulas_a_generar, expected_pdf_names)
                 firma_cc_actual = _firma_cc(payload_cc_actual)
                 respaldos_cc_locales: list[tuple[Path, Path]] = []
+                carpeta_tramite_resguardada = False
 
                 if not _cc_locales_corresponden_a_oracle(
                     planilla_dir=planilla_dir,
@@ -1805,6 +1915,34 @@ def generar_coberturas_automaticas_desde_mes(
                         output_name=output_name,
                         pdf_path=str(pdf_path),
                     )
+
+                    if total_pdfs_tramite == 3 and str(reg.get("dig_menor_edad", "")).strip() == "S" and secuencia_pdf > 1:
+                        pausa_menor = _pausa_menor_edad_entre_peticiones()
+                        if pausa_menor > 0:
+                            logger.event(
+                                "PDF_GENERATION_THROTTLE_WAIT",
+                                index=index,
+                                dig_tramite=tramite,
+                                dig_id_tramite=dig_id_tramite,
+                                segundos=pausa_menor,
+                                motivo="Trámite menor de edad con 3 PDFs. Pausa entre peticiones para evitar rechazos del portal.",
+                                secuencia_pdf=secuencia_pdf,
+                            )
+                            if progress_callback:
+                                progress_callback(
+                                    index,
+                                    total,
+                                    {
+                                        "fe_pla_aniomes": fe_pla,
+                                        "dig_tramite": tramite,
+                                        "dig_id_tramite": dig_id_tramite,
+                                        "dig_cedula": c,
+                                        "dig_fecha_hasta": fecha_hasta,
+                                        "dig_fecha_alta": fecha_alta,
+                                        "estado": f"Pausa de {pausa_menor:.0f}s entre peticiones por menor de edad.",
+                                    },
+                                )
+                            time.sleep(pausa_menor)
 
                     if pdf_path.exists() and pdf_path.stat().st_size > 0:
                         pdfs_generados.append(pdf_path)
@@ -1856,25 +1994,42 @@ def generar_coberturas_automaticas_desde_mes(
                             node_stderr=error_en_pdf_detalle["stderr"],
                             node_stdout=error_en_pdf_detalle["stdout"],
                         )
-                        if respaldos_cc_locales:
-                            _restaurar_cc_locales(
-                                respaldos_cc_locales,
-                                planilla_dir=planilla_dir,
-                                expected_pdf_names=expected_pdf_names,
-                            )
+                    if respaldos_cc_locales:
+                        _restaurar_cc_locales(
+                            respaldos_cc_locales,
+                            planilla_dir=planilla_dir,
+                            expected_pdf_names=expected_pdf_names,
+                        )
                         break
+
+                    if not carpeta_tramite_resguardada:
+                        carpeta_resguardada = _resguardar_carpeta_tramite_existente(planilla_dir)
+                        if carpeta_resguardada is not None:
+                            carpeta_tramite_resguardada = True
+                            logger.event(
+                                "LOCAL_DIR_RESGUARDED_BEFORE_REGEN",
+                                index=index,
+                                dig_tramite=tramite,
+                                dig_id_tramite=dig_id_tramite,
+                                planilla_dir_original=str(planilla_dir),
+                                planilla_dir_resguardada=str(carpeta_resguardada),
+                            )
+
+                    if not planilla_dir.exists():
+                        planilla_dir.mkdir(parents=True, exist_ok=True)
 
                     inicio_pdf = time.monotonic()
 
+                    timeout_node, retries_node, delay_node = _parametros_node_rendimiento()
                     result_node = _run_node_pdf_generator(
                         node_project_dir=node_project_dir,
                         cedula=c,
                         fecha_pdf=fecha_pdf,
                         output_dir=planilla_dir,
                         output_name=output_name,
-                        single_timeout_seconds=120,
-                        max_retries=2,
-                        delay_seconds=1.0,
+                        single_timeout_seconds=timeout_node,
+                        max_retries=retries_node,
+                        delay_seconds=delay_node,
                     )
 
                     ultimo_segundos_pdf = time.monotonic() - inicio_pdf
@@ -1981,7 +2136,14 @@ def generar_coberturas_automaticas_desde_mes(
 
                         if clave_exclusion:
                             dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
-                            poner_en_cuarentena(clave_exclusion, tramite, sync_error)
+                        _marcar_tramite_x_en_oracle(
+                            username=username,
+                            password=password,
+                            tramite=tramite,
+                            motivo=sync_error,
+                            logger=logger,
+                            dig_id_tramite=dig_id_tramite,
+                        )
 
                         errors_list.append(
                             {
@@ -2175,6 +2337,29 @@ def generar_coberturas_automaticas_desde_mes(
                             oracle_affected=update_result.get("affected", 0),
                             detalle=last_processed_detail,
                         )
+
+                        if str(os.environ.get("COBERTURA_CLEAN_LOCAL_AFTER_SUCCESS", "1") or "").strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "y",
+                            "si",
+                            "sí",
+                            "on",
+                        }:
+                            limpieza_local = _limpiar_local_post_sincronizacion(
+                                planilla_dir=planilla_dir,
+                                pdfs_generados=pdfs_generados,
+                            )
+                            logger.event(
+                                "LOCAL_CLEANUP_AFTER_SUCCESS",
+                                index=index,
+                                dig_tramite=tramite,
+                                dig_id_tramite=dig_id_tramite,
+                                removed_files=limpieza_local.get("removed_files", []),
+                                removed_manifest=bool(limpieza_local.get("removed_manifest")),
+                                removed_dir=bool(limpieza_local.get("removed_dir")),
+                            )
                     else:
                         errores += 1
                         errores_consecutivos += 1
@@ -2184,7 +2369,14 @@ def generar_coberturas_automaticas_desde_mes(
 
                         if clave_exclusion:
                             dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
-                            poner_en_cuarentena(clave_exclusion, tramite, err_msg)
+                        _marcar_tramite_x_en_oracle(
+                            username=username,
+                            password=password,
+                            tramite=tramite,
+                            motivo=err_msg,
+                            logger=logger,
+                            dig_id_tramite=dig_id_tramite,
+                        )
 
                         errors_list.append(
                             {
@@ -2219,134 +2411,23 @@ def generar_coberturas_automaticas_desde_mes(
                     errores_consecutivos += 1
 
                     err_msg = error_en_pdf or "No se generaron todos los PDFs esperados del trámite."
-                    last_processed_status = "NO_ACTUALIZADO_PDFS_INCOMPLETOS"
+                    last_processed_status = "CUARENTENA_POR_FALLO_PDF"
                     last_processed_detail = err_msg
 
-                    if error_en_pdf_detalle.get("categoria") == "CEDULA_INVALIDA":
+                    if error_en_pdf_detalle.get("categoria") in {"CEDULA_INVALIDA", "PORTAL_503"}:
                         # El dato es malo, pero no debe castigar el ritmo del resto.
                         errores_consecutivos = 0
 
-                    logger.event(
-                        "ORACLE_FORCE_CLOSE_AFTER_PDF_ERROR_START",
-                        index=index,
-                        dig_tramite=tramite,
-                        dig_id_tramite=dig_id_tramite,
-                        dig_id_generacion=id_generacion,
-                        error_categoria=error_en_pdf_detalle.get("categoria", "PDF_INCOMPLETO"),
-                        error=err_msg,
-                    )
-
-                    force_close_result = actualizar_cobertura_por_tramite(
-                        username=username,
-                        password=password,
-                        dig_tramite=tramite,
-                    )
-
-                    logger.event(
-                        "ORACLE_FORCE_CLOSE_AFTER_PDF_ERROR_END",
-                        index=index,
-                        dig_tramite=tramite,
-                        dig_id_tramite=dig_id_tramite,
-                        dig_id_generacion=id_generacion,
-                        ok=bool(force_close_result.get("ok")),
-                        affected=force_close_result.get("affected", 0),
-                        verified=bool(force_close_result.get("verified")),
-                        already_closed=bool(force_close_result.get("already_closed")),
-                        error=force_close_result.get("error", ""),
-                        criterio=force_close_result.get("criterio", ""),
-                    )
-
-                    if (
-                        force_close_result.get("ok")
-                        and force_close_result.get("verified") is True
-                        and (
-                            force_close_result.get("affected") == 1
-                            or force_close_result.get("already_closed") is True
-                        )
-                    ):
-                        actualizados += 1
-                        errores_consecutivos = 0
-                        last_processed_status = "CERRADO_FORZADO_POR_FALLO_PDF"
-                        last_processed_detail = (
-                            "Oracle se cerró en S aunque la generación PDF no completó."
-                        )
-
-                        writer.writerow(
-                            {
-                                "RUN_ID": run_id,
-                                "FE_PLA_ANIOMES": fe_pla,
-                                "DIG_TRAMITE": tramite,
-                                "DIG_ID_TRAMITE": dig_id_tramite,
-                                "DIG_ID_GENERACION": id_generacion,
-                                "DIG_CEDULA": cedula,
-                                "DIG_FECHA_HASTA": fecha_hasta,
-                                "DIG_FECHA_ALTA": fecha_alta,
-                                "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
-                                "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados) if pdfs_generados else 0,
-                                "ESTADO": "CERRADO_FORZADO_POR_FALLO_PDF",
-                                "PASO": "OK",
-                                "ORACLE_AFFECTED": force_close_result.get("affected", 0),
-                                "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
-                                "ESPERA_SEGUNDOS": "",
-                                "ERRORES_CONSECUTIVOS": "",
-                                "ERROR": err_msg,
-                                "CEDULA_FALLIDA": error_en_pdf_detalle.get("cedula", ""),
-                                "PDF_ESPERADO": error_en_pdf_detalle.get("pdf_esperado", ""),
-                                "ERROR_CATEGORIA": error_en_pdf_detalle.get("categoria", "PDFS_INCOMPLETOS"),
-                                "CAUSA_PROBABLE": error_en_pdf_detalle.get("causa", err_msg),
-                                "SUGERENCIA_REVISION": error_en_pdf_detalle.get("sugerencia", ""),
-                                "NODE_ATTEMPTS": error_en_pdf_detalle.get("attempts", ""),
-                                "NODE_RETURNCODE": error_en_pdf_detalle.get("returncode", ""),
-                                "NODE_STDERR": error_en_pdf_detalle.get("stderr", ""),
-                                "NODE_STDOUT": error_en_pdf_detalle.get("stdout", ""),
-                                "FECHA_PROCESO": timestamp,
-                            }
-                        )
-
-                        if progress_callback:
-                            progress_callback(
-                                index,
-                                total,
-                                {
-                                    "fe_pla_aniomes": fe_pla,
-                                    "dig_tramite": tramite,
-                                    "dig_id_tramite": dig_id_tramite,
-                                    "dig_cedula": cedula,
-                                    "dig_fecha_hasta": fecha_hasta,
-                                    "dig_fecha_alta": fecha_alta,
-                                    "estado": "CERRADO_FORZADO_POR_FALLO_PDF",
-                                    "procesados_global": str(procesados_global),
-                                    "lote_numero": str(lote_numero),
-                                },
-                            )
-                        _registrar_resumen_ciclico(
-                            run_id=run_id,
-                            tramite=tramite,
-                            cedula=cedula,
-                            estado=last_processed_status,
-                            fecha_hasta=fecha_hasta,
-                            fecha_alta=fecha_alta,
-                            pdfs_generados=pdfs_generados,
-                            sync_ok=True,
-                            sync_returncode=sync_result.get("returncode", ""),
-                            oracle_ok=True,
-                            oracle_affected=force_close_result.get("affected", 0),
-                            detalle=last_processed_detail,
-                            error_categoria=error_en_pdf_detalle.get("categoria", "PDF_INCOMPLETO"),
-                        )
-                        marcar_ultimo_procesado(
-                            tramite=tramite,
-                            cedula=cedula,
-                            planilla=tramite,
-                            fe_pla_aniomes=fe_pla,
-                            status=last_processed_status,
-                            detalle=last_processed_detail,
-                        )
-                        continue
-
                     if clave_exclusion:
                         dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
-                        poner_en_cuarentena(clave_exclusion, tramite, err_msg)
+                    _marcar_tramite_x_en_oracle(
+                        username=username,
+                        password=password,
+                        tramite=tramite,
+                        motivo=err_msg,
+                        logger=logger,
+                        dig_id_tramite=dig_id_tramite,
+                    )
 
                     writer.writerow(
                         {
@@ -2360,7 +2441,7 @@ def generar_coberturas_automaticas_desde_mes(
                             "DIG_FECHA_ALTA": fecha_alta,
                             "PDF_PATH": " | ".join(str(p) for p in pdfs_generados),
                             "PDF_SIZE_BYTES": sum(p.stat().st_size for p in pdfs_generados) if pdfs_generados else 0,
-                            "ESTADO": "NO_ACTUALIZADO_PDFS_INCOMPLETOS",
+                            "ESTADO": "CUARENTENA_POR_FALLO_PDF",
                             "PASO": "ERROR",
                             "ORACLE_AFFECTED": 0,
                             "SEGUNDOS_PDF": round(ultimo_segundos_pdf, 3),
@@ -2402,39 +2483,7 @@ def generar_coberturas_automaticas_desde_mes(
                     status=last_processed_status,
                     detalle=last_processed_detail,
                 )
-
                 if index < total:
-
-                    try:
-                        espera, motivo_espera = calcular_espera_dinamica(
-                            output_root=output_root,
-                            segundos_pdf=ultimo_segundos_pdf,
-                            errores_consecutivos=errores_consecutivos,
-                        )
-                        espera = max(1.0, min(float(espera), 7.0))
-                    except Exception as exc:
-                        espera = 2.0
-                        motivo_espera = "No se pudo calcular la espera din\u00e1mica. Se aplica espera segura de 2 segundos."
-                        logger.error(
-                            "THROTTLE_CALC_ERROR",
-                            exc,
-                            index=index,
-                            dig_tramite=tramite,
-                            dig_id_tramite=dig_id_tramite,
-                            errores_consecutivos=errores_consecutivos,
-                            ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
-                        )
-
-                    logger.event(
-                        "THROTTLE_WAIT",
-                        index=index,
-                        dig_tramite=tramite,
-                        espera_segundos=round(espera, 2),
-                        motivo=motivo_espera,
-                        errores_consecutivos=errores_consecutivos,
-                        ultimo_segundos_pdf=round(ultimo_segundos_pdf, 3),
-                    )
-
                     if progress_callback:
                         progress_callback(
                             index,
@@ -2444,24 +2493,18 @@ def generar_coberturas_automaticas_desde_mes(
                                 "dig_tramite": tramite,
                                 "dig_cedula": cedula,
                                 "dig_fecha_hasta": fecha_hasta,
-                                "estado": f"{motivo_espera} Esperando {espera:.1f}s antes del siguiente registro...",
+                                "estado": "Sin espera entre trámites.",
                             },
                         )
 
-                    # Espera cortada para que el bot\u00f3n de parar responda
-                    inicio_espera = time.monotonic()
-                    while time.monotonic() - inicio_espera < espera:
-                        if _get_stop_flag().exists():
-                            break
-                        time.sleep(0.5)
-
-                    if _get_stop_flag().exists():
-                        logger.event(
-                            "STOP_REQUEST_DETECTED_AFTER_ROW",
-                            lote_numero=lote_numero,
-                            procesados_global=procesados_global,
-                        )
-                        break
+            if dig_tramite:
+                logger.event(
+                    "DIG_TRAMITE_SINGLE_PASS_END",
+                    lote_numero=lote_numero,
+                    procesados_global=procesados_global,
+                    dig_tramite=dig_tramite,
+                )
+                break
 
             # Fin del lote.
             # Se vuelve al while principal para consultar otra vez Oracle.
