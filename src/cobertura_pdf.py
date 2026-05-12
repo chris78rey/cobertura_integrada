@@ -97,11 +97,11 @@ def _pausa_menor_edad_entre_peticiones() -> float:
 
 
 def _pausa_entre_tramites() -> float:
-    valor = os.environ.get("COBERTURA_PAUSA_ENTRE_TRAMITES_SEGUNDOS", "7").strip()
+    valor = os.environ.get("COBERTURA_PAUSA_ENTRE_TRAMITES_SEGUNDOS", "2.5").strip()
     try:
         pausa = float(valor)
     except Exception:
-        pausa = 7.0
+        pausa = 2.5
     return max(0.0, pausa)
 
 

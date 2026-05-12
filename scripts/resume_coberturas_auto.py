@@ -257,7 +257,7 @@ def _run_cycle() -> int:
 
 
 def main() -> int:
-    sleep_sequence = (7,)
+    sleep_sequence = (2.5,)
     loop_index = 0
 
     while True:

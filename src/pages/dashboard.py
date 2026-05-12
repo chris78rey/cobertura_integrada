@@ -194,6 +194,12 @@ def _diagnostico_simple_operativo() -> dict[str, object]:
     }
 
 
+def _pausas_operativas() -> tuple[str, str]:
+    loop_segundos = str(os.environ.get("COBERTURA_WORKER_LOOP_SLEEP_SECONDS", "2.5") or "2.5").strip()
+    tramites_segundos = str(os.environ.get("COBERTURA_PAUSA_ENTRE_TRAMITES_SEGUNDOS", "2.5") or "2.5").strip()
+    return loop_segundos, tramites_segundos
+
+
 def _render_css():
     st.markdown(
         """
@@ -1361,6 +1367,13 @@ def _render_monitor_progreso():
         """,
         unsafe_allow_html=True,
     )
+
+    loop_pause, tramites_pause = _pausas_operativas()
+    ritmo_cols = st.columns(2)
+    with ritmo_cols[0]:
+        st.metric("Pausa del loop", f"{loop_pause}s")
+    with ritmo_cols[1]:
+        st.metric("Pausa entre trámites", f"{tramites_pause}s")
 
     if detalle:
         st.info(detalle)
