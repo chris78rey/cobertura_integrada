@@ -195,8 +195,8 @@ def _diagnostico_simple_operativo() -> dict[str, object]:
 
 
 def _pausas_operativas() -> tuple[str, str]:
-    loop_segundos = str(os.environ.get("COBERTURA_WORKER_LOOP_SLEEP_SECONDS", "2.5") or "2.5").strip()
-    tramites_segundos = str(os.environ.get("COBERTURA_PAUSA_ENTRE_TRAMITES_SEGUNDOS", "2.5") or "2.5").strip()
+    loop_segundos = str(os.environ.get("COBERTURA_WORKER_LOOP_SLEEP_SECONDS", "8") or "8").strip()
+    tramites_segundos = str(os.environ.get("COBERTURA_PAUSA_ENTRE_TRAMITES_SEGUNDOS", "8") or "8").strip()
     return loop_segundos, tramites_segundos
 
 
