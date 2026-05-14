@@ -53,13 +53,28 @@ def _es_modo_vigilante(dig_tramite: str) -> bool:
     return not str(dig_tramite or "").strip()
 
 
+def _dias_busqueda_auto() -> int:
+    valor = str(os.environ.get("AUTO_FECHA_HASTA_DIAS_ATRAS", "") or "").strip()
+    if not valor.isdigit():
+        return 0
+    dias = int(valor)
+    return dias if dias > 0 else 0
+
+
 def contar_pendientes(username: str, password: str, fe_pla_aniomes_desde: str, dig_tramite: str = "") -> int:
     conn = None
     ps = None
     rs = None
+    dias_busqueda_auto = _dias_busqueda_auto()
     sql = """SELECT COUNT(*) FROM DIGITALIZACION.DIGITALIZACION
-        WHERE TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ? AND NVL(TRIM(DIG_COBERTURA),'N')='N' AND TRIM(DIG_PLANILLADO)='S'"""
-    params = [fe_pla_aniomes_desde]
+        WHERE NVL(TRIM(DIG_COBERTURA),'N')='N' AND TRIM(DIG_PLANILLADO)='S'"""
+    params: list[str | int] = []
+    if dias_busqueda_auto > 0:
+        sql += " AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE) - ?"
+        params.append(dias_busqueda_auto)
+    else:
+        sql += " AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?"
+        params.append(fe_pla_aniomes_desde)
     if dig_tramite:
         sql += " AND TO_CHAR(DIG_TRAMITE) = ?"
         params.append(dig_tramite)
@@ -125,8 +140,12 @@ def _run_cycle() -> int:
                 "last_error": "",
                 "retry_count": 0,
                 "detalle": (
-                    "Mes de trabajo restaurado desde AUTO_FE_PLA_ANIOMES_DESDE "
-                    f"({fe_pla_aniomes_desde})."
+                    (
+                        f"Ventana de { _dias_busqueda_auto() } días restaurada desde AUTO_FECHA_HASTA_DIAS_ATRAS "
+                        if _dias_busqueda_auto() > 0
+                        else "Mes de trabajo restaurado desde AUTO_FE_PLA_ANIOMES_DESDE "
+                    )
+                    + (f"({fe_pla_aniomes_desde})." if _dias_busqueda_auto() == 0 else "")
                 ),
             }
         )
@@ -142,7 +161,11 @@ def _run_cycle() -> int:
         last_error="",
         retry_count=0,
         detalle=(
-            f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
+            (
+                f"Worker revisando Oracle para últimos {_dias_busqueda_auto()} días"
+                if _dias_busqueda_auto() > 0
+                else f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
+            )
             + (f" y trámite {dig_tramite}" if dig_tramite else "")
         ),
     )
@@ -150,7 +173,11 @@ def _run_cycle() -> int:
     if pendientes_antes <= 0:
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
-                f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. Sistema vigilando.",
+                (
+                    f"No hay pendientes en los últimos {_dias_busqueda_auto()} días. Sistema vigilando."
+                    if _dias_busqueda_auto() > 0
+                    else f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. Sistema vigilando."
+                ),
                 sync_pending=False)
             log("[INFO] Sin pendientes. El loop sigue vigilando.")
         return 0
@@ -163,7 +190,11 @@ def _run_cycle() -> int:
                         "last_actualizados": "",
                         "last_errores": "",
                         "detalle": (
-                            f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
+                            (
+                                f"Worker revisando Oracle para últimos {_dias_busqueda_auto()} días"
+                                if _dias_busqueda_auto() > 0
+                                else f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
+                            )
                             + (f" y trámite {dig_tramite}" if dig_tramite else "")
                         ),
                         })
@@ -244,8 +275,12 @@ def _run_cycle() -> int:
     if pendientes_despues <= 0:
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
-                f"Terminados pendientes actuales con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
-                "Sistema vigilando.",
+                (
+                    f"Terminados pendientes actuales en los últimos {_dias_busqueda_auto()} días. "
+                    if _dias_busqueda_auto() > 0
+                    else f"Terminados pendientes actuales con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
+                )
+                + "Sistema vigilando.",
                 sync_pending=False,
             )
             log("[INFO] Sin pendientes. El loop sigue vigilando.")

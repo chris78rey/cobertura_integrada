@@ -20,6 +20,7 @@ from src.cobertura_pdf import (
     _limpiar_local_post_sincronizacion,
     _nombre_cc_por_secuencia,
     _resguardar_cc_locales,
+    _archivar_carpeta_tramite_si_corresponde,
     _run_node_pdf_generator,
 )
 from src.oracle_jdbc import oracle_connect
@@ -479,6 +480,18 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
 
     run_id = _ahora_id()
     local_resguardos: list[tuple[Path, Path]] = []
+    carpeta_archivada = _archivar_carpeta_tramite_si_corresponde(output_dir)
+    if carpeta_archivada is not None:
+        _auditar_evento(
+            {
+                "evento": "TRAMITE_FOLDER_ARCHIVED",
+                "usuario": usuario,
+                "tramite": tramite,
+                "archived_path": str(carpeta_archivada),
+                "active_path": str(output_dir),
+            }
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
     if _listar_cc(output_dir) or _listar_cc_legacy(output_dir):
         local_resguardos = _resguardar_cc_locales(
             planilla_dir=output_dir,
@@ -576,31 +589,6 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
                 "reemplazo": reemplazo.get("manifest_path", ""),
             }
         )
-
-        if str(os.environ.get("COBERTURA_CLEAN_LOCAL_AFTER_SUCCESS", "1") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "si",
-            "sí",
-            "on",
-        }:
-            limpieza_local = _limpiar_local_post_sincronizacion(
-                planilla_dir=output_dir,
-                pdfs_generados=nuevos_pdfs,
-            )
-            _auditar_evento(
-                {
-                    "evento": "LOCAL_CLEANUP_AFTER_SUCCESS",
-                    "usuario": usuario,
-                    "tramite": tramite,
-                    "fe_pla_aniomes": fe_pla,
-                    "removed_files": limpieza_local.get("removed_files", []),
-                    "removed_manifest": bool(limpieza_local.get("removed_manifest")),
-                    "removed_dir": bool(limpieza_local.get("removed_dir")),
-                }
-            )
 
         return {
             "ok": True,

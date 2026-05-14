@@ -1570,6 +1570,14 @@ def _obtener_mes_desde_por_defecto() -> str:
     return mes
 
 
+def _dias_busqueda_auto() -> int:
+    valor = str(os.environ.get("AUTO_FECHA_HASTA_DIAS_ATRAS", "") or "").strip()
+    if not valor.isdigit():
+        return 0
+    dias = int(valor)
+    return dias if dias > 0 else 0
+
+
 def _validar_fe_pla_aniomes_desde(valor: str) -> tuple[bool, str, str]:
     """
     Valida el mes desde para evitar consultas accidentales o valores mal escritos.
@@ -1593,13 +1601,19 @@ def dashboard_page():
     _render_css()
 
     mes_por_defecto = _obtener_mes_desde_por_defecto()
+    dias_busqueda_auto = _dias_busqueda_auto()
 
+    subtitulo_ventana = (
+        f"últimos {dias_busqueda_auto} días"
+        if dias_busqueda_auto > 0
+        else f"mes {mes_por_defecto}"
+    )
     st.markdown(
-        """
+        f"""
         <div class="main-title">Cobertura automática MSP</div>
         <div class="main-subtitle">
-            Monitor operativo. El worker corre en loop continuo con pausas alternadas de 2 y 4 segundos.
-            Usar contingencia solo si el sistema no responde.
+            Monitor operativo. El worker corre en loop continuo con pausas de 8 segundos
+            y trabaja por ventana de {subtitulo_ventana}.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1617,7 +1631,9 @@ def dashboard_page():
 
     _render_estado_simple_operativo()
 
-    st.caption("Flujo simple: Oracle manda, el loop alterna 2 s y 4 s, y cada fallo sale como X.")
+    st.caption(
+        "Flujo simple: Oracle manda, el loop corre solo, cada fallo sale como X y el éxito como S."
+    )
 
     st.markdown("---")
 
@@ -1633,7 +1649,11 @@ def dashboard_page():
     modo_procesamiento = st.radio(
         "Seleccione cómo desea procesar",
         options=[
-            "Procesar por mes desde",
+            (
+                f"Procesar por últimos {dias_busqueda_auto} días"
+                if dias_busqueda_auto > 0
+                else "Procesar por mes desde"
+            ),
             "Procesar por trámite específico",
         ],
         horizontal=True,
@@ -1682,26 +1702,34 @@ def dashboard_page():
 
     st.markdown("---")
 
-    mes_key = f"fe_pla_aniomes_desde_input_{st.session_state.input_reset_counter}"
-
-    fe_pla_aniomes_input = st.text_input(
-        "Mes desde",
-        value=mes_por_defecto,
-        max_chars=6,
-        key=mes_key,
-        help="Formato YYYYMM. Ejemplo: 202604 procesa FE_PLA_ANIOMES >= 202604.",
-    )
-
-    mes_valido, fe_pla_aniomes_desde, error_mes = _validar_fe_pla_aniomes_desde(
-        fe_pla_aniomes_input
-    )
-
-    if mes_valido:
-        st.caption(
-            f"Se procesarán registros con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}."
+    if dias_busqueda_auto > 0:
+        fe_pla_aniomes_desde = mes_por_defecto
+        mes_valido = True
+        st.info(
+            f"Modo activo: se procesarán registros con DIG_FECHA_HASTA de los últimos "
+            f"{dias_busqueda_auto} día(s)."
         )
     else:
-        st.error(error_mes)
+        mes_key = f"fe_pla_aniomes_desde_input_{st.session_state.input_reset_counter}"
+
+        fe_pla_aniomes_input = st.text_input(
+            "Mes desde",
+            value=mes_por_defecto,
+            max_chars=6,
+            key=mes_key,
+            help="Formato YYYYMM. Ejemplo: 202604 procesa FE_PLA_ANIOMES >= 202604.",
+        )
+
+        mes_valido, fe_pla_aniomes_desde, error_mes = _validar_fe_pla_aniomes_desde(
+            fe_pla_aniomes_input
+        )
+
+        if mes_valido:
+            st.caption(
+                f"Se procesarán registros con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}."
+            )
+        else:
+            st.error(error_mes)
 
     # Contador de pendientes
     pendientes_oracle_actuales = st.session_state.get("pendientes_inicio_corrida")

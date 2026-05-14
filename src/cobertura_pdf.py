@@ -105,6 +105,18 @@ def _pausa_entre_tramites() -> float:
     return max(0.0, pausa)
 
 
+def _dias_busqueda_auto() -> int:
+    """
+    Si AUTO_FECHA_HASTA_DIAS_ATRAS viene definido con un entero positivo,
+    el worker deja de filtrar por FE_PLA_ANIOMES y usa DIG_FECHA_HASTA.
+    """
+    valor = str(os.environ.get("AUTO_FECHA_HASTA_DIAS_ATRAS", "") or "").strip()
+    if not valor.isdigit():
+        return 0
+    dias = int(valor)
+    return dias if dias > 0 else 0
+
+
 def _next_cc_output_name(
     output_dir: Path,
     used_names: set[str],
@@ -392,6 +404,23 @@ def _resguardar_carpeta_tramite_existente(planilla_dir: Path) -> Path | None:
         return candidato
     except Exception:
         return None
+
+
+def _modo_archivar_carpeta_tramite_activo() -> bool:
+    valor = str(os.environ.get("COBERTURA_ARCHIVAR_CARPETA_TRAMITE", "0") or "").strip().lower()
+    return valor in {"1", "true", "yes", "y", "si", "sí", "on"}
+
+
+def _archivar_carpeta_tramite_si_corresponde(planilla_dir: Path) -> Path | None:
+    """
+    Si el modo opcional está activo, mueve la carpeta del trámite a un respaldo
+    con sufijo de timestamp para arrancar limpio sin borrar evidencia.
+
+    Si el modo está apagado, conserva el comportamiento actual y no toca la carpeta.
+    """
+    if not _modo_archivar_carpeta_tramite_activo():
+        return None
+    return _resguardar_carpeta_tramite_existente(planilla_dir)
 
 
 def _sincronizar_tramite_inmediato(
@@ -1336,6 +1365,7 @@ def _obtener_registros_automaticos(
     result_set = None
 
     dig_tramite = _validar_dig_tramite_opcional(dig_tramite)
+    dias_busqueda_auto = _dias_busqueda_auto()
 
     # INICIO NUEVO: exclusión segura de cuarentena
     excluir_dig_id_tramite = excluir_dig_id_tramite or set()
@@ -1396,12 +1426,22 @@ def _obtener_registros_automaticos(
                 DIG_USUARIO,
                 FE_PLA_ANIOMES
             FROM DIGITALIZACION.DIGITALIZACION
-            WHERE TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
-              AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+            WHERE NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
               AND TRIM(DIG_PLANILLADO) = 'S'
     """
 
-    params: list[str | int] = [fe_pla_aniomes_desde]
+    params: list[str | int] = []
+
+    if dias_busqueda_auto > 0:
+        sql += """
+              AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE) - ?
+        """
+        params.append(dias_busqueda_auto)
+    else:
+        sql += """
+              AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
+        """
+        params.append(fe_pla_aniomes_desde)
 
     if dig_tramite:
         sql += """
@@ -1446,7 +1486,11 @@ def _obtener_registros_automaticos(
 
     sql += """
             ORDER BY
-                TRIM(TO_CHAR(FE_PLA_ANIOMES)) DESC,
+                """ + (
+                    "TRUNC(DIG_FECHA_HASTA) DESC,"
+                    if dias_busqueda_auto > 0
+                    else "TRIM(TO_CHAR(FE_PLA_ANIOMES)) DESC,"
+                ) + """
                 TO_DATE(NVL(TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD'), '1900-01-01'), 'YYYY-MM-DD') DESC,
                 TO_CHAR(DIG_TRAMITE) DESC,
                 TO_CHAR(DIG_ID_TRAMITE) DESC
@@ -1580,16 +1624,27 @@ def _contar_pendientes_automaticos(
     conn = None
     prepared_statement = None
     result_set = None
+    dias_busqueda_auto = _dias_busqueda_auto()
 
     sql = """
         SELECT COUNT(*)
         FROM DIGITALIZACION.DIGITALIZACION
-        WHERE TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
-          AND NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
+        WHERE NVL(TRIM(DIG_COBERTURA), 'N') = 'N'
           AND TRIM(DIG_PLANILLADO) = 'S'
     """
 
-    params = [fe_pla_aniomes_desde]
+    params: list[str | int] = []
+
+    if dias_busqueda_auto > 0:
+        sql += """
+          AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE) - ?
+        """
+        params.append(dias_busqueda_auto)
+    else:
+        sql += """
+          AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
+        """
+        params.append(fe_pla_aniomes_desde)
 
     if dig_tramite:
         sql += """
@@ -1922,6 +1977,17 @@ def generar_coberturas_automaticas_desde_mes(
                     )
 
                 planilla_dir = output_root / _safe_name(tramite)
+                carpeta_archivada = _archivar_carpeta_tramite_si_corresponde(planilla_dir)
+                if carpeta_archivada is not None:
+                    logger.event(
+                        "TRAMITE_FOLDER_ARCHIVED",
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        archived_path=str(carpeta_archivada),
+                        active_path=str(planilla_dir),
+                    )
+                planilla_dir.mkdir(parents=True, exist_ok=True)
 
                 cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
                 total_pdfs_tramite = len(cedulas_a_generar)
@@ -2385,28 +2451,6 @@ def generar_coberturas_automaticas_desde_mes(
                             detalle=last_processed_detail,
                         )
 
-                        if str(os.environ.get("COBERTURA_CLEAN_LOCAL_AFTER_SUCCESS", "1") or "").strip().lower() in {
-                            "1",
-                            "true",
-                            "yes",
-                            "y",
-                            "si",
-                            "sí",
-                            "on",
-                        }:
-                            limpieza_local = _limpiar_local_post_sincronizacion(
-                                planilla_dir=planilla_dir,
-                                pdfs_generados=pdfs_generados,
-                            )
-                            logger.event(
-                                "LOCAL_CLEANUP_AFTER_SUCCESS",
-                                index=index,
-                                dig_tramite=tramite,
-                                dig_id_tramite=dig_id_tramite,
-                                removed_files=limpieza_local.get("removed_files", []),
-                                removed_manifest=bool(limpieza_local.get("removed_manifest")),
-                                removed_dir=bool(limpieza_local.get("removed_dir")),
-                            )
                         _escribir_marca_local(
                             planilla_dir=planilla_dir,
                             tramite=tramite,
