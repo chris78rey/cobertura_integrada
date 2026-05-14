@@ -343,6 +343,30 @@ def _limpiar_local_post_sincronizacion(
     }
 
 
+def _escribir_marca_local(
+    planilla_dir: Path,
+    tramite: str,
+    paso: bool,
+    mensaje: str,
+    detalles: list[str] | None = None,
+) -> Path:
+    planilla_dir.mkdir(parents=True, exist_ok=True)
+    marca_path = planilla_dir / ("PASO.txt" if paso else "FALLO.txt")
+    lineas = [
+        f"TRAMITE: {tramite}",
+        f"RESULTADO: {'PASO' if paso else 'FALLO'}",
+        f"MENSAJE: {mensaje}",
+        f"TS: {datetime.now().isoformat(timespec='seconds')}",
+    ]
+    if detalles:
+        lineas.append("DETALLES:")
+        for item in detalles:
+            lineas.append(f"- {item}")
+    lineas.append("")
+    marca_path.write_text("\n".join(lineas), encoding="utf-8")
+    return marca_path
+
+
 def _resguardar_carpeta_tramite_existente(planilla_dir: Path) -> Path | None:
     """
     Si ya existe la carpeta del trámite, la renombra para no mezclar restos viejos
@@ -1293,7 +1317,7 @@ def _obtener_registros_automaticos(
     dig_tramite: str = "",
     excluir_dig_id_tramite: set[str] | None = None,
     excluir_dig_tramite: set[str] | None = None,
-    batch_size: int = 100,
+    batch_size: int = 20,
     timeout_seconds: int = 300,
     fetch_size: int = 500,
 ) -> list[dict[str, str]]:
@@ -1618,7 +1642,7 @@ def generar_coberturas_automaticas_desde_mes(
     dig_tramite: str = "",
     output_dir: str | Path | None = None,
     progress_callback: Callable[[int, int, dict[str, str]], None] | None = None,
-    batch_size: int = 100,
+    batch_size: int = 20,
     rondas_vacias_maximas: int = 0,
     espera_ronda_vacia_segundos: float = 0.0,
 ) -> dict[str, Any]:
@@ -2383,6 +2407,17 @@ def generar_coberturas_automaticas_desde_mes(
                                 removed_manifest=bool(limpieza_local.get("removed_manifest")),
                                 removed_dir=bool(limpieza_local.get("removed_dir")),
                             )
+                        _escribir_marca_local(
+                            planilla_dir=planilla_dir,
+                            tramite=tramite,
+                            paso=True,
+                            mensaje="Generación, sync y actualización Oracle completados.",
+                            detalles=[
+                                f"PDFS={len(pdfs_generados)}",
+                                f"SYNC_RETURNCODE={sync_result.get('returncode', '')}",
+                                f"ORACLE_AFFECTED={update_result.get('affected', 0)}",
+                            ],
+                        )
                     else:
                         errores += 1
                         errores_consecutivos += 1
@@ -2428,6 +2463,17 @@ def generar_coberturas_automaticas_desde_mes(
                             oracle_affected=update_result.get("affected", 0),
                             detalle=last_processed_detail,
                             error_categoria="ERROR_ACTUALIZANDO_ORACLE",
+                        )
+                        _escribir_marca_local(
+                            planilla_dir=planilla_dir,
+                            tramite=tramite,
+                            paso=False,
+                            mensaje="Fallo al actualizar Oracle después de sincronizar.",
+                            detalles=[
+                                f"PDFS={len(pdfs_generados)}",
+                                f"SYNC_RETURNCODE={sync_result.get('returncode', '')}",
+                                f"ERROR={err_msg}",
+                            ],
                         )
                 else:
                     errores += 1
@@ -2496,6 +2542,17 @@ def generar_coberturas_automaticas_desde_mes(
                         oracle_ok=False,
                         detalle=last_processed_detail,
                         error_categoria=error_en_pdf_detalle.get("categoria", "PDFS_INCOMPLETOS"),
+                    )
+                    _escribir_marca_local(
+                        planilla_dir=planilla_dir,
+                        tramite=tramite,
+                        paso=False,
+                        mensaje="La generación local quedó incompleta.",
+                        detalles=[
+                            f"PDFS_ESPERADOS={len(cedulas_a_generar)}",
+                            f"PDFS_LOCALES={len(pdfs_generados)}",
+                            f"ERROR={err_msg}",
+                        ],
                     )
 
                 marcar_ultimo_procesado(
