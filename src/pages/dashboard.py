@@ -24,6 +24,7 @@ from src.cobertura_pdf import (
 from src.auto_resume_state import (
     leer_estado_job,
     _parse_ts,
+    reiniciar_fallos_tramite,
 )
 from src.operator_tools import (
     exportar_estado_json,
@@ -752,14 +753,10 @@ def _render_tramites_x_reprocesar(username: str, password: str, fe_pla_aniomes_d
             )
 
         if resultado.get("ok") and resultado.get("verified"):
+            reiniciar_fallos_tramite(tramite)
             st.success(
                 f"Trámite {tramite} volvió a N. El loop lo tomará en el siguiente ciclo."
             )
-            lanzamiento = _disparar_worker_inmediato()
-            if lanzamiento.get("ok"):
-                st.info("Se lanzó un ciclo inmediato del worker para tomar el trámite.")
-            else:
-                st.warning("No se pudo lanzar el worker inmediato; el loop lo tomará solo en el siguiente ciclo.")
             st.session_state.pop(cache_key, None)
             st.rerun()
         else:

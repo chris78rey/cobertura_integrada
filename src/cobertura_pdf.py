@@ -459,9 +459,25 @@ def _marcar_tramite_x_en_oracle(
     motivo: str,
     logger: Any | None = None,
     dig_id_tramite: str = "",
+    min_reintentos: int = 3,
 ) -> None:
+    from src.auto_resume_state import reiniciar_fallos_tramite, registrar_fallo_tramite
+
     tramite = str(tramite or "").strip()
     if not tramite:
+        return
+
+    attempts = registrar_fallo_tramite(tramite, motivo, status="FAIL")
+    if attempts < max(1, int(min_reintentos or 1)):
+        if logger is not None:
+            logger.event(
+                "ORACLE_RETRY_DEFERRAL",
+                dig_tramite=tramite,
+                dig_id_tramite=str(dig_id_tramite or "").strip(),
+                attempts=attempts,
+                min_reintentos=min_reintentos,
+                motivo=motivo,
+            )
         return
 
     try:
@@ -478,7 +494,9 @@ def _marcar_tramite_x_en_oracle(
                 error=res.get("error", ""),
                 nuevo_valor="DIG_COBERTURA=X",
                 motivo=motivo,
+                attempts=attempts,
             )
+        reiniciar_fallos_tramite(tramite)
     except Exception as exc:
         if logger is not None:
             logger.error(
@@ -487,6 +505,7 @@ def _marcar_tramite_x_en_oracle(
                 dig_tramite=tramite,
                 dig_id_tramite=str(dig_id_tramite or "").strip(),
                 motivo=motivo,
+                attempts=attempts,
             )
 
 
@@ -2275,6 +2294,8 @@ def generar_coberturas_automaticas_desde_mes(
                         errores_consecutivos = 0
                         last_processed_status = "GENERADO_Y_ACTUALIZADO"
                         last_processed_detail = "Fila procesada correctamente y Oracle actualizado."
+                        from src.auto_resume_state import reiniciar_fallos_tramite
+                        reiniciar_fallos_tramite(tramite)
 
                         writer.writerow(
                             {

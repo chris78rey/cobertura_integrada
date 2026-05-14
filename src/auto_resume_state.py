@@ -79,6 +79,72 @@ def _sync_queue_db() -> sqlite3.Connection:
     return conn
 
 
+def _tramite_retry_db() -> sqlite3.Connection:
+    db_path = PROJECT_ROOT / "logs" / "cobertura_tramite_retry.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tramite_retry (
+            tramite TEXT PRIMARY KEY,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            last_status TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def registrar_fallo_tramite(tramite: str, error: str, status: str = "FAIL") -> int:
+    tramite = str(tramite or "").strip()
+    if not tramite:
+        return 0
+
+    now = _now()
+    conn = _tramite_retry_db()
+    try:
+        conn.execute("""
+            INSERT INTO tramite_retry (tramite, attempts, last_error, last_status, created_at, updated_at)
+            VALUES (?, 1, ?, ?, ?, ?)
+            ON CONFLICT(tramite) DO UPDATE SET
+                attempts = attempts + 1,
+                last_error = excluded.last_error,
+                last_status = excluded.last_status,
+                updated_at = excluded.updated_at
+        """, (tramite, str(error or "")[:1000], str(status or "").strip() or "FAIL", now, now))
+        conn.commit()
+        row = conn.execute("SELECT attempts FROM tramite_retry WHERE tramite=?", (tramite,)).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def reiniciar_fallos_tramite(tramite: str) -> None:
+    tramite = str(tramite or "").strip()
+    if not tramite:
+        return
+    conn = _tramite_retry_db()
+    try:
+        conn.execute("DELETE FROM tramite_retry WHERE tramite=?", (tramite,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def obtener_fallos_tramite(tramite: str) -> int:
+    tramite = str(tramite or "").strip()
+    if not tramite:
+        return 0
+    conn = _tramite_retry_db()
+    try:
+        row = conn.execute("SELECT attempts FROM tramite_retry WHERE tramite=?", (tramite,)).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
 def marcar_tramite_sync_pendiente(tramite: str, source_dir: str, detalle: str = "") -> None:
     now = _now()
     conn = _sync_queue_db()
@@ -145,6 +211,12 @@ def guardar_estado_job(data: dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     actual = leer_estado_job()
     actual.update(data)
+    status = str(actual.get("status", "") or "").strip()
+    if status in {"RUNNING", "RUNNING_BY_WORKER", "WATCHING_NO_PENDING", "SYNC_ACTIVE"}:
+        if "last_error" not in data:
+            actual["last_error"] = ""
+        if "retry_count" not in data:
+            actual["retry_count"] = 0
     actual["updated_at"] = _now()
     tmp_path = STATE_PATH.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(actual, ensure_ascii=False, indent=2), encoding="utf-8")

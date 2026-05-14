@@ -139,6 +139,8 @@ def _run_cycle() -> int:
         enabled=True,
         status="RUNNING_BY_WORKER" if pendientes_antes > 0 else "WATCHING_NO_PENDING",
         pendientes_antes=pendientes_antes,
+        last_error="",
+        retry_count=0,
         detalle=(
             f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
             + (f" y trámite {dig_tramite}" if dig_tramite else "")
@@ -171,6 +173,8 @@ def _run_cycle() -> int:
             enabled=True,
             status="RUNNING_BY_WORKER",
             sync_active=False,
+            last_error="",
+            retry_count=0,
             detalle="Generación de coberturas en ejecución.",
         )
         result = ejecutar_coberturas_con_lock(
@@ -185,6 +189,8 @@ def _run_cycle() -> int:
             last_errores=result.get("errores", 0),
             last_run_id=result.get("run_id", ""),
             last_manifest_path=result.get("manifest_path", ""),
+            last_error="",
+            retry_count=0,
             detalle=(
                 f"Generación terminada. "
                 f"Generados={result.get('generados', 0)}, "
@@ -200,6 +206,7 @@ def _run_cycle() -> int:
             "last_actualizados": result.get("actualizados", 0),
             "last_errores": result.get("errores", 0),
             "last_manifest_path": result.get("manifest_path", ""),
+            "last_progress_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds"),
             "detalle": (
                 f"Pasada terminada. "
                 f"Generados={result.get('generados', 0)}, "
@@ -227,6 +234,8 @@ def _run_cycle() -> int:
 
     heartbeat_job(
         pendientes_despues=pendientes_despues,
+        last_error="",
+        retry_count=0,
         detalle=(
             f"Revisión posterior a la generación. Pendientes restantes: {pendientes_despues}."
         ),
@@ -244,11 +253,12 @@ def _run_cycle() -> int:
         guardar_estado_job(
             {
                 "enabled": True,
-                "status": "RETRY_PENDING",
+                "status": "RUNNING_BY_WORKER",
                 "pendientes_despues": pendientes_despues,
                 "last_error": "",
                 "retry_count": 0,
                 "sync_pending": False,
+                "last_progress_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds"),
                 "detalle": "Aún quedan pendientes. El loop sigue ejecutando.",
             }
         )
