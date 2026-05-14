@@ -258,6 +258,26 @@ while time.monotonic() - inicio < espera:
 
 ---
 
+## 8. Lecciones recientes que no deben olvidarse
+
+- El flujo definitivo debe trabajar sobre `DIG_COBERTURA = 'N'`.
+- La ventana activa actual puede ser por `AUTO_FECHA_HASTA_DIAS_ATRAS=5` usando `DIG_FECHA_HASTA`.
+- El éxito solo cuenta si:
+  - el PDF local existe,
+  - se copia al destino existente,
+  - y Oracle queda en `S`.
+- El fallo solo pasa a `X` después de 3 intentos.
+- `X` es manual fuera del flujo automático.
+- No se deben borrar los PDFs locales al éxito.
+- El destino no debe crear carpetas nuevas si no existe la carpeta del trámite.
+- Solo se copian `CC*.pdf`; los demás PDFs del destino quedan intactos.
+- Cuando exista una carpeta local vieja del trámite, conviene archivarla o renombrarla antes de reprocesar para no mezclar corridas.
+
+Referencia de memoria larga:
+- [LECCIONES_APRENDIDAS.md](../../LECCIONES_APRENDIDAS.md)
+
+---
+
 ## 8. Ritmo dinámico por carga del sistema
 
 La aplicación debe bajar el ritmo si detecta carga.

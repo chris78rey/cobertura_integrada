@@ -11,6 +11,9 @@
 
 Genera PDFs de cobertura desde Oracle y los sincroniza al repositorio oficial.
 
+Si querés repasar decisiones, errores corregidos y reglas que no conviene olvidar, mirá:
+- [LECCIONES_APRENDIDAS.md](./LECCIONES_APRENDIDAS.md)
+
 ```
 ORACLE (DIGITALIZACION.DIGITALIZACION)
     ↓ consulta pendientes (DIG_COBERTURA='N', DIG_PLANILLADO='S')
