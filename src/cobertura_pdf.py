@@ -108,13 +108,24 @@ def _pausa_entre_tramites() -> float:
 def _dias_busqueda_auto() -> int:
     """
     Si AUTO_FECHA_HASTA_DIAS_ATRAS viene definido con un entero positivo,
-    el worker deja de filtrar por FE_PLA_ANIOMES y usa DIG_FECHA_HASTA.
+    el worker deja de filtrar por FE_PLA_ANIOMES y usa DIG_FECHA_HASTA
+    desde el primer día del mes actual.
     """
     valor = str(os.environ.get("AUTO_FECHA_HASTA_DIAS_ATRAS", "") or "").strip()
     if not valor.isdigit():
         return 0
     dias = int(valor)
     return dias if dias > 0 else 0
+
+
+def _parse_fecha_yyyy_mm_dd(valor: str | None) -> datetime | None:
+    raw = str(valor or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d")
+    except Exception:
+        return None
 
 
 def _next_cc_output_name(
@@ -1412,6 +1423,7 @@ def _obtener_registros_automaticos(
                 DIG_TRAMITE,
                 TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD') AS FECHA_HASTA,
                 TO_CHAR(DIG_FECHA_ALTA, 'YYYY-MM-DD') AS FECHA_ALTA,
+                TO_CHAR(DIG_FECHA_PLANILLA, 'YYYY-MM-DD') AS FECHA_PLANILLA,
                 DIG_CEDULA,
                 DIG_MENOR_EDAD,
                 DIG_DEPENDIENTE_01,
@@ -1434,9 +1446,8 @@ def _obtener_registros_automaticos(
 
     if dias_busqueda_auto > 0:
         sql += """
-              AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE) - ?
+              AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE, 'MM')
         """
-        params.append(dias_busqueda_auto)
     else:
         sql += """
               AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?
@@ -1525,19 +1536,20 @@ def _obtener_registros_automaticos(
                     "dig_tramite": str(result_set.getString(1) or "").strip(),
                     "dig_fecha_hasta": str(result_set.getString(2) or "").strip(),
                     "dig_fecha_alta": str(result_set.getString(3) or "").strip(),
-                    "dig_cedula": str(result_set.getString(4) or "").strip(),
-                    "dig_menor_edad": str(result_set.getString(5) or "").strip(),
-                    "dig_dependiente_01": str(result_set.getString(6) or "").strip(),
-                    "dig_dependiente_02": str(result_set.getString(7) or "").strip(),
-                    "dig_planillado": str(result_set.getString(8) or "").strip(),
-                    "dig_cobertura": str(result_set.getString(9) or "").strip(),
-                    "dig_id_generacion": str(result_set.getString(10) or "").strip(),
-                    "dig_id_tipo": str(result_set.getString(11) or "").strip(),
-                    "dig_numero_solicitud": str(result_set.getString(12) or "").strip(),
-                    "dig_bloqueo_sgh": str(result_set.getString(13) or "").strip(),
-                    "dig_id_tramite": str(result_set.getString(14) or "").strip(),
-                    "dig_usuario": str(result_set.getString(15) or "").strip(),
-                    "fe_pla_aniomes": str(result_set.getString(16) or "").strip(),
+                    "dig_fecha_planilla": str(result_set.getString(4) or "").strip(),
+                    "dig_cedula": str(result_set.getString(5) or "").strip(),
+                    "dig_menor_edad": str(result_set.getString(6) or "").strip(),
+                    "dig_dependiente_01": str(result_set.getString(7) or "").strip(),
+                    "dig_dependiente_02": str(result_set.getString(8) or "").strip(),
+                    "dig_planillado": str(result_set.getString(9) or "").strip(),
+                    "dig_cobertura": str(result_set.getString(10) or "").strip(),
+                    "dig_id_generacion": str(result_set.getString(11) or "").strip(),
+                    "dig_id_tipo": str(result_set.getString(12) or "").strip(),
+                    "dig_numero_solicitud": str(result_set.getString(13) or "").strip(),
+                    "dig_bloqueo_sgh": str(result_set.getString(14) or "").strip(),
+                    "dig_id_tramite": str(result_set.getString(15) or "").strip(),
+                    "dig_usuario": str(result_set.getString(16) or "").strip(),
+                    "fe_pla_aniomes": str(result_set.getString(17) or "").strip(),
                 }
             )
 
@@ -1567,7 +1579,7 @@ def _expandir_cedulas_para_cobertura(registro: dict[str, str]) -> list[dict[str,
     """
     Dado un registro de DIGITALIZACION, devuelve una lista con las cédulas
     que necesitan cobertura: titular + dependientes si DIG_MENOR_EDAD='S'.
-    Si DIG_FECHA_ALTA viene lleno, duplica la salida con esa fecha.
+    Si DIG_FECHA_PLANILLA es menor que DIG_FECHA_ALTA, duplica la salida con esa fecha.
     """
     cedulas_base: list[dict[str, str]] = []
 
@@ -1587,13 +1599,16 @@ def _expandir_cedulas_para_cobertura(registro: dict[str, str]) -> list[dict[str,
 
     fecha_hasta = str(registro.get("dig_fecha_hasta", "") or "").strip()
     fecha_alta = str(registro.get("dig_fecha_alta", "") or "").strip()
+    fecha_planilla = str(registro.get("dig_fecha_planilla", "") or "").strip()
 
     if not fecha_hasta:
         return []
 
     variantes_fecha = [("HASTA", fecha_hasta)]
-    if fecha_alta:
-        variantes_fecha.append(("ALTA", fecha_alta))
+    fecha_planilla_dt = _parse_fecha_yyyy_mm_dd(fecha_planilla)
+    fecha_alta_dt = _parse_fecha_yyyy_mm_dd(fecha_alta)
+    if fecha_planilla_dt and fecha_alta_dt and fecha_planilla_dt < fecha_alta_dt:
+        variantes_fecha = [("PLANILLA", fecha_planilla), ("ALTA", fecha_alta)]
 
     cedulas: list[dict[str, str]] = []
     for fecha_tipo, fecha_pdf in variantes_fecha:
@@ -1637,9 +1652,8 @@ def _contar_pendientes_automaticos(
 
     if dias_busqueda_auto > 0:
         sql += """
-          AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE) - ?
+          AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE, 'MM')
         """
-        params.append(dias_busqueda_auto)
     else:
         sql += """
           AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?

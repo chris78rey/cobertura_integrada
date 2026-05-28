@@ -70,8 +70,7 @@ def contar_pendientes(username: str, password: str, fe_pla_aniomes_desde: str, d
         WHERE NVL(TRIM(DIG_COBERTURA),'N')='N' AND TRIM(DIG_PLANILLADO)='S'"""
     params: list[str | int] = []
     if dias_busqueda_auto > 0:
-        sql += " AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE) - ?"
-        params.append(dias_busqueda_auto)
+        sql += " AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE, 'MM')"
     else:
         sql += " AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?"
         params.append(fe_pla_aniomes_desde)
@@ -141,7 +140,7 @@ def _run_cycle() -> int:
                 "retry_count": 0,
                 "detalle": (
                     (
-                        f"Ventana de { _dias_busqueda_auto() } días restaurada desde AUTO_FECHA_HASTA_DIAS_ATRAS "
+                        "Ventana del mes actual restaurada desde AUTO_FECHA_HASTA_DIAS_ATRAS "
                         if _dias_busqueda_auto() > 0
                         else "Mes de trabajo restaurado desde AUTO_FE_PLA_ANIOMES_DESDE "
                     )
@@ -162,7 +161,7 @@ def _run_cycle() -> int:
         retry_count=0,
         detalle=(
             (
-                f"Worker revisando Oracle para últimos {_dias_busqueda_auto()} días"
+                "Worker revisando Oracle para el mes actual"
                 if _dias_busqueda_auto() > 0
                 else f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
             )
@@ -174,7 +173,7 @@ def _run_cycle() -> int:
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
                 (
-                    f"No hay pendientes en los últimos {_dias_busqueda_auto()} días. Sistema vigilando."
+                    "No hay pendientes en el mes actual. Sistema vigilando."
                     if _dias_busqueda_auto() > 0
                     else f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. Sistema vigilando."
                 ),
@@ -191,7 +190,7 @@ def _run_cycle() -> int:
                         "last_errores": "",
                         "detalle": (
                             (
-                                f"Worker revisando Oracle para últimos {_dias_busqueda_auto()} días"
+                                "Worker revisando Oracle para el mes actual"
                                 if _dias_busqueda_auto() > 0
                                 else f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
                             )
@@ -276,7 +275,7 @@ def _run_cycle() -> int:
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
                 (
-                    f"Terminados pendientes actuales en los últimos {_dias_busqueda_auto()} días. "
+                    "Terminados pendientes actuales del mes actual. "
                     if _dias_busqueda_auto() > 0
                     else f"Terminados pendientes actuales con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
                 )

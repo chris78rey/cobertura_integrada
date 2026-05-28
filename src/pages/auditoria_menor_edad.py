@@ -16,6 +16,7 @@ import streamlit as st
 
 from src.cobertura_runner import ArchivoLock, LOCK_PATH, ProcesoCoberturaYaEnEjecucion
 from src.cobertura_pdf import (
+    _parse_fecha_yyyy_mm_dd,
     _expandir_cedulas_para_cobertura,
     _limpiar_local_post_sincronizacion,
     _nombre_cc_por_secuencia,
@@ -119,6 +120,7 @@ def _consultar_menores_por_mes(
                 TRIM(NVL(DIG_DEPENDIENTE_02, '')) AS DIG_DEPENDIENTE_02,
                 TRIM(TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD')) AS DIG_FECHA_HASTA,
                 TRIM(TO_CHAR(DIG_FECHA_ALTA, 'YYYY-MM-DD')) AS DIG_FECHA_ALTA,
+                TRIM(TO_CHAR(DIG_FECHA_PLANILLA, 'YYYY-MM-DD')) AS DIG_FECHA_PLANILLA,
                 TRIM(NVL(DIG_MENOR_EDAD, 'N')) AS DIG_MENOR_EDAD,
                 TRIM(NVL(DIG_COBERTURA, 'N')) AS DIG_COBERTURA,
                 TRIM(NVL(DIG_PLANILLADO, '')) AS DIG_PLANILLADO,
@@ -147,10 +149,11 @@ def _consultar_menores_por_mes(
                 "DIG_DEPENDIENTE_02": str(rs.getString(4) or "").strip(),
                 "DIG_FECHA_HASTA": str(rs.getString(5) or "").strip(),
                 "DIG_FECHA_ALTA": str(rs.getString(6) or "").strip(),
-                "DIG_MENOR_EDAD": str(rs.getString(7) or "").strip(),
-                "DIG_COBERTURA": str(rs.getString(8) or "").strip(),
-                "DIG_PLANILLADO": str(rs.getString(9) or "").strip(),
-                "FE_PLA_ANIOMES": str(rs.getString(10) or "").strip(),
+                "DIG_FECHA_PLANILLA": str(rs.getString(7) or "").strip(),
+                "DIG_MENOR_EDAD": str(rs.getString(8) or "").strip(),
+                "DIG_COBERTURA": str(rs.getString(9) or "").strip(),
+                "DIG_PLANILLADO": str(rs.getString(10) or "").strip(),
+                "FE_PLA_ANIOMES": str(rs.getString(11) or "").strip(),
             })
         return rows
     finally:
@@ -191,6 +194,7 @@ def _preparar_registro_cobertura(row: dict[str, str]) -> dict[str, str]:
         "dig_dependiente_02": str(row.get("DIG_DEPENDIENTE_02", "")).strip(),
         "dig_fecha_hasta": str(row.get("DIG_FECHA_HASTA", "")).strip(),
         "dig_fecha_alta": str(row.get("DIG_FECHA_ALTA", "")).strip(),
+        "dig_fecha_planilla": str(row.get("DIG_FECHA_PLANILLA", "")).strip(),
     }
 
 
@@ -449,6 +453,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
     dig_dep2 = str(row.get("DIG_DEPENDIENTE_02", "")).strip()
     dig_fecha_hasta = str(row.get("DIG_FECHA_HASTA", "")).strip()
     dig_fecha_alta = str(row.get("DIG_FECHA_ALTA", "")).strip()
+    dig_fecha_planilla = str(row.get("DIG_FECHA_PLANILLA", "")).strip()
     fe_pla = str(row.get("FE_PLA_ANIOMES", "")).strip()
 
     if dig_planillado != "S":
@@ -467,10 +472,22 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
         "fe_pla_aniomes": fe_pla,
         "dig_fecha_hasta": dig_fecha_hasta,
         "dig_fecha_alta": dig_fecha_alta,
+        "dig_fecha_planilla": dig_fecha_planilla,
     }
     cedulas_a_generar = _expandir_cedulas_para_cobertura(registro)
     if not cedulas_a_generar:
         raise RuntimeError(f"No hay cédulas válidas para regenerar el trámite {tramite}.")
+
+    fecha_planilla_dt = _parse_fecha_yyyy_mm_dd(dig_fecha_planilla)
+    fecha_alta_dt = _parse_fecha_yyyy_mm_dd(dig_fecha_alta)
+    if fecha_planilla_dt and fecha_alta_dt and fecha_planilla_dt < fecha_alta_dt:
+        for idx, item in enumerate(cedulas_a_generar):
+            if idx < len(cedulas_a_generar) // 2:
+                item["fecha_pdf"] = dig_fecha_planilla
+                item["fecha_tipo"] = "PLANILLA"
+            else:
+                item["fecha_pdf"] = dig_fecha_alta
+                item["fecha_tipo"] = "ALTA"
 
     output_dir = OUTPUT_ROOT / tramite
     expected_output_names = [

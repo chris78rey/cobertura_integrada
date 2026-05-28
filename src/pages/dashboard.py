@@ -270,8 +270,8 @@ def _render_css():
         }
 
         .status-warn {
-            background: #fff7ed;
-            border: 1px solid #fed7aa;
+            background: rgba(255, 247, 237, 0.28);
+            border: 1px solid rgba(253, 186, 116, 0.22);
             color: #9a3412;
             border-radius: 18px;
             padding: 1rem;
@@ -296,8 +296,8 @@ def _render_css():
         }
 
         .status-card.warn {
-            background: #fffbeb;
-            border-color: #fcd34d;
+            background: rgba(255, 251, 235, 0.26);
+            border-color: rgba(252, 211, 77, 0.2);
             color: #92400e;
         }
 
@@ -324,8 +324,12 @@ def _render_css():
         }
 
         .op-card-accent {
-            background: linear-gradient(180deg, #fff7ed 0%, #ffedd5 100%);
-            border: 1px solid #fdba74;
+            background: linear-gradient(
+                180deg,
+                rgba(255, 247, 237, 0.18) 0%,
+                rgba(255, 237, 213, 0.24) 100%
+            );
+            border: 1px solid rgba(253, 186, 116, 0.16);
         }
 
         .op-card-title {
@@ -1604,7 +1608,7 @@ def dashboard_page():
     dias_busqueda_auto = _dias_busqueda_auto()
 
     subtitulo_ventana = (
-        f"últimos {dias_busqueda_auto} días"
+        "mes actual"
         if dias_busqueda_auto > 0
         else f"mes {mes_por_defecto}"
     )
@@ -1650,7 +1654,7 @@ def dashboard_page():
         "Seleccione cómo desea procesar",
         options=[
             (
-                f"Procesar por últimos {dias_busqueda_auto} días"
+                "Procesar por mes actual"
                 if dias_busqueda_auto > 0
                 else "Procesar por mes desde"
             ),
@@ -1706,8 +1710,7 @@ def dashboard_page():
         fe_pla_aniomes_desde = mes_por_defecto
         mes_valido = True
         st.info(
-            f"Modo activo: se procesarán registros con DIG_FECHA_HASTA de los últimos "
-            f"{dias_busqueda_auto} día(s)."
+            "Modo activo: se procesarán registros con DIG_FECHA_HASTA desde el primer día del mes actual."
         )
     else:
         mes_key = f"fe_pla_aniomes_desde_input_{st.session_state.input_reset_counter}"
