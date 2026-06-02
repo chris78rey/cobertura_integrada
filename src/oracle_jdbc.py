@@ -558,6 +558,133 @@ def actualizar_cobertura_por_tramite(
     )
 
 
+def corregir_cobertura_x_mes_actual_y_anterior(
+    username: str,
+    password: str,
+) -> dict:
+    """
+    Replica el procedimiento PR_CORRIGE_DIG_2_MESES:
+
+    - Cambia DIG_COBERTURA de X a N.
+    - Solo para el mes actual y el mes anterior.
+    - No filtra por DIG_PLANILLADO.
+    """
+
+    conn = None
+    select_before = None
+    result_before = None
+    update_stmt = None
+    select_after = None
+    result_after = None
+
+    sql_before = """
+        SELECT TO_CHAR(FE_PLA_ANIOMES), COUNT(1)
+        FROM DIGITALIZACION.DIGITALIZACION
+        WHERE TRIM(NVL(DIG_COBERTURA, '')) = 'X'
+          AND FE_PLA_ANIOMES IN (
+                TO_CHAR(SYSDATE, 'YYYYMM'),
+                TO_CHAR(ADD_MONTHS(SYSDATE, -1), 'YYYYMM')
+          )
+        GROUP BY TO_CHAR(FE_PLA_ANIOMES)
+        ORDER BY TO_CHAR(FE_PLA_ANIOMES)
+    """
+
+    sql_update = """
+        UPDATE DIGITALIZACION.DIGITALIZACION
+           SET DIG_COBERTURA = 'N'
+         WHERE TRIM(NVL(DIG_COBERTURA, '')) = 'X'
+           AND FE_PLA_ANIOMES IN (
+                TO_CHAR(SYSDATE, 'YYYYMM'),
+                TO_CHAR(ADD_MONTHS(SYSDATE, -1), 'YYYYMM')
+           )
+    """
+
+    sql_after = """
+        SELECT TO_CHAR(FE_PLA_ANIOMES), COUNT(1)
+        FROM DIGITALIZACION.DIGITALIZACION
+        WHERE TRIM(NVL(DIG_COBERTURA, '')) = 'X'
+          AND FE_PLA_ANIOMES IN (
+                TO_CHAR(SYSDATE, 'YYYYMM'),
+                TO_CHAR(ADD_MONTHS(SYSDATE, -1), 'YYYYMM')
+          )
+        GROUP BY TO_CHAR(FE_PLA_ANIOMES)
+        ORDER BY TO_CHAR(FE_PLA_ANIOMES)
+    """
+
+    before_rows: list[dict[str, str]] = []
+    after_rows: list[dict[str, str]] = []
+    affected = 0
+
+    try:
+        conn = oracle_connect(username, password)
+        java_conn = conn.jconn
+        java_conn.setAutoCommit(False)
+
+        select_before = java_conn.prepareStatement(sql_before)
+        result_before = select_before.executeQuery()
+        while result_before.next():
+            before_rows.append(
+                {
+                    "fe_pla_aniomes": str(result_before.getString(1) or "").strip(),
+                    "cantidad": str(result_before.getString(2) or "").strip(),
+                }
+            )
+
+        update_stmt = java_conn.prepareStatement(sql_update)
+        affected = int(update_stmt.executeUpdate())
+        java_conn.commit()
+
+        select_after = java_conn.prepareStatement(sql_after)
+        result_after = select_after.executeQuery()
+        while result_after.next():
+            after_rows.append(
+                {
+                    "fe_pla_aniomes": str(result_after.getString(1) or "").strip(),
+                    "cantidad": str(result_after.getString(2) or "").strip(),
+                }
+            )
+
+        return {
+            "ok": True,
+            "affected": affected,
+            "verified": True,
+            "error": "",
+            "before_rows": before_rows,
+            "after_rows": after_rows,
+            "criterio": "X_MES_ACTUAL_Y_ANTERIOR",
+        }
+
+    except Exception as exc:
+        if conn:
+            try:
+                conn.jconn.rollback()
+            except Exception:
+                pass
+
+        return {
+            "ok": False,
+            "affected": affected,
+            "verified": False,
+            "error": str(exc),
+            "before_rows": before_rows,
+            "after_rows": after_rows,
+            "criterio": "X_MES_ACTUAL_Y_ANTERIOR",
+        }
+
+    finally:
+        for obj in (result_after, select_after, result_before, select_before, update_stmt):
+            if obj:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def obtener_tramites_en_cola(
     username: str,
     password: str,

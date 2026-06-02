@@ -804,6 +804,13 @@ async function generatePdfFromResult({ result, cedula, fecha, outputName = "", o
   const { svgPath, svgPaths } = generateSvgFromResult({ result, cedula, fecha, outputName, outputDir });
   await renderPdfFromSvg({ svgPath, svgPaths, pdfPath });
 
+  const responseJsonPath = path.join(outDir, `${baseName}.json`);
+  try {
+    fs.writeFileSync(responseJsonPath, JSON.stringify(result, null, 2), "utf8");
+  } catch (error) {
+    // El PDF ya quedó generado; el sidecar JSON es solo evidencia auxiliar.
+  }
+
   // Limpiar archivos SVG intermedios (solo conservamos el PDF)
   for (const svg of svgPaths) {
     try {
@@ -813,7 +820,7 @@ async function generatePdfFromResult({ result, cedula, fecha, outputName = "", o
     }
   }
 
-  return { pdfPath };
+  return { pdfPath, responseJsonPath };
 }
 
 if (require.main === module) {

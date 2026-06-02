@@ -109,7 +109,7 @@ def _dias_busqueda_auto() -> int:
     """
     Si AUTO_FECHA_HASTA_DIAS_ATRAS viene definido con un entero positivo,
     el worker deja de filtrar por FE_PLA_ANIOMES y usa DIG_FECHA_HASTA
-    desde el primer día del mes actual.
+    del mes anterior completo.
     """
     valor = str(os.environ.get("AUTO_FECHA_HASTA_DIAS_ATRAS", "") or "").strip()
     if not valor.isdigit():
@@ -126,6 +126,39 @@ def _parse_fecha_yyyy_mm_dd(valor: str | None) -> datetime | None:
         return datetime.strptime(raw, "%Y-%m-%d")
     except Exception:
         return None
+
+
+def _texto_indica_servicio_no_disponible(valor: Any) -> bool:
+    if isinstance(valor, dict):
+        return any(_texto_indica_servicio_no_disponible(v) for v in valor.values())
+    if isinstance(valor, list):
+        return any(_texto_indica_servicio_no_disponible(v) for v in valor)
+    if isinstance(valor, (str, int, float, bool)):
+        texto = str(valor).strip().lower()
+        texto = (
+            texto.replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+            .replace("ü", "u")
+        )
+        return "servicio no disponible" in texto or "service unavailable" in texto
+    return False
+
+
+def _json_portal_indica_servicio_no_disponible(json_path: Path) -> bool:
+    if not json_path.exists() or not json_path.is_file():
+        return False
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return _texto_indica_servicio_no_disponible(data)
+
+
+def _pdf_resultado_indica_servicio_no_disponible(pdf_path: Path) -> bool:
+    return _json_portal_indica_servicio_no_disponible(pdf_path.with_suffix(".json"))
 
 
 def _next_cc_output_name(
@@ -1274,6 +1307,38 @@ def generar_hojas_cobertura_por_id(
             )
 
             if result["ok"] and pdf_path.exists():
+                if _pdf_resultado_indica_servicio_no_disponible(pdf_path):
+                    failed += 1
+                    error_message = "servicio no disponible"
+                    errors.append(
+                        {
+                            "planilla": planilla,
+                            "cedula": cedula,
+                            "fecha": fecha_texto,
+                            "error": error_message,
+                        }
+                    )
+                    writer.writerow(
+                        {
+                            "planilla": planilla,
+                            "cedula": cedula,
+                            "fecha": fecha_texto,
+                            "carpeta": str(planilla_dir),
+                            "pdf": str(pdf_path),
+                            "estado": "ERROR",
+                            "error": error_message,
+                        }
+                    )
+
+                    if planilla_dir.exists() and not any(planilla_dir.iterdir()):
+                        try:
+                            planilla_dir.rmdir()
+                        except Exception:
+                            pass
+
+                    time.sleep(delay_seconds)
+                    continue
+
                 generated += 1
                 zip_files.append(pdf_path)
                 writer.writerow(
@@ -1446,7 +1511,8 @@ def _obtener_registros_automaticos(
 
     if dias_busqueda_auto > 0:
         sql += """
-              AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE, 'MM')
+              AND TRUNC(DIG_FECHA_HASTA) >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -1)
+              AND TRUNC(DIG_FECHA_HASTA) < TRUNC(SYSDATE, 'MM')
         """
     else:
         sql += """
@@ -1652,7 +1718,8 @@ def _contar_pendientes_automaticos(
 
     if dias_busqueda_auto > 0:
         sql += """
-          AND TRUNC(DIG_FECHA_HASTA) >= TRUNC(SYSDATE, 'MM')
+          AND TRUNC(DIG_FECHA_HASTA) >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -1)
+          AND TRUNC(DIG_FECHA_HASTA) < TRUNC(SYSDATE, 'MM')
         """
     else:
         sql += """
@@ -2006,6 +2073,7 @@ def generar_coberturas_automaticas_desde_mes(
                 cedulas_a_generar = _expandir_cedulas_para_cobertura(reg)
                 total_pdfs_tramite = len(cedulas_a_generar)
                 pdfs_generados: list[Path] = []
+                pdf_titular_generado = False
                 error_en_pdf = ""
                 error_en_pdf_detalle: dict[str, str] = {}
                 expected_output_names = [
@@ -2114,6 +2182,26 @@ def generar_coberturas_automaticas_desde_mes(
                             "pdf_esperado": output_name,
                             "error_tecnico": "La cédula debe tener 10 dígitos.",
                         }
+                        if pdf_titular_generado and tipo_persona != "TITULAR":
+                            logger.event(
+                                "PDF_GENERATION_NON_BLOCKING_ERROR",
+                                index=index,
+                                dig_tramite=tramite,
+                                dig_id_tramite=dig_id_tramite,
+                                cedula=mask_cedula(c),
+                                tipo_persona=tipo_persona,
+                                pdf_path=str(pdf_path),
+                                segundos_pdf=0.0,
+                                error_categoria=error_en_pdf_detalle["categoria"],
+                                causa_probable=error_en_pdf_detalle["causa"],
+                                sugerencia_revision=error_en_pdf_detalle["sugerencia"],
+                                node_attempts=error_en_pdf_detalle["attempts"],
+                                node_returncode=error_en_pdf_detalle["returncode"],
+                                node_stderr=error_en_pdf_detalle["stderr"],
+                                node_stdout=error_en_pdf_detalle["stdout"],
+                            )
+                            continue
+
                         error_en_pdf = error_en_pdf_detalle["error_tecnico"]
 
                         logger.error(
@@ -2161,7 +2249,73 @@ def generar_coberturas_automaticas_desde_mes(
                     pdf_size = pdf_path.stat().st_size if pdf_path.exists() else 0
 
                     if result_node["ok"] and pdf_path.exists() and pdf_size > 0:
+                        if _pdf_resultado_indica_servicio_no_disponible(pdf_path):
+                            error_en_pdf_detalle = {
+                                "categoria": "PORTAL_503",
+                                "causa": "El portal respondió 'servicio no disponible' y no se debe considerar cobertura válida.",
+                                "sugerencia": (
+                                    "Mantener el trámite en N para reintentar. "
+                                    "Si se repite 3 veces, pasar a X manual."
+                                ),
+                                "attempts": str(result_node.get("attempts", "")),
+                                "returncode": str(result_node.get("returncode", "")),
+                                "stderr": _limitar_texto(result_node.get("stderr", "")),
+                                "stdout": _limitar_texto(result_node.get("stdout", "")),
+                                "cedula": c,
+                                "pdf_esperado": output_name,
+                                "error_tecnico": "servicio no disponible",
+                            }
+                            if pdf_titular_generado and tipo_persona != "TITULAR":
+                                logger.event(
+                                    "PDF_GENERATION_NON_BLOCKING_ERROR",
+                                    index=index,
+                                    dig_tramite=tramite,
+                                    dig_id_tramite=dig_id_tramite,
+                                    cedula=mask_cedula(c),
+                                    tipo_persona=tipo_persona,
+                                    pdf_path=str(pdf_path),
+                                    segundos_pdf=round(ultimo_segundos_pdf, 3),
+                                    error_categoria=error_en_pdf_detalle["categoria"],
+                                    causa_probable=error_en_pdf_detalle["causa"],
+                                    sugerencia_revision=error_en_pdf_detalle["sugerencia"],
+                                    node_attempts=error_en_pdf_detalle["attempts"],
+                                    node_returncode=error_en_pdf_detalle["returncode"],
+                                    node_stderr=error_en_pdf_detalle["stderr"],
+                                    node_stdout=error_en_pdf_detalle["stdout"],
+                                )
+                                continue
+
+                            error_en_pdf = error_en_pdf_detalle["error_tecnico"]
+
+                            logger.error(
+                                "PDF_GENERATION_ERROR",
+                                error_en_pdf,
+                                index=index,
+                                dig_tramite=tramite,
+                                dig_id_tramite=dig_id_tramite,
+                                cedula=mask_cedula(c),
+                                tipo_persona=tipo_persona,
+                                pdf_path=str(pdf_path),
+                                segundos_pdf=round(ultimo_segundos_pdf, 3),
+                                error_categoria=error_en_pdf_detalle["categoria"],
+                                causa_probable=error_en_pdf_detalle["causa"],
+                                sugerencia_revision=error_en_pdf_detalle["sugerencia"],
+                                node_attempts=error_en_pdf_detalle["attempts"],
+                                node_returncode=error_en_pdf_detalle["returncode"],
+                                node_stderr=error_en_pdf_detalle["stderr"],
+                                node_stdout=error_en_pdf_detalle["stdout"],
+                            )
+                            if respaldos_cc_locales:
+                                _restaurar_cc_locales(
+                                    respaldos_cc_locales,
+                                    planilla_dir=planilla_dir,
+                                    expected_pdf_names=expected_pdf_names,
+                                )
+                            break
+
                         pdfs_generados.append(pdf_path)
+                        if tipo_persona == "TITULAR":
+                            pdf_titular_generado = True
                         logger.event(
                             "PDF_GENERATION_END",
                             index=index,
@@ -2184,6 +2338,26 @@ def generar_coberturas_automaticas_desde_mes(
                             cedula=c,
                             fecha=fecha_pdf,
                         )
+
+                        if pdf_titular_generado and tipo_persona != "TITULAR":
+                            logger.event(
+                                "PDF_GENERATION_NON_BLOCKING_ERROR",
+                                index=index,
+                                dig_tramite=tramite,
+                                dig_id_tramite=dig_id_tramite,
+                                cedula=mask_cedula(c),
+                                tipo_persona=tipo_persona,
+                                pdf_path=str(pdf_path),
+                                segundos_pdf=round(ultimo_segundos_pdf, 3),
+                                error_categoria=error_en_pdf_detalle["categoria"],
+                                causa_probable=error_en_pdf_detalle["causa"],
+                                sugerencia_revision=error_en_pdf_detalle["sugerencia"],
+                                node_attempts=error_en_pdf_detalle["attempts"],
+                                node_returncode=error_en_pdf_detalle["returncode"],
+                                node_stderr=error_en_pdf_detalle["stderr"],
+                                node_stdout=error_en_pdf_detalle["stdout"],
+                            )
+                            continue
 
                         error_en_pdf = error_en_pdf_detalle["error_tecnico"] or error_en_pdf_detalle["causa"]
 
@@ -2215,11 +2389,12 @@ def generar_coberturas_automaticas_desde_mes(
 
                 # =========================
                 # ACTUALIZACIÓN ORACLE POR TRÁMITE
-                # Solo cuando TODOS los PDFs del trámite existen.
+                # Solo cuando al menos el PDF del titular existe y fue válido.
                 # =========================
                 todos_los_pdfs_ok = (
                     not error_en_pdf
-                    and len(pdfs_generados) == total_pdfs_tramite
+                    and pdf_titular_generado
+                    and len(pdfs_generados) >= 1
                     and all(p.exists() and p.stat().st_size > 0 for p in pdfs_generados)
                 )
 

@@ -31,6 +31,7 @@ from src.operator_tools import (
 )
 from src.oracle_jdbc import (
     actualizar_cobertura_por_tramite_valor,
+    corregir_cobertura_x_mes_actual_y_anterior,
     obtener_tramites_en_cola,
     obtener_tramites_en_x,
 )
@@ -636,6 +637,46 @@ def _render_tramites_x_reprocesar(username: str, password: str, fe_pla_aniomes_d
     if not username or not password:
         st.info("Inicia sesión en Oracle para buscar y reprocesar trámites en X.")
         return
+
+    st.markdown("#### Corrección masiva")
+    st.caption("Equivale al procedimiento PR_CORRIGE_DIG_2_MESES: cambia X a N en el mes actual y el anterior.")
+    confirmar_masiva = st.checkbox(
+        "Confirmo que quiero cambiar todos los X del mes actual y anterior a N",
+        key="confirmar_correcion_masiva_x",
+    )
+    escribir_masiva = st.text_input(
+        "Escribir CORREGIR X para confirmar",
+        value="",
+        key="confirmar_texto_correcion_masiva_x",
+    ).strip().upper()
+
+    if st.button(
+        "Corregir X -> N del mes actual y anterior",
+        key="btn_corregir_x_meses",
+        use_container_width=True,
+    ):
+        if not confirmar_masiva or escribir_masiva != "CORREGIR X":
+            st.warning("Debes confirmar la acción y escribir CORREGIR X.")
+        else:
+            with st.spinner("Actualizando Oracle: X -> N para mes actual y anterior..."):
+                try:
+                    resultado_masivo = corregir_cobertura_x_mes_actual_y_anterior(
+                        username=username,
+                        password=password,
+                    )
+                except Exception as exc:
+                    resultado_masivo = {"ok": False, "error": str(exc)}
+
+            if resultado_masivo.get("ok") and resultado_masivo.get("verified"):
+                st.success(
+                    f"Listo. Se actualizaron {resultado_masivo.get('affected', 0)} fila(s) de X a N."
+                )
+                st.session_state.pop("tramites_x_mes_desde", None)
+                st.session_state.pop("tramites_x_tramite_exacto", None)
+                st.rerun()
+            else:
+                st.error("No se pudo completar la corrección masiva.")
+                st.code(str(resultado_masivo), language="json")
 
     col1, col2 = st.columns([1.1, 1.0])
     with col1:
@@ -1608,7 +1649,7 @@ def dashboard_page():
     dias_busqueda_auto = _dias_busqueda_auto()
 
     subtitulo_ventana = (
-        "mes actual"
+        "mes anterior"
         if dias_busqueda_auto > 0
         else f"mes {mes_por_defecto}"
     )
@@ -1654,7 +1695,7 @@ def dashboard_page():
         "Seleccione cómo desea procesar",
         options=[
             (
-                "Procesar por mes actual"
+                "Procesar por mes anterior"
                 if dias_busqueda_auto > 0
                 else "Procesar por mes desde"
             ),
@@ -1710,7 +1751,7 @@ def dashboard_page():
         fe_pla_aniomes_desde = mes_por_defecto
         mes_valido = True
         st.info(
-            "Modo activo: se procesarán registros con DIG_FECHA_HASTA desde el primer día del mes actual."
+            "Modo activo: se procesarán registros con DIG_FECHA_HASTA del mes anterior completo."
         )
     else:
         mes_key = f"fe_pla_aniomes_desde_input_{st.session_state.input_reset_counter}"

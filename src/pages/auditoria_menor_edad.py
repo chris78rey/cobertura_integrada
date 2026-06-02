@@ -17,6 +17,7 @@ import streamlit as st
 from src.cobertura_runner import ArchivoLock, LOCK_PATH, ProcesoCoberturaYaEnEjecucion
 from src.cobertura_pdf import (
     _parse_fecha_yyyy_mm_dd,
+    _pdf_resultado_indica_servicio_no_disponible,
     _expandir_cedulas_para_cobertura,
     _limpiar_local_post_sincronizacion,
     _nombre_cc_por_secuencia,
@@ -497,6 +498,7 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
 
     run_id = _ahora_id()
     local_resguardos: list[tuple[Path, Path]] = []
+    titular_generado = False
     carpeta_archivada = _archivar_carpeta_tramite_si_corresponde(output_dir)
     if carpeta_archivada is not None:
         _auditar_evento(
@@ -533,6 +535,8 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
 
             if pdf_path.exists() and pdf_path.stat().st_size > 0:
                 nuevos_pdfs.append(pdf_path)
+                if item_cedula.get("tipo", "") == "TITULAR":
+                    titular_generado = True
                 continue
 
             if not output_dir.exists():
@@ -565,6 +569,19 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
             )
 
             if not result_node.get("ok"):
+                if titular_generado and item_cedula.get("tipo", "") != "TITULAR":
+                    _auditar_evento(
+                        {
+                            "evento": "RECUPERACION_LOCAL_MENOR_EDAD_ERROR_NO_CRITICO",
+                            "usuario": usuario,
+                            "tramite": tramite,
+                            "cedula": c,
+                            "output_name": output_name,
+                            "error": result_node.get("error") or result_node.get("stderr") or result_node.get("stdout"),
+                            "motivo": "Fallo no crítico: ya existe el PDF del titular.",
+                        }
+                    )
+                    continue
                 raise RuntimeError(
                     f"No se pudo regenerar {output_name}.pdf para el trámite {tramite}: "
                     f"{result_node.get('error') or result_node.get('stderr') or result_node.get('stdout')}"
@@ -573,7 +590,28 @@ def _regenerar_local_y_reemplazar_cc(row: dict[str, Any], usuario: str, password
             if not pdf_path.exists() or pdf_path.stat().st_size <= 0:
                 raise RuntimeError(f"El generador no dejó el PDF esperado: {pdf_path}")
 
+            if _pdf_resultado_indica_servicio_no_disponible(pdf_path):
+                if titular_generado and item_cedula.get("tipo", "") != "TITULAR":
+                    _auditar_evento(
+                        {
+                            "evento": "RECUPERACION_LOCAL_MENOR_EDAD_ERROR_NO_CRITICO",
+                            "usuario": usuario,
+                            "tramite": tramite,
+                            "cedula": c,
+                            "output_name": output_name,
+                            "error": "servicio no disponible",
+                            "motivo": "Fallo no crítico: ya existe el PDF del titular.",
+                        }
+                    )
+                    continue
+                raise RuntimeError(
+                    "El portal respondió 'servicio no disponible'. "
+                    "No se debe considerar cobertura válida hasta que el servicio responda bien."
+                )
+
             nuevos_pdfs.append(pdf_path)
+            if item_cedula.get("tipo", "") == "TITULAR":
+                titular_generado = True
 
         if output_dir.exists() and not any(output_dir.iterdir()):
             try:
@@ -646,9 +684,11 @@ def _sincronizar_item(row: dict[str, Any], username: str) -> dict[str, Any]:
             "DIG_MENOR_EDAD": str(row.get("DIG_MENOR_EDAD", "")).strip(),
         }
     )
-    nuevos_pdfs = [local_dir / name for name in expected_pdf_names]
-    if not all(p.exists() and p.stat().st_size > 0 for p in nuevos_pdfs):
-        raise RuntimeError(f"No están completos los PDFs locales esperados en {local_dir}")
+    nuevos_pdfs = [local_dir / name for name in expected_pdf_names if (local_dir / name).exists() and (local_dir / name).stat().st_size > 0]
+    if not nuevos_pdfs:
+        raise RuntimeError(f"No hay PDFs locales válidos en {local_dir}")
+    if not (local_dir / expected_pdf_names[0]).exists() or (local_dir / expected_pdf_names[0]).stat().st_size <= 0:
+        raise RuntimeError(f"No existe el PDF del titular en {local_dir}")
     return _backup_y_reemplazar_solo_cc(
         destino_dir=destino_dir,
         tramite=tramite,
