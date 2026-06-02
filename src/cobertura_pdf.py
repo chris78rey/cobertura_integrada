@@ -108,8 +108,7 @@ def _pausa_entre_tramites() -> float:
 def _dias_busqueda_auto() -> int:
     """
     Si AUTO_FECHA_HASTA_DIAS_ATRAS viene definido con un entero positivo,
-    el worker deja de filtrar por FE_PLA_ANIOMES y usa DIG_FECHA_HASTA
-    del mes anterior completo.
+    el worker usa una ventana de trabajo de mes actual + mes anterior.
     """
     valor = str(os.environ.get("AUTO_FECHA_HASTA_DIAS_ATRAS", "") or "").strip()
     if not valor.isdigit():
@@ -1511,8 +1510,10 @@ def _obtener_registros_automaticos(
 
     if dias_busqueda_auto > 0:
         sql += """
-              AND TRUNC(DIG_FECHA_HASTA) >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -1)
-              AND TRUNC(DIG_FECHA_HASTA) < TRUNC(SYSDATE, 'MM')
+              AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) IN (
+                    TO_CHAR(SYSDATE, 'YYYYMM'),
+                    TO_CHAR(ADD_MONTHS(SYSDATE, -1), 'YYYYMM')
+              )
         """
     else:
         sql += """
@@ -1564,7 +1565,7 @@ def _obtener_registros_automaticos(
     sql += """
             ORDER BY
                 """ + (
-                    "TRUNC(DIG_FECHA_HASTA) DESC,"
+                    "TRIM(TO_CHAR(FE_PLA_ANIOMES)) DESC,"
                     if dias_busqueda_auto > 0
                     else "TRIM(TO_CHAR(FE_PLA_ANIOMES)) DESC,"
                 ) + """
@@ -1718,8 +1719,10 @@ def _contar_pendientes_automaticos(
 
     if dias_busqueda_auto > 0:
         sql += """
-          AND TRUNC(DIG_FECHA_HASTA) >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -1)
-          AND TRUNC(DIG_FECHA_HASTA) < TRUNC(SYSDATE, 'MM')
+          AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) IN (
+                TO_CHAR(SYSDATE, 'YYYYMM'),
+                TO_CHAR(ADD_MONTHS(SYSDATE, -1), 'YYYYMM')
+          )
         """
     else:
         sql += """
@@ -1784,7 +1787,7 @@ def generar_coberturas_automaticas_desde_mes(
 ) -> dict[str, Any]:
     """
     Flujo automático:
-    1. Consulta registros con FE_PLA_ANIOMES >= x, COBERTURA='N', PLANILLADO='S'
+    1. Consulta registros del mes actual y del mes anterior, COBERTURA='N', PLANILLADO='S'
     2. Por cada fila: genera PDF de cobertura para titular y dependientes
     3. Solo si el PDF existe fÃ­sicamente, actualiza DIG_COBERTURA='S'
     4. Genera manifiesto CSV de auditorÃ­a

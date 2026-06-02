@@ -71,8 +71,10 @@ def contar_pendientes(username: str, password: str, fe_pla_aniomes_desde: str, d
     params: list[str | int] = []
     if dias_busqueda_auto > 0:
         sql += (
-            " AND TRUNC(DIG_FECHA_HASTA) >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -1)"
-            " AND TRUNC(DIG_FECHA_HASTA) < TRUNC(SYSDATE, 'MM')"
+            " AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) IN ("
+            " TO_CHAR(SYSDATE, 'YYYYMM'),"
+            " TO_CHAR(ADD_MONTHS(SYSDATE, -1), 'YYYYMM')"
+            " )"
         )
     else:
         sql += " AND TRIM(TO_CHAR(FE_PLA_ANIOMES)) >= ?"
@@ -143,7 +145,7 @@ def _run_cycle() -> int:
                 "retry_count": 0,
                 "detalle": (
                     (
-                        "Ventana del mes anterior restaurada desde AUTO_FECHA_HASTA_DIAS_ATRAS "
+                        "Ventana del mes actual y el anterior restaurada desde AUTO_FECHA_HASTA_DIAS_ATRAS "
                         if _dias_busqueda_auto() > 0
                         else "Mes de trabajo restaurado desde AUTO_FE_PLA_ANIOMES_DESDE "
                     )
@@ -164,8 +166,8 @@ def _run_cycle() -> int:
         retry_count=0,
         detalle=(
             (
-                "Worker revisando Oracle para el mes anterior"
-                        if _dias_busqueda_auto() > 0
+                "Worker revisando Oracle para el mes actual y el anterior"
+                if _dias_busqueda_auto() > 0
                 else f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
             )
             + (f" y trámite {dig_tramite}" if dig_tramite else "")
@@ -176,30 +178,14 @@ def _run_cycle() -> int:
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
                 (
-                    "No hay pendientes en el mes anterior. Sistema vigilando."
+                    "No hay pendientes en el mes actual y el anterior. Sistema vigilando."
                     if _dias_busqueda_auto() > 0
                     else f"No hay pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. Sistema vigilando."
                 ),
-                sync_pending=False)
+                sync_pending=False,
+            )
             log("[INFO] Sin pendientes. El loop sigue vigilando.")
         return 0
-
-        guardar_estado_job({"enabled": True, "status": "RUNNING_BY_WORKER",
-                        "last_error": "", "retry_count": 0,
-                        "pendientes_antes": pendientes_antes,
-                        "pendientes_despues": "",
-                        "last_generados": "",
-                        "last_actualizados": "",
-                        "last_errores": "",
-                        "detalle": (
-                            (
-                                "Worker revisando Oracle para el mes anterior"
-                                if _dias_busqueda_auto() > 0
-                                else f"Worker revisando Oracle para FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}"
-                            )
-                            + (f" y trámite {dig_tramite}" if dig_tramite else "")
-                        ),
-                        })
 
     try:
         heartbeat_job(
@@ -278,9 +264,9 @@ def _run_cycle() -> int:
         if modo_vigilante:
             marcar_job_vigilando_sin_pendientes(
                 (
-                    "Terminados pendientes actuales del mes anterior. "
+                    "Terminados pendientes del mes actual y el anterior. "
                     if _dias_busqueda_auto() > 0
-                    else f"Terminados pendientes actuales con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
+                    else f"Terminados pendientes con FE_PLA_ANIOMES >= {fe_pla_aniomes_desde}. "
                 )
                 + "Sistema vigilando.",
                 sync_pending=False,

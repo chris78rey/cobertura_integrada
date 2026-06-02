@@ -1649,7 +1649,7 @@ def dashboard_page():
     dias_busqueda_auto = _dias_busqueda_auto()
 
     subtitulo_ventana = (
-        "mes anterior"
+        "mes actual y anterior"
         if dias_busqueda_auto > 0
         else f"mes {mes_por_defecto}"
     )
@@ -1695,7 +1695,7 @@ def dashboard_page():
         "Seleccione cómo desea procesar",
         options=[
             (
-                "Procesar por mes anterior"
+                "Procesar por mes actual y anterior"
                 if dias_busqueda_auto > 0
                 else "Procesar por mes desde"
             ),
@@ -1751,7 +1751,7 @@ def dashboard_page():
         fe_pla_aniomes_desde = mes_por_defecto
         mes_valido = True
         st.info(
-            "Modo activo: se procesarán registros con DIG_FECHA_HASTA del mes anterior completo."
+            "Modo activo: se procesarán registros del mes actual y del mes anterior."
         )
     else:
         mes_key = f"fe_pla_aniomes_desde_input_{st.session_state.input_reset_counter}"
