@@ -1414,6 +1414,51 @@ def generar_hojas_cobertura_por_id(
     }
 
 
+def _leer_planillado_actual(
+    username: str,
+    password: str,
+    dig_tramite: str,
+    timeout_seconds: int = 30,
+) -> list[str]:
+    """
+    Relee DIG_PLANILLADO del trámite justo antes de generar sus PDFs.
+
+    Motivo: el procedimiento Oracle PCK_DIGITALIZACION.p_sin_planillar pone
+    DIG_PLANILLADO='S' en toda la tabla, hace COMMIT y luego regresa a 'N'
+    fila por fila. Durante esa ventana el lote puede traer trámites que en
+    realidad no están planillados.
+
+    Devuelve los valores (TRIM) de todas las filas del trámite.
+    Lanza excepción si la consulta falla; el llamador decide qué hacer.
+    """
+    conn = None
+    prepared_statement = None
+    result_set = None
+    valores: list[str] = []
+    try:
+        conn = oracle_connect(username, password)
+        prepared_statement = conn.jconn.prepareStatement(
+            """
+            SELECT TRIM(NVL(DIG_PLANILLADO, ''))
+            FROM DIGITALIZACION.DIGITALIZACION
+            WHERE TO_CHAR(DIG_TRAMITE) = ?
+            """
+        )
+        prepared_statement.setString(1, str(dig_tramite or "").strip())
+        prepared_statement.setQueryTimeout(int(timeout_seconds))
+        result_set = prepared_statement.executeQuery()
+        while result_set.next():
+            valores.append(str(result_set.getString(1) or "").strip())
+        return valores
+    finally:
+        for recurso in (result_set, prepared_statement, conn):
+            if recurso is not None:
+                try:
+                    recurso.close()
+                except Exception:
+                    pass
+
+
 def _obtener_registros_automaticos(
     username: str,
     password: str,
@@ -2059,6 +2104,50 @@ def generar_coberturas_automaticas_desde_mes(
                             "estado": "INICIANDO",
                         },
                     )
+
+                # Doble verificación de DIG_PLANILLADO antes de tocar carpetas o
+                # generar PDFs (ver _leer_planillado_actual). Si el trámite ya no
+                # está planillado, se omite SIN contarlo como fallo, para que no
+                # termine marcado como X, y se excluye del resto de esta corrida.
+                try:
+                    planillado_actual = _leer_planillado_actual(username, password, tramite)
+                except Exception as exc:
+                    planillado_actual = None
+                    logger.error(
+                        "PLANILLADO_RECHECK_ERROR",
+                        exc,
+                        index=index,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        detalle="No se pudo releer DIG_PLANILLADO; se continúa con el dato del lote.",
+                    )
+
+                if planillado_actual is not None and "S" not in planillado_actual:
+                    dig_id_tramite_fallidos_en_corrida.add(clave_exclusion)
+                    detalle_omision = (
+                        f"Omitido: DIG_PLANILLADO actual={','.join(planillado_actual) or 'SIN_FILAS'} "
+                        f"(el lote lo trajo como 'S'). No se generan PDFs ni se cuenta como fallo."
+                    )
+                    logger.event(
+                        "ROW_SKIPPED_NOT_PLANILLADO",
+                        index=index,
+                        fe_pla_aniomes=fe_pla,
+                        dig_tramite=tramite,
+                        dig_id_tramite=dig_id_tramite,
+                        planillado_actual=planillado_actual,
+                        detalle=detalle_omision,
+                    )
+                    _registrar_resumen_ciclico(
+                        run_id=run_id,
+                        tramite=tramite,
+                        cedula=cedula,
+                        estado="OMITIDO_NO_PLANILLADO",
+                        fecha_hasta=fecha_hasta,
+                        fecha_alta=fecha_alta,
+                        pdfs_generados=[],
+                        detalle=detalle_omision,
+                    )
+                    continue
 
                 planilla_dir = output_root / _safe_name(tramite)
                 carpeta_archivada = _archivar_carpeta_tramite_si_corresponde(planilla_dir)

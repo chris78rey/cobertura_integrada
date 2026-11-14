@@ -23,12 +23,19 @@ SERVICE_NAME = "cobertura-auto-resume.service"
 TIMER_NAME = "cobertura-auto-resume.timer"
 DEFAULT_STALE_MINUTES = 5
 DEFAULT_COOLDOWN_MINUTES = 10
+# COBERTURA_WATCHDOG_DRY_RUN=1: evalúa y muestra el veredicto, pero no ejecuta
+# systemctl ni escribe archivos de estado/log. Útil para probar cambios.
+DRY_RUN = os.environ.get("COBERTURA_WATCHDOG_DRY_RUN", "").strip() == "1"
+# Estados en los que el worker está vivo en su loop y debe dar señales de vida.
+HEARTBEAT_STATUSES = {"RUNNING", "RUNNING_BY_WORKER", "SYNC_ACTIVE", "WATCHING_NO_PENDING"}
 
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    if DRY_RUN:
+        return
     WATCHDOG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with WATCHDOG_LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -68,12 +75,33 @@ def _systemctl_is_active(unit: str) -> str:
     return (completed.stdout or "").strip()
 
 
-def _systemctl_restart(unit: str) -> None:
-    subprocess.run(["systemctl", "restart", unit], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def _systemctl_action(action: str, unit: str) -> tuple[bool, str]:
+    """Ejecuta systemctl y devuelve (ok, detalle). Antes el error se descartaba en silencio."""
+    if DRY_RUN:
+        return True, f"DRY_RUN: no se ejecutó systemctl {action} {unit}"
+    try:
+        completed = subprocess.run(
+            ["systemctl", action, unit],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"systemctl {action} lanzó excepción: {exc}"
+    if completed.returncode != 0:
+        err = (completed.stderr or "").strip().replace("\n", " ")[:300]
+        return False, f"systemctl {action} rc={completed.returncode}: {err or 'sin detalle'}"
+    return True, ""
 
 
-def _systemctl_start(unit: str) -> None:
-    subprocess.run(["systemctl", "start", unit], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def _systemctl_restart(unit: str) -> tuple[bool, str]:
+    return _systemctl_action("restart", unit)
+
+
+def _systemctl_start(unit: str) -> tuple[bool, str]:
+    return _systemctl_action("start", unit)
 
 
 def _systemctl_show_main_pid(unit: str) -> int:
@@ -189,40 +217,63 @@ def main() -> int:
     sync_age = sync_info.get("elapsed")
 
     sync_active = bool(state.get("sync_active"))
-    sync_since_age = _age_seconds(str(state.get("sync_active_since", "")))
     progress_age = _age_seconds(str(state.get("last_progress_at", "")))
+    state_updated_age = _age_seconds(str(state.get("updated_at", "")))
     status = str(state.get("status", "")).strip()
     enabled = bool(state.get("enabled"))
+
+    # Inactividad = tiempo desde la señal de vida MÁS RECIENTE (min), no la más
+    # antigua. El tiempo de vida del proceso (main_pid_age) NO es una señal de
+    # vida: antes se usaba max(...) incluyéndolo, y cualquier worker con más de
+    # 5 min de vida parecía "trabado" (miles de RESTART falsos en el log).
+    heartbeats = [float(v) for v in (last_log_age, progress_age, state_updated_age) if v is not None]
+    inactivity = min(heartbeats) if heartbeats else None
+    in_cooldown = restart_age is not None and restart_age <= cooldown_seconds
+    recently_started = main_pid_age is not None and main_pid_age <= stale_seconds
 
     verdict = Verdict(action="noop", reason="Sin indicios de estancamiento.")
 
     if enabled and service_active == "inactive" and timer_active == "active":
-        _systemctl_start(SERVICE_NAME)
-        verdict = Verdict(action="start", reason="Servicio inactivo con timer activo y reanudación habilitada.")
+        ok, detail = _systemctl_start(SERVICE_NAME)
+        verdict = Verdict(
+            action="start" if ok else "start_failed",
+            reason="Servicio inactivo con timer activo y reanudación habilitada."
+            + ("" if ok else f" FALLÓ: {detail}"),
+        )
 
     if enabled and service_active in {"active", "activating"}:
         if sync_active:
             verdict = Verdict(action="noop", reason="Sync activo: no se reinicia por watchdog.")
-        elif status in {"WATCHING_NO_PENDING", "WAITING_OTHER_PROCESS"}:
+        elif status == "WAITING_OTHER_PROCESS":
             verdict = Verdict(action="noop", reason=f"Estado {status}: no se reinicia por watchdog.")
-        elif status in {"RUNNING", "RUNNING_BY_WORKER", "SYNC_ACTIVE"}:
-            candidates: list[float] = []
-            for value in (last_log_age, progress_age):
-                if value is not None:
-                    candidates.append(float(value))
-            if main_pid_age is not None:
-                candidates.append(float(main_pid_age))
-            if candidates:
-                oldest = max(candidates)
-                if oldest > stale_seconds and (restart_age is None or restart_age > cooldown_seconds):
-                    _systemctl_restart(SERVICE_NAME)
-                    verdict = Verdict(
-                        action="restart",
-                        reason=(
-                            f"Estado {status} sin actividad reciente por {int(oldest // 60)} min. "
-                            f"PID={main_pid}, sync_pid={sync_info.get('pid', 0)}."
-                        ),
-                    )
+        elif status in HEARTBEAT_STATUSES:
+            if inactivity is None:
+                verdict = Verdict(action="noop", reason=f"Estado {status}: sin señales de vida medibles; no se reinicia.")
+            elif inactivity <= stale_seconds:
+                verdict = Verdict(
+                    action="noop",
+                    reason=f"Estado {status}: última señal de vida hace {int(inactivity)} s.",
+                )
+            elif recently_started:
+                verdict = Verdict(action="noop", reason=f"Estado {status}: proceso recién iniciado ({main_pid_age} s).")
+            elif in_cooldown:
+                verdict = Verdict(
+                    action="noop",
+                    reason=(
+                        f"Estado {status} sin señales de vida por {int(inactivity // 60)} min, "
+                        f"pero en enfriamiento tras reinicio ({int(restart_age or 0)} s)."
+                    ),
+                )
+            else:
+                ok, detail = _systemctl_restart(SERVICE_NAME)
+                verdict = Verdict(
+                    action="restart" if ok else "restart_failed",
+                    reason=(
+                        f"Estado {status} sin señales de vida por {int(inactivity // 60)} min. "
+                        f"PID={main_pid}, sync_pid={sync_info.get('pid', 0)}."
+                        + ("" if ok else f" FALLÓ: {detail}")
+                    ),
+                )
 
     snapshot = {
         "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -239,17 +290,21 @@ def main() -> int:
         "sync_active_tramite": state.get("sync_active_tramite", ""),
         "sync_active_since": state.get("sync_active_since", ""),
         "last_progress_at": state.get("last_progress_at", ""),
+        "state_updated_at": state.get("updated_at", ""),
+        "inactivity_seconds": inactivity,
         "verdict": verdict.__dict__,
         "last_restart_at": watchdog_state.get("last_restart_at", ""),
     }
-    if verdict.action == "restart":
+    if verdict.action in {"restart", "restart_failed"}:
+        # También en el intento fallido, para aplicar el enfriamiento y no
+        # reintentar (ni llenar el log) cada minuto.
         snapshot["last_restart_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
-        _save_json(WATCHDOG_STATE_PATH, snapshot)
-        log(f"RESTART: {verdict.reason}")
-        return 0
 
-    _save_json(WATCHDOG_STATE_PATH, snapshot)
-    log(f"OK: {verdict.reason}")
+    if not DRY_RUN:
+        _save_json(WATCHDOG_STATE_PATH, snapshot)
+
+    labels = {"restart": "RESTART", "restart_failed": "RESTART_FAILED", "start": "START", "start_failed": "START_FAILED"}
+    log(f"{labels.get(verdict.action, 'OK')}: {verdict.reason}")
     return 0
 
 
