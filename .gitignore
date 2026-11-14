@@ -16,3 +16,6 @@ repomix-compacto.xml
 repomix-output.xml
 streamlit.log
 scripts/*.bak_streamlit_sync_*
+
+# Checkpoint local de sesión del agente
+.task_scratch

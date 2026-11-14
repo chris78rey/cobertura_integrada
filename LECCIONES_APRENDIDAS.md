@@ -149,6 +149,45 @@ No deben reemplazar al worker principal sin revisión.
 - destino no se inventa
 - `CC*.pdf` son los únicos PDFs que se copian
 
+## 13. Watchdog: el tiempo de vida del proceso no es inactividad (2026-11-14)
+
+**Error:** el watchdog calculaba la inactividad con `max(log, progreso, vida_del_proceso)`. Cualquier worker con más de 5 min de vida parecía "trabado". El log acumuló más de 8 000 `RESTART` falsos.
+
+**Por qué no hizo daño:** el watchdog corre como `spd-he1`, sin permiso para `systemctl restart`, y descartaba el error. Ningún reinicio se ejecutó; el efecto real era que **no había watchdog**.
+
+**Corrección (commit 64c97d4):** inactividad = `min(...)` de señales de vida reales (journal, `last_progress_at`, `updated_at` del estado). Se revisa el código de salida de `systemctl` y se registra `RESTART_FAILED`.
+
+**Regla:**
+- Medir inactividad por la señal de vida **más reciente**, nunca por la más antigua ni por la edad del proceso.
+- Toda acción correctiva (reinicio, UPDATE) debe revisar su resultado y dejarlo en el log.
+- Probar cambios del watchdog con `COBERTURA_WATCHDOG_DRY_RUN=1`: el timer lo ejecuta cada minuto desde el repo, así que editarlo es desplegarlo.
+
+## 14. Oracle cambia `DIG_PLANILLADO` por debajo del worker (2026-11-14)
+
+**Síntoma:** trámites del mes anterior generaban PDFs y luego fallaban con `ERROR_ACTUALIZANDO_ORACLE: No se actualiza porque DIG_PLANILLADO=N`, corrida tras corrida.
+
+**Causa raíz (fuera del repo):** `PCK_DIGITALIZACION.p_sin_planillar` hace `UPDATE digitalizacion SET dig_planillado = 'S'` en **toda la tabla**, `COMMIT`, y luego regresa a `N` fila por fila los que no tienen cuenta en `sis.cuentas`. El lote del worker captura esa ventana.
+
+**Corrección (commit 64c97d4):** se relee `DIG_PLANILLADO` justo antes de archivar la carpeta o generar PDFs. Si ya no es `S`, el trámite queda `OMITIDO_NO_PLANILLADO`, sin generar PDFs y **sin contarlo como fallo** (no pasa a `X`).
+
+**Regla:**
+- Un dato leído en lote puede cambiar antes de usarlo: revalidar justo antes de una acción costosa o irreversible.
+- Una omisión por dato externo no es un fallo del trámite; no debe sumar reintentos hacia `X`.
+- Pendiente con el DBA: reescribir `p_sin_planillar` sin el UPDATE masivo.
+
+## 15. Los `X` no vuelven solos a `N` si el job 5407 está roto (2026-11-14)
+
+- El job Oracle 5407 `PR_CORRIGE_DIG_2_MESES` (diario 06:00) pasa `X` a `N` en el mes actual y el anterior.
+- Estaba en `BROKEN = Y`, sin última ejecución. Por eso los `X` quedaban abandonados y hubo que resetearlos con un UPDATE manual.
+- **Regla:** si se acumulan `X`, revisar primero `USER_JOBS` (`BROKEN`, `FAILURES`) antes de buscar el problema en el worker.
+- Diagnóstico: un conteo de solo lectura por `FE_PLA_ANIOMES` y `DIG_COBERTURA` muestra en segundos si hay `X` acumulados.
+
+## 16. Verificar la hipótesis antes de cambiar código (2026-11-14)
+
+- El primer diagnóstico ("el worker estuvo trabado 15 horas") era falso: el worker estaba bien, en vigilancia, porque los pendientes estaban en `X`, no en `N`.
+- El dato engañoso fue el propio log del watchdog (sección 13).
+- **Regla:** antes de corregir, contrastar el síntoma con al menos dos fuentes independientes: journal del servicio, log JSONL de la corrida, `systemctl show` (`NRestarts`, `MainPID`) y Oracle.
+
 ---
 
-Última actualización: 2026-05-14
+Última actualización: 2026-11-14
