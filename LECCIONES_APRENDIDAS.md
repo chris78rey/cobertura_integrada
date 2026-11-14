@@ -153,9 +153,11 @@ No deben reemplazar al worker principal sin revisión.
 
 **Error:** el watchdog calculaba la inactividad con `max(log, progreso, vida_del_proceso)`. Cualquier worker con más de 5 min de vida parecía "trabado". El log acumuló más de 8 000 `RESTART` falsos.
 
-**Por qué no hizo daño:** el watchdog corre como `spd-he1`, sin permiso para `systemctl restart`, y descartaba el error. Ningún reinicio se ejecutó; el efecto real era que **no había watchdog**.
+**Por qué no hizo daño:** el watchdog corre como `spd-he1` y llamaba a `systemctl restart` **sin `sudo`**, así que fallaba y descartaba el error. Ningún reinicio se ejecutó; el efecto real era que **no había watchdog**. El permiso sí existía: sudoers da a `spd-he1` `NOPASSWD: /usr/bin/systemctl *, /usr/bin/journalctl *` (lo usa el bot de Telegram).
 
 **Corrección (commit 64c97d4):** inactividad = `min(...)` de señales de vida reales (journal, `last_progress_at`, `updated_at` del estado). Se revisa el código de salida de `systemctl` y se registra `RESTART_FAILED`.
+
+**Segunda corrección (2026-11-14):** reinicio con `sudo -n /usr/bin/systemctl ...` y umbral de 10 min (hueco máximo real entre señales de vida ~99 s en 51 corridas; la consulta del lote a Oracle tiene timeout de 300 s).
 
 **Regla:**
 - Medir inactividad por la señal de vida **más reciente**, nunca por la más antigua ni por la edad del proceso.

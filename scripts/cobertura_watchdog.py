@@ -21,7 +21,10 @@ WATCHDOG_STATE_PATH = PROJECT_ROOT / "logs" / "cobertura_watchdog_state.json"
 WATCHDOG_LOG_PATH = PROJECT_ROOT / "logs" / "cobertura_watchdog.log"
 SERVICE_NAME = "cobertura-auto-resume.service"
 TIMER_NAME = "cobertura-auto-resume.timer"
-DEFAULT_STALE_MINUTES = 5
+# 10 min: el hueco máximo observado entre señales de vida de un trámite normal
+# es ~99 s, y la consulta del lote a Oracle tiene timeout de 300 s; con 5 min
+# una consulta lenta pero viva podía disparar un reinicio real.
+DEFAULT_STALE_MINUTES = 10
 DEFAULT_COOLDOWN_MINUTES = 10
 # COBERTURA_WATCHDOG_DRY_RUN=1: evalúa y muestra el veredicto, pero no ejecuta
 # systemctl ni escribe archivos de estado/log. Útil para probar cambios.
@@ -81,7 +84,10 @@ def _systemctl_action(action: str, unit: str) -> tuple[bool, str]:
         return True, f"DRY_RUN: no se ejecutó systemctl {action} {unit}"
     try:
         completed = subprocess.run(
-            ["systemctl", action, unit],
+            # spd-he1 tiene NOPASSWD para /usr/bin/systemctl en sudoers; sin
+            # sudo, restart/start fallan con "Interactive authentication required".
+            # -n: nunca pedir contraseña (falla rápido y queda en RESTART_FAILED).
+            ["sudo", "-n", "/usr/bin/systemctl", action, unit],
             text=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
