@@ -19,3 +19,8 @@ scripts/*.bak_streamlit_sync_*
 
 # Checkpoint local de sesión del agente
 .task_scratch
+
+# Graphify: solo se versionan el grafo y el informe (como en digitalizacion_he1)
+graphify-out/*
+!graphify-out/graph.json
+!graphify-out/GRAPH_REPORT.md
