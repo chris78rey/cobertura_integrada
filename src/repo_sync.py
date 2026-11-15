@@ -12,6 +12,26 @@ PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
 _INDICE_DESTINOS_CACHE: dict[str, dict[str, list[Path]]] = {}
 
 
+def _destinos_vigentes(repo_scan_root: Path, tramite: str, cacheados: list[Path]) -> list[Path]:
+    """Rutas destino actuales de UN trámite, partiendo del índice en caché.
+
+    El índice se arma una sola vez por proceso, pero el repositorio cambia mientras
+    el worker sigue vivo: el generador crea carpetas nuevas y "Duplicados por cambio
+    de mes" (visor) pasa carpetas viejas a cuarentena. Sin esto, una carpeta retirada
+    seguía contando y el trámite fallaba con DESTINO_AMBIGUO hasta reiniciar el worker.
+    Se descartan rutas que ya no existen y se agregan las SERVICIO/<tramite> nuevas.
+    """
+    vigentes = {p for p in cacheados if p.is_dir()}
+    try:
+        for servicio in repo_scan_root.iterdir():
+            candidata = servicio / tramite
+            if candidata.is_dir():
+                vigentes.add(candidata)
+    except OSError:
+        pass
+    return sorted(vigentes)
+
+
 def _ejecutar_sync_repo_subproceso(
     output_dir: str,
     dig_tramite: str = "",
@@ -185,6 +205,9 @@ def ejecutar_sync_repo_directo_rapido(
                 _INDICE_DESTINOS_CACHE[cache_key] = construir_indice_destinos(repo_scan_root)
 
             indice_destinos = _INDICE_DESTINOS_CACHE[cache_key]
+            indice_destinos[str(tramite)] = _destinos_vigentes(
+                repo_scan_root, str(tramite), indice_destinos.get(str(tramite), [])
+            )
             conn = init_db(state_db)
 
             try:

@@ -190,6 +190,19 @@ No deben reemplazar al worker principal sin revisión.
 - El dato engañoso fue el propio log del watchdog (sección 13).
 - **Regla:** antes de corregir, contrastar el síntoma con al menos dos fuentes independientes: journal del servicio, log JSONL de la corrida, `systemctl show` (`NRestarts`, `MainPID`) y Oracle.
 
+## 17. Una caché en memoria de un proceso largo no ve los cambios del disco (2026-11-15)
+
+**Síntoma:** después de retirar la carpeta vieja de 12 trámites (`EMR10` → cuarentena, lote #1 de "Duplicados por cambio de mes" del visor), el sync siguió fallando con `DESTINO_AMBIGUO` y los 12 volvieron a `X`.
+
+**Causa:** `src/repo_sync.py` guarda el índice de carpetas destino en `_INDICE_DESTINOS_CACHE` una sola vez por proceso. El worker, vivo desde horas antes, seguía "viendo" la carpeta retirada. El mismo defecto escondía otro: tampoco veía las carpetas **nuevas** que el generador crea mientras el worker corre.
+
+**Corrección:** `_destinos_vigentes()` revisa en disco, para el trámite que se va a copiar, las rutas de la caché (descarta las que ya no existen) y las `SERVICIO/<tramite>` del año (agrega las nuevas). Cuesta ~1 ms.
+
+**Regla:**
+- Toda caché de un proceso que vive horas necesita una forma de invalidarse o de revalidar el dato justo antes de usarlo.
+- Cuando otro sistema mueve o retira carpetas, revisar quién las tiene en caché: aquí eran el worker de coberturas y los 2 procesos del visor (este último se resuelve con su reindexación).
+- Al reintentar trámites en `X`, primero asegurarse de que la causa ya no está: si no, en pocos ciclos vuelven a `X`.
+
 ---
 
-Última actualización: 2026-11-14
+Última actualización: 2026-11-15
