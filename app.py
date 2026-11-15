@@ -3,6 +3,7 @@
 # Login directo con DIGITALIZACION desde .env
 # =========================
 
+import hmac
 import os
 
 import streamlit as st
@@ -55,7 +56,12 @@ def _ui_login_gate():
     if st.session_state.get("ui_auth_ok"):
         return
 
-    ui_password = os.environ.get("APP_UI_PASSWORD", "cr19780302").strip()
+    # La clave vive solo en el .env (APP_UI_PASSWORD), nunca en el código: un valor por
+    # defecto aquí quedaría público en el repositorio. Sin clave configurada, no se abre.
+    ui_password = os.environ.get("APP_UI_PASSWORD", "").strip()
+    if not ui_password:
+        st.error("Acceso bloqueado: falta APP_UI_PASSWORD en el .env del servidor.")
+        st.stop()
 
     st.markdown(
         """
@@ -72,7 +78,7 @@ def _ui_login_gate():
         submitted = st.form_submit_button("Ingresar", use_container_width=True)
 
     if submitted:
-        if clave.strip() == ui_password:
+        if hmac.compare_digest(clave.strip().encode("utf-8"), ui_password.encode("utf-8")):
             st.session_state.ui_auth_ok = True
             st.rerun()
         else:
