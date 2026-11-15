@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -309,3 +310,82 @@ def ejecutar_sync_repo(
         replace_existing_cc=replace_existing_cc,
         timeout_seconds=timeout_seconds,
     )
+
+
+def ejecutar_publicacion_sftp_incremental_por_tramite(
+    tramites: list[str],
+    *,
+    project_root: Path | None = None,
+    timeout_seconds: int = 3600,
+) -> dict[str, Any]:
+    """
+    Publica hacia SFTP únicamente los trámites pedidos.
+
+    Usa scripts/refresh_sftp_mirror_by_tramite.sh y aprovecha el SUDOPASS
+    ya disponible en el entorno de la aplicación.
+    """
+
+    tramites_limpios = [str(t or "").strip() for t in tramites if str(t or "").strip()]
+    tramites_limpios = [t for t in tramites_limpios if t.isdigit()]
+
+    if not tramites_limpios:
+        return {
+            "ok": False,
+            "returncode": -4,
+            "stdout": "",
+            "stderr": "No se recibió ningún DIG_TRAMITE válido.",
+            "script": "",
+        }
+
+    root = Path(project_root or PROJECT_ROOT).resolve()
+    script = root / "scripts" / "refresh_sftp_mirror_by_tramite.sh"
+    if not script.exists():
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": f"No existe el script de publicación incremental: {script}",
+            "script": str(script),
+        }
+
+    env = dict(os.environ)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+
+    try:
+        completed = subprocess.run(
+            ["bash", str(script), *tramites_limpios],
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_seconds,
+            check=False,
+            env=env,
+        )
+        stdout = completed.stdout or ""
+        return {
+            "ok": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "stdout": stdout,
+            "stderr": "" if completed.returncode == 0 else stdout[-4000:],
+            "script": str(script),
+            "tramites": tramites_limpios,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "returncode": -2,
+            "stdout": "",
+            "stderr": f"Timeout publicando SFTP incremental: {exc}",
+            "script": str(script),
+            "tramites": tramites_limpios,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": -3,
+            "stdout": "",
+            "stderr": f"Error publicando SFTP incremental: {exc}",
+            "script": str(script),
+            "tramites": tramites_limpios,
+        }

@@ -874,6 +874,77 @@ def obtener_tramites_en_x(
             pass
 
 
+def obtener_tramite_por_id(
+    username: str,
+    password: str,
+    dig_id_tramite: str,
+) -> dict[str, str]:
+    """
+    Resuelve un DIG_ID_TRAMITE exacto hacia su fila operativa.
+
+    No actualiza nada.
+    """
+    dig_id_tramite = str(dig_id_tramite or "").strip()
+    if not dig_id_tramite.isdigit():
+        return {}
+
+    conn = oracle_connect(username, password)
+    pstmt = None
+    rs = None
+
+    sql = """
+        SELECT *
+        FROM (
+            SELECT
+                TO_CHAR(d.DIG_ID_TRAMITE)      AS DIG_ID_TRAMITE,
+                TO_CHAR(d.DIG_ID_GENERACION)   AS DIG_ID_GENERACION,
+                TO_CHAR(d.DIG_TRAMITE)         AS DIG_TRAMITE,
+                TRIM(d.DIG_CEDULA)             AS DIG_CEDULA,
+                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) AS FE_PLA_ANIOMES,
+                TRIM(NVL(d.DIG_PLANILLADO, '')) AS DIG_PLANILLADO,
+                TRIM(NVL(d.DIG_COBERTURA, ''))  AS DIG_COBERTURA,
+                TRIM(NVL(d.DIG_DEPENDIENTE_01, '')) AS DIG_DEPENDIENTE_01,
+                TRIM(NVL(d.DIG_DEPENDIENTE_02, '')) AS DIG_DEPENDIENTE_02,
+                TO_CHAR(d.DIG_FECHA_PLANILLA, 'YYYY-MM-DD HH24:MI:SS') AS DIG_FECHA_PLANILLA,
+                TO_CHAR(d.DIG_FECHA_HASTA, 'YYYY-MM-DD HH24:MI:SS') AS DIG_FECHA_HASTA,
+                TO_CHAR(d.DIG_FECHA_ALTA, 'YYYY-MM-DD HH24:MI:SS') AS DIG_FECHA_ALTA,
+                TRIM(NVL(d.DIG_MENOR_EDAD, '')) AS DIG_MENOR_EDAD
+            FROM DIGITALIZACION.DIGITALIZACION d
+            WHERE TO_CHAR(d.DIG_ID_TRAMITE) = ?
+            ORDER BY
+                TRIM(TO_CHAR(d.FE_PLA_ANIOMES)) DESC,
+                TO_DATE(NVL(TO_CHAR(d.DIG_FECHA_HASTA, 'YYYY-MM-DD'), '1900-01-01'), 'YYYY-MM-DD') DESC,
+                TO_CHAR(d.DIG_TRAMITE) DESC
+        )
+        WHERE ROWNUM <= 1
+    """
+
+    try:
+        pstmt = conn.jconn.prepareStatement(sql)
+        pstmt.setString(1, dig_id_tramite)
+        pstmt.setQueryTimeout(20)
+
+        rs = pstmt.executeQuery()
+        if not rs.next():
+            return {}
+
+        meta = rs.getMetaData()
+        row: dict[str, str] = {}
+        for idx in range(1, meta.getColumnCount() + 1):
+            col_name = meta.getColumnLabel(idx)
+            value = rs.getString(idx)
+            row[col_name] = value.strip() if isinstance(value, str) else ""
+        return row
+
+    finally:
+        for obj in (rs, pstmt, conn):
+            if obj:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
 # =========================
 # FIN
 # =========================

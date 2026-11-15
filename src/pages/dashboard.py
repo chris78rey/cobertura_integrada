@@ -26,15 +26,20 @@ from src.auto_resume_state import (
     _parse_ts,
     reiniciar_fallos_tramite,
 )
+from src.repo_sync import (
+    ejecutar_publicacion_sftp_incremental_por_tramite,
+)
 from src.operator_tools import (
     exportar_estado_json,
 )
 from src.oracle_jdbc import (
     actualizar_cobertura_por_tramite_valor,
     corregir_cobertura_x_mes_actual_y_anterior,
+    obtener_tramite_por_id,
     obtener_tramites_en_cola,
     obtener_tramites_en_x,
 )
+from src.repo_sync import ejecutar_publicacion_sftp_incremental_por_tramite
 
 
 def _reset_all():
@@ -1729,19 +1734,88 @@ def dashboard_page():
 
         if dig_tramite_input and dig_tramite_input.isdigit():
             st.markdown("#### Acciones rápidas")
-            if st.button(
-                "📦 Enviar trámite a cola de resincronización",
-                key="btn_cola_sync",
-                use_container_width=True,
-                help="NO genera PDF. NO toca Oracle. Solo intenta sincronizar PDFs existentes al repositorio.",
-            ):
-                from src.auto_resume_state import marcar_tramite_sync_pendiente
-                marcar_tramite_sync_pendiente(
-                    tramite=dig_tramite_input,
-                    source_dir=f"/data_nuevo/coberturas/{dig_tramite_input}",
-                )
-                st.success(f"Trámite {dig_tramite_input} enviado a cola de resincronización.")
-                st.info("El worker lo procesará en la siguiente pasada.")
+            col_q1, col_q2 = st.columns(2)
+            with col_q1:
+                if st.button(
+                    "📦 Cola resincronización",
+                    key="btn_cola_sync",
+                    use_container_width=True,
+                    help="NO genera PDF. NO toca Oracle. Solo intenta sincronizar PDFs existentes al repositorio.",
+                ):
+                    from src.auto_resume_state import marcar_tramite_sync_pendiente
+                    marcar_tramite_sync_pendiente(
+                        tramite=dig_tramite_input,
+                        source_dir=f"/data_nuevo/coberturas/{dig_tramite_input}",
+                    )
+                    st.success(f"Trámite {dig_tramite_input} enviado a cola de resincronización.")
+                    st.info("El worker lo procesará en la siguiente pasada.")
+            with col_q2:
+                if st.button(
+                    "📤 Publicar en SFTP",
+                    key="btn_publicar_sftp_incremental",
+                    use_container_width=True,
+                    help="Publica solo este trámite en el SFTP leyendo el árbol origen y evitando copiar todo el repositorio.",
+                ):
+                    with st.spinner(f"Publicando trámite {dig_tramite_input} en SFTP..."):
+                        resultado_sftp = ejecutar_publicacion_sftp_incremental_por_tramite(
+                            [dig_tramite_input],
+                        )
+
+                    if resultado_sftp.get("ok"):
+                        st.success(f"Trámite {dig_tramite_input} publicado en SFTP.")
+                        if resultado_sftp.get("stdout"):
+                            st.code(resultado_sftp.get("stdout"), language="text")
+                    else:
+                        st.error(
+                            f"No se pudo publicar el trámite {dig_tramite_input} en SFTP."
+                        )
+                        if resultado_sftp.get("stderr"):
+                            st.code(resultado_sftp.get("stderr"), language="text")
+
+            id_tramite_publicar = st.text_input(
+                "ID trámite para publicar en SFTP",
+                value=st.session_state.get("id_tramite_publicar", ""),
+                key=f"id_tramite_publicar_{st.session_state.input_reset_counter}",
+                help="Si ingresas un DIG_ID_TRAMITE, primero se resuelve el DIG_TRAMITE asociado y luego se publica solo ese trámite en SFTP.",
+            ).strip()
+
+            if id_tramite_publicar:
+                st.caption(f"Se resolverá DIG_ID_TRAMITE={id_tramite_publicar} antes de publicar.")
+                if st.button(
+                    "🔎 Resolver y publicar por ID",
+                    key="btn_publicar_sftp_por_id",
+                    use_container_width=True,
+                    help="Busca el DIG_TRAMITE asociado al ID y publica solo ese trámite en SFTP.",
+                ):
+                    with st.spinner(f"Resolviendo ID {id_tramite_publicar} en Oracle..."):
+                        fila_id = obtener_tramite_por_id(
+                            username=username,
+                            password=password,
+                            dig_id_tramite=id_tramite_publicar,
+                        )
+
+                    tramite_resuelto = str(fila_id.get("DIG_TRAMITE", "") or "").strip()
+                    if not tramite_resuelto:
+                        st.error(f"No se encontró un trámite asociado al ID {id_tramite_publicar}.")
+                    else:
+                        st.info(
+                            f"ID {id_tramite_publicar} resuelto a trámite {tramite_resuelto}. "
+                            "Ahora se publicará solo ese trámite en SFTP."
+                        )
+                        with st.spinner(f"Publicando trámite {tramite_resuelto} en SFTP..."):
+                            resultado_sftp = ejecutar_publicacion_sftp_incremental_por_tramite(
+                                [tramite_resuelto],
+                            )
+                        if resultado_sftp.get("ok"):
+                            st.success(f"Trámite {tramite_resuelto} publicado en SFTP.")
+                            if resultado_sftp.get("stdout"):
+                                st.code(resultado_sftp.get("stdout"), language="text")
+                        else:
+                            st.error(
+                                f"No se pudo publicar el trámite {tramite_resuelto} en SFTP."
+                            )
+                            if resultado_sftp.get("stderr"):
+                                st.code(resultado_sftp.get("stderr"), language="text")
     else:
         tramite_valido = True
 
