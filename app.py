@@ -3,13 +3,12 @@
 # Login directo con DIGITALIZACION desde .env
 # =========================
 
-import hmac
 import os
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.oracle_jdbc import test_login
+from src.oracle_jdbc import login_with_role, test_login
 from src.pages.dashboard import dashboard_page
 from src.pages.cedulas_tramite import cedulas_tramite_page
 from src.pages.auditoria_menor_edad import auditoria_menor_edad_page
@@ -52,37 +51,42 @@ def _auto_login():
         st.stop()
 
 
+UI_REQUIRED_ROLE = os.environ.get("APP_UI_REQUIRED_ROLE", "SPD_ADMIN").strip() or "SPD_ADMIN"
+
+
 def _ui_login_gate():
+    """Acceso con usuario y clave de Oracle; solo entra quien tenga el rol SPD_ADMIN."""
     if st.session_state.get("ui_auth_ok"):
         return
 
-    # La clave vive solo en el .env (APP_UI_PASSWORD), nunca en el código: un valor por
-    # defecto aquí quedaría público en el repositorio. Sin clave configurada, no se abre.
-    ui_password = os.environ.get("APP_UI_PASSWORD", "").strip()
-    if not ui_password:
-        st.error("Acceso bloqueado: falta APP_UI_PASSWORD en el .env del servidor.")
-        st.stop()
-
     st.markdown(
-        """
-        <div style="max-width: 460px; margin: 8rem auto 2rem auto; padding: 2rem 1.5rem; border: 1px solid #dbe3ef; border-radius: 16px; background: white; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);">
+        f"""
+        <div style="max-width: 460px; margin: 6rem auto 1rem auto; padding: 2rem 1.5rem; border: 1px solid #dbe3ef; border-radius: 16px; background: white; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);">
             <div style="font-size: 1.5rem; font-weight: 800; text-align: center; margin-bottom: 0.4rem;">Acceso restringido</div>
-            <div style="text-align: center; color: #475569; margin-bottom: 1.2rem;">Ingresa la clave para abrir la aplicación.</div>
+            <div style="text-align: center; color: #475569;">Ingresa tu usuario y clave de Oracle (rol {UI_REQUIRED_ROLE}).</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     with st.form("ui_login_form", clear_on_submit=False):
-        clave = st.text_input("Clave de acceso", type="password")
+        usuario = st.text_input("Usuario Oracle").strip()
+        clave = st.text_input("Contraseña Oracle", type="password")
         submitted = st.form_submit_button("Ingresar", use_container_width=True)
 
     if submitted:
-        if hmac.compare_digest(clave.strip().encode("utf-8"), ui_password.encode("utf-8")):
-            st.session_state.ui_auth_ok = True
-            st.rerun()
+        if not usuario or not clave:
+            st.warning("Debes ingresar usuario y contraseña.")
         else:
-            st.error("Clave incorrecta.")
+            with st.spinner("Validando contra Oracle..."):
+                result = login_with_role(usuario, clave, UI_REQUIRED_ROLE)
+            if result["ok"]:
+                st.session_state.ui_auth_ok = True
+                st.session_state.ui_user = result["db_user"]
+                st.rerun()
+            else:
+                st.error("No fue posible ingresar.")
+                st.code(result["error"])
 
     st.stop()
 

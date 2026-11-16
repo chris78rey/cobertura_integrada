@@ -106,6 +106,49 @@ def test_login(username: str, password: str) -> dict:
                 pass
 
 
+def login_with_role(username: str, password: str, role: str) -> dict:
+    """
+    Valida usuario/clave contra Oracle y exige que el usuario tenga `role`
+    (concedido directamente o por otro rol). La clave solo se usa para esta conexión.
+    """
+
+    conn = None
+
+    try:
+        conn = oracle_connect(username, password)
+        cursor = conn.cursor()
+        cursor.execute("SELECT USER FROM DUAL")
+        row = cursor.fetchone()
+        db_user = row[0] if row else username.upper()
+
+        cursor.execute(
+            "SELECT 1 FROM USER_ROLE_PRIVS WHERE GRANTED_ROLE = ? "
+            "UNION SELECT 1 FROM SESSION_ROLES WHERE ROLE = ?",
+            [role.upper(), role.upper()],
+        )
+        has_role = cursor.fetchone() is not None
+        cursor.close()
+
+        if not has_role:
+            return {
+                "ok": False,
+                "db_user": db_user,
+                "error": f"El usuario {db_user} no tiene el rol {role.upper()}.",
+            }
+
+        return {"ok": True, "db_user": db_user, "error": None}
+
+    except Exception as exc:
+        return {"ok": False, "db_user": None, "error": str(exc)}
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _java_resultset_to_dataframe(result_set) -> pd.DataFrame:
     """
     Convierte un ResultSet JDBC Java a pandas DataFrame.
