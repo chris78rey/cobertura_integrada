@@ -4,6 +4,7 @@
 # =========================
 
 import os
+import time
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -54,6 +55,32 @@ def _auto_login():
 UI_REQUIRED_ROLE = os.environ.get("APP_UI_REQUIRED_ROLE", "SPD_ADMIN").strip() or "SPD_ADMIN"
 
 
+LOGIN_MAX_FAILS = 3
+LOGIN_COOLDOWN_SECONDS = 30
+
+
+def _login_error_message(result: dict) -> str:
+    """Traduce el error técnico de Oracle a un mensaje claro para el usuario."""
+    if result.get("reason") == "no_role":
+        return (
+            f"Tu usuario es válido, pero no tiene permiso para esta aplicación "
+            f"(requiere el rol {UI_REQUIRED_ROLE}). Solicítalo al administrador."
+        )
+
+    raw = (result.get("error") or "").upper()
+
+    if "ORA-01017" in raw:
+        return "Usuario o contraseña incorrectos. Revísalos e inténtalo de nuevo."
+    if "ORA-28000" in raw:
+        return "Tu cuenta está bloqueada por intentos fallidos. Contacta al administrador de base de datos."
+    if "ORA-28001" in raw or "ORA-28002" in raw:
+        return "Tu contraseña de Oracle caducó. Cámbiala y vuelve a ingresar."
+    if "NINGÚN NODO" in raw or "ORA-12" in raw or "IO ERROR" in raw:
+        return "No se pudo conectar con la base de datos. Inténtalo en unos minutos o avisa a soporte."
+
+    return "No fue posible ingresar. Inténtalo de nuevo o avisa a soporte."
+
+
 def _ui_login_gate():
     """Acceso con usuario y clave de Oracle; solo entra quien tenga el rol SPD_ADMIN."""
     if st.session_state.get("ui_auth_ok"):
@@ -69,10 +96,19 @@ def _ui_login_gate():
         unsafe_allow_html=True,
     )
 
+    # Pausa breve tras varios fallos: evita bloquear la cuenta en Oracle por insistir.
+    wait = st.session_state.get("login_locked_until", 0) - time.time()
+    locked = wait > 0
+
     with st.form("ui_login_form", clear_on_submit=False):
-        usuario = st.text_input("Usuario Oracle").strip()
+        usuario = st.text_input("Usuario Oracle", placeholder="Ej: NOMBRE_APELLIDO").strip()
         clave = st.text_input("Contraseña Oracle", type="password")
-        submitted = st.form_submit_button("Ingresar", use_container_width=True)
+        submitted = st.form_submit_button("Ingresar", use_container_width=True, disabled=locked)
+
+    if locked:
+        st.warning(f"Demasiados intentos fallidos. Espera {int(wait) + 1} s antes de reintentar.")
+        time.sleep(1)
+        st.rerun()
 
     if submitted:
         if not usuario or not clave:
@@ -83,10 +119,18 @@ def _ui_login_gate():
             if result["ok"]:
                 st.session_state.ui_auth_ok = True
                 st.session_state.ui_user = result["db_user"]
+                st.session_state.login_fails = 0
                 st.rerun()
             else:
-                st.error("No fue posible ingresar.")
-                st.code(result["error"])
+                fails = st.session_state.get("login_fails", 0) + 1
+                st.session_state.login_fails = fails
+                st.error(_login_error_message(result))
+                if fails >= LOGIN_MAX_FAILS:
+                    st.session_state.login_fails = 0
+                    st.session_state.login_locked_until = time.time() + LOGIN_COOLDOWN_SECONDS
+                    st.rerun()
+                with st.expander("Detalle técnico"):
+                    st.code(result["error"])
 
     st.stop()
 

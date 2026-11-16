@@ -133,13 +133,14 @@ def login_with_role(username: str, password: str, role: str) -> dict:
             return {
                 "ok": False,
                 "db_user": db_user,
+                "reason": "no_role",
                 "error": f"El usuario {db_user} no tiene el rol {role.upper()}.",
             }
 
         return {"ok": True, "db_user": db_user, "error": None}
 
     except Exception as exc:
-        return {"ok": False, "db_user": None, "error": str(exc)}
+        return {"ok": False, "db_user": None, "reason": "error", "error": str(exc)}
 
     finally:
         if conn:
