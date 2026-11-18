@@ -176,6 +176,21 @@ class Descargador {
     }
   }
 
+  // Diagnóstico (stderr -> logs/pdf_original_server.log) de por qué "Nueva consulta" no limpió la pantalla.
+  async _registrarLimpiezaFallida() {
+    try {
+      const estado = await this.page.evaluate(() => ({
+        botones: [...document.querySelectorAll("button")].map((x) => x.innerText.trim().slice(0, 30)),
+        nuevaConsulta: [...document.querySelectorAll("button")].filter((x) => /nueva consulta/i.test(x.innerText)).length,
+        dialogos: document.querySelectorAll("[role=dialog]").length,
+        embeds: document.querySelectorAll('embed[src^="blob:"]').length,
+      }));
+      process.stderr.write(`[${new Date().toISOString()}] LIMPIEZA_FALLIDA ${JSON.stringify(estado)}\n`);
+    } catch (_) {
+      /* el diagnóstico nunca debe romper la consulta */
+    }
+  }
+
   async _consultar(cedula, fechaPortal) {
     const page = this.page;
     const inputCedula = page.locator("#cedula");
@@ -191,11 +206,19 @@ class Descargador {
     const btnNueva = page.getByRole("button", { name: /^\s*nueva consulta\s*$/i });
     if ((await btnNueva.count()) > 0) {
       await btnNueva.first().click();
-      await page.waitForFunction(
-        () => !document.querySelector('embed[src^="blob:"]') && !document.querySelector("[role=dialog]"),
-        null,
-        { timeout: 15000 },
-      );
+      // Si tras "Nueva consulta" el resultado anterior sigue en pantalla, no esperar 15 s: recargar el portal.
+      const limpio = await page
+        .waitForFunction(
+          () => !document.querySelector('embed[src^="blob:"]') && !document.querySelector("[role=dialog]"),
+          null,
+          { timeout: 3000 },
+        )
+        .then(() => true)
+        .catch(() => false);
+      if (!limpio) {
+        await this._registrarLimpiezaFallida();
+        await this._cargarPortal();
+      }
     }
     await inputCedula.waitFor({ state: "visible", timeout: 15000 });
     marca("formulario_limpio");
