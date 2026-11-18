@@ -6,10 +6,15 @@ import json
 import os
 import random
 import re
+import atexit
+import collections
+import queue
 import subprocess
+import threading
 import time
 import shutil
 import zipfile
+import types
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -770,7 +775,7 @@ def _get_node_project_dir() -> Path:
     if not path.exists():
         raise RuntimeError(f"No existe COBERTURA_NODE_PROJECT_DIR: {path}")
 
-    script = path / "scripts" / "generate_pdf.js"
+    script = path / _script_generador_pdf()
 
     if not script.exists():
         raise RuntimeError(f"No existe el generador PDF: {script}")
@@ -1078,6 +1083,200 @@ def obtener_registros_cobertura(
                 pass
 
 
+def _modo_pdf_original_activo() -> bool:
+    """COBERTURA_PDF_MODE=original descarga el PDF que genera el portal; cualquier otro valor usa el dibujado local."""
+    return os.environ.get("COBERTURA_PDF_MODE", "dibujado").strip().lower() == "original"
+
+
+def _script_generador_pdf() -> str:
+    return "scripts/generate_pdf_original.js" if _modo_pdf_original_activo() else "scripts/generate_pdf.js"
+
+
+def _espera_limite_portal(stdout: str, stderr: str) -> int:
+    """Segundos a esperar cuando el portal indica límite de consultas (salida 3 del generador original)."""
+    for texto in (stdout, stderr):
+        for linea in reversed((texto or "").strip().splitlines()):
+            try:
+                valor = json.loads(linea).get("retry_after_seconds")
+            except Exception:
+                continue
+            if isinstance(valor, (int, float)) and valor > 0:
+                return int(valor)
+    return 135
+
+
+def _dormir_vigilando_parada(segundos: int) -> bool:
+    """Duerme por tramos de 1 s; devuelve False si se pidió parar el proceso durante la espera."""
+    fin = time.time() + segundos
+    while time.time() < fin:
+        if proceso_debe_parar():
+            return False
+        time.sleep(1)
+    return True
+
+
+def _modo_pdf_persistente_activo() -> bool:
+    """En modo original reutiliza un solo Chromium (servidor Node) entre consultas. COBERTURA_PDF_PERSISTENTE=0 lo desactiva."""
+    return _modo_pdf_original_activo() and os.environ.get("COBERTURA_PDF_PERSISTENTE", "1").strip() != "0"
+
+
+class _PdfOriginalWorker:
+    """Proceso Node persistente (generate_pdf_original.js --server): un navegador para muchas consultas."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._key: tuple[str, str] | None = None
+        self._q: queue.Queue = queue.Queue()
+        self._stderr: collections.deque = collections.deque(maxlen=40)
+        self._seq = 0
+
+    def _leer_stdout(self, proc: subprocess.Popen, q: queue.Queue) -> None:
+        for linea in proc.stdout:  # type: ignore[union-attr]
+            try:
+                q.put(json.loads(linea))
+            except Exception:
+                continue
+        q.put({"_eof": True})
+
+    def _leer_stderr(self, proc: subprocess.Popen) -> None:
+        for linea in proc.stderr:  # type: ignore[union-attr]
+            self._stderr.append(linea.rstrip())
+
+    def _detener(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    def _arrancar(self, node_bin: str, node_project_dir: Path, timeout_s: int) -> None:
+        self._detener()
+        self._q = queue.Queue()
+        proc = subprocess.Popen(
+            [node_bin, "scripts/generate_pdf_original.js", "--server", "--timeout", str(timeout_s)],
+            cwd=str(node_project_dir),
+            text=True,
+            encoding="utf-8",
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+        )
+        self._proc = proc
+        self._key = (node_bin, str(node_project_dir))
+        threading.Thread(target=self._leer_stdout, args=(proc, self._q), daemon=True).start()
+        threading.Thread(target=self._leer_stderr, args=(proc,), daemon=True).start()
+        try:
+            listo = self._q.get(timeout=30)
+        except queue.Empty:
+            self._detener()
+            raise RuntimeError("El servidor Node de PDF original no respondió al arrancar")
+        if not listo.get("ready"):
+            self._detener()
+            raise RuntimeError(f"El servidor Node de PDF original no arrancó: {' | '.join(self._stderr)}")
+
+    def solicitar(
+        self,
+        node_bin: str,
+        node_project_dir: Path,
+        cedula: str,
+        fecha_pdf: str,
+        output_dir: Path,
+        output_name: str,
+        timeout_s: int,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if (
+                self._proc is None
+                or self._proc.poll() is not None
+                or self._key != (node_bin, str(node_project_dir))
+            ):
+                self._arrancar(node_bin, node_project_dir, timeout_s)
+            self._seq += 1
+            req_id = self._seq
+            req = {
+                "id": req_id,
+                "cedula": cedula,
+                "fecha": fecha_pdf,
+                "output_name": output_name,
+                "output_dir": str(output_dir),
+            }
+            try:
+                self._proc.stdin.write(json.dumps(req) + "\n")  # type: ignore[union-attr]
+                self._proc.stdin.flush()  # type: ignore[union-attr]
+            except Exception as exc:
+                self._detener()
+                raise RuntimeError(f"No se pudo enviar la consulta al servidor Node: {exc}")
+            fin = time.time() + int(timeout_s) + 30
+            while True:
+                restante = fin - time.time()
+                if restante <= 0:
+                    self._detener()  # se reinicia en la próxima consulta
+                    raise subprocess.TimeoutExpired(cmd="generate_pdf_original.js --server", timeout=timeout_s)
+                try:
+                    resp = self._q.get(timeout=restante)
+                except queue.Empty:
+                    continue
+                if resp.get("_eof"):
+                    self._detener()
+                    raise RuntimeError(f"El servidor Node terminó inesperadamente: {' | '.join(self._stderr)}")
+                if resp.get("id") == req_id:
+                    return resp
+
+    def cerrar(self) -> None:
+        with self._lock:
+            if self._proc is not None and self._proc.stdin:
+                try:
+                    self._proc.stdin.close()
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    pass
+            self._detener()
+
+
+_PDF_ORIGINAL_WORKER = _PdfOriginalWorker()
+atexit.register(_PDF_ORIGINAL_WORKER.cerrar)
+
+
+def _ejecutar_node_una_vez(
+    node_bin: str,
+    cmd: list[str],
+    node_project_dir: Path,
+    cedula: str,
+    fecha_pdf: str,
+    output_dir: Path,
+    output_name: str,
+    timeout_s: int,
+):
+    """Una ejecución del generador. Devuelve algo con returncode/stdout/stderr (como subprocess.run)."""
+    if _modo_pdf_persistente_activo():
+        resp = _PDF_ORIGINAL_WORKER.solicitar(
+            node_bin, node_project_dir, cedula, fecha_pdf, output_dir, output_name, timeout_s
+        )
+        code = int(resp.get("exit_code", 1))
+        return types.SimpleNamespace(
+            returncode=code,
+            stdout=json.dumps(resp, ensure_ascii=False),
+            stderr="" if code == 0 else str(resp.get("error") or ""),
+        )
+    return subprocess.run(
+        cmd,
+        cwd=str(node_project_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=int(timeout_s),
+        check=False,
+    )
+
+
 def _run_node_pdf_generator(
     node_project_dir: Path,
     cedula: str,
@@ -1093,7 +1292,7 @@ def _run_node_pdf_generator(
 
     cmd = [
         node_bin,
-        "scripts/generate_pdf.js",
+        _script_generador_pdf(),
         "--cedula",
         cedula,
         "--fecha",
@@ -1109,16 +1308,13 @@ def _run_node_pdf_generator(
     last_stderr = ""
     last_returncode = -1
 
-    for attempt in range(1, max_retries + 1):
+    attempt = 0
+    esperas_limite = 0
+    while attempt < max_retries:
+        attempt += 1
         try:
-            completed = subprocess.run(
-                cmd,
-                cwd=str(node_project_dir),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=int(single_timeout_seconds),
-                check=False,
+            completed = _ejecutar_node_una_vez(
+                node_bin, cmd, node_project_dir, cedula, fecha_pdf, output_dir, output_name, single_timeout_seconds
             )
 
             if completed.returncode == 0:
@@ -1158,8 +1354,26 @@ def _run_node_pdf_generator(
             last_stderr = completed.stderr
             last_returncode = completed.returncode
 
+            # Límite de consultas del portal (salida 3): esperar lo que indica el portal y NO gastar intento.
+            if completed.returncode == 3 and _modo_pdf_original_activo():
+                esperas_limite += 1
+                if esperas_limite > 5:
+                    last_error = f"Límite del portal persistente: {last_error}"
+                    break
+                if not _dormir_vigilando_parada(_espera_limite_portal(completed.stdout, completed.stderr)):
+                    last_error = f"Proceso detenido durante la espera por límite del portal: {last_error}"
+                    break
+                attempt -= 1
+                continue
+
         except subprocess.TimeoutExpired as exc:
             last_error = f"Timeout generando cobertura para {cedula} con fecha {fecha_pdf}"
+            last_stdout = ""
+            last_stderr = str(exc)
+            last_returncode = -1
+
+        except RuntimeError as exc:  # fallo del servidor Node persistente (arranque, pipe roto, cierre inesperado)
+            last_error = f"Fallo del generador persistente: {exc}"
             last_stdout = ""
             last_stderr = str(exc)
             last_returncode = -1
