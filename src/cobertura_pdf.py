@@ -1107,11 +1107,29 @@ def _espera_limite_portal(stdout: str, stderr: str) -> int:
 
 
 def _dormir_vigilando_parada(segundos: int) -> bool:
-    """Duerme por tramos de 1 s; devuelve False si se pidió parar el proceso durante la espera."""
-    fin = time.time() + segundos
+    """Duerme por tramos de 1 s; devuelve False si se pidió parar el proceso durante la espera.
+
+    Cada ~60 s emite una señal de vida: sin ella el watchdog (10 min sin progreso) reiniciaría el
+    servicio a mitad de una espera larga por límite de consultas del portal (hasta ~61 min).
+    """
+    inicio = time.time()
+    fin = inicio + segundos
+    proxima_senal = inicio
     while time.time() < fin:
         if proceso_debe_parar():
             return False
+        ahora = time.time()
+        if ahora >= proxima_senal:
+            proxima_senal = ahora + 60
+            try:
+                from src.auto_resume_state import heartbeat_job
+
+                restante = max(0, int(fin - ahora))
+                heartbeat_job(
+                    detalle=f"Esperando por límite de consultas del portal ({restante // 60} min {restante % 60} s restantes).",
+                )
+            except Exception:
+                pass  # una falla al escribir el estado no debe romper la espera
         time.sleep(1)
     return True
 
