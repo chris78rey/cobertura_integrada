@@ -8,15 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from src.auto_resume_state import leer_estado_job, guardar_estado_job
+from src.project_paths import PROJECT_ROOT, OUTPUT_ROOT
 from src.quarantine import (
     contar_en_cuarentena,
     listar_cuarentena_activa,
     expirar_cuarentena_activa,
+
 )
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
-OUTPUT_ROOT = Path("/data_nuevo/coberturas")
 
 LOG_DIR = PROJECT_ROOT / "logs"
 GEN_LOCK = LOG_DIR / "cobertura_generation.lock"

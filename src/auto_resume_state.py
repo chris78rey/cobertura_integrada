@@ -6,9 +6,9 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from src.project_paths import PROJECT_ROOT
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
 STATE_PATH = PROJECT_ROOT / "logs" / "cobertura_auto_resume_state.json"
 
 

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
+PROJECT_ROOT = Path(os.environ.get("COBERTURA_PROJECT_ROOT") or "/data_nuevo/cobertura_integrada")
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.auto_resume_state import _parse_ts
@@ -19,8 +19,8 @@ from src.auto_resume_state import _parse_ts
 STATE_PATH = PROJECT_ROOT / "logs" / "cobertura_auto_resume_state.json"
 WATCHDOG_STATE_PATH = PROJECT_ROOT / "logs" / "cobertura_watchdog_state.json"
 WATCHDOG_LOG_PATH = PROJECT_ROOT / "logs" / "cobertura_watchdog.log"
-SERVICE_NAME = "cobertura-auto-resume.service"
-TIMER_NAME = "cobertura-auto-resume.timer"
+SERVICE_NAME = os.environ.get("COBERTURA_SERVICE_NAME") or "cobertura-auto-resume.service"
+TIMER_NAME = os.environ.get("COBERTURA_TIMER_NAME") or "cobertura-auto-resume.timer"
 # 10 min: el hueco máximo observado entre señales de vida de un trámite normal
 # es ~99 s, y la consulta del lote a Oracle tiene timeout de 300 s; con 5 min
 # una consulta lenta pero viva podía disparar un reinicio real.
@@ -178,7 +178,7 @@ def _sync_child_info() -> dict[str, Any]:
         stripped = line.strip()
         if "scripts/sync_coberturas_repo.py" not in stripped:
             continue
-        if "--origen-root /data_nuevo/coberturas" not in stripped:
+        if f"--origen-root {os.environ.get('COBERTURA_OUTPUT_ROOT') or '/data_nuevo/coberturas'}" not in stripped:
             continue
         parts = stripped.split(maxsplit=3)
         if len(parts) < 4:

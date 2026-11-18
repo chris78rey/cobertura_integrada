@@ -259,6 +259,11 @@ def query_dataframe(
             except Exception:
                 pass
 
+def _oracle_solo_lectura() -> bool:
+    """COBERTURA_ORACLE_SOLO_LECTURA=1: ninguna función de este módulo escribe en Oracle (copias de prueba)."""
+    return str(os.environ.get("COBERTURA_ORACLE_SOLO_LECTURA", "")).strip() == "1"
+
+
 def actualizar_cobertura_por_tramite_valor(
     username: str,
     password: str,
@@ -294,6 +299,21 @@ def actualizar_cobertura_por_tramite_valor(
             "error": f"Valor inválido de cobertura: {valor!r}. Solo se permite S, N o X.",
             "criterio": "DIG_TRAMITE",
             "oracle_context": {},
+            "before_rows": [],
+            "after_rows": [],
+        }
+
+    if _oracle_solo_lectura():
+        # Modo prueba: se simula un UPDATE exitoso de 1 fila SIN tocar Oracle.
+        return {
+            "ok": True,
+            "affected": 1,
+            "verified": True,
+            "already_closed": False,
+            "simulado": True,
+            "error": "",
+            "criterio": "DIG_TRAMITE",
+            "oracle_context": {"solo_lectura": True},
             "before_rows": [],
             "after_rows": [],
         }
@@ -613,6 +633,9 @@ def corregir_cobertura_x_mes_actual_y_anterior(
     - Solo para el mes actual y el mes anterior.
     - No filtra por DIG_PLANILLADO.
     """
+
+    if _oracle_solo_lectura():
+        return {"ok": False, "error": "COBERTURA_ORACLE_SOLO_LECTURA=1: no se escribe en Oracle en modo prueba."}
 
     conn = None
     select_before = None

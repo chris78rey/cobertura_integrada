@@ -12,6 +12,7 @@ import pandas as pd
 
 import streamlit as st
 
+from src.project_paths import PROJECT_ROOT, OUTPUT_ROOT, REPO_ROOT
 from src.app_config import (
     leer_config,
     guardar_config,
@@ -830,7 +831,7 @@ def _ejecutar_sync_coberturas_repo(
 
     El CSV y SQLite siguen guardando todo el histórico completo.
     """
-    project_root = Path("/data_nuevo/cobertura_integrada")
+    project_root = PROJECT_ROOT
     script_path = project_root / "scripts" / "sync_coberturas_repo.py"
 
     if not script_path.exists():
@@ -850,11 +851,11 @@ def _ejecutar_sync_coberturas_repo(
         "--origen-root",
         str(Path(origen_root).resolve()),
         "--repo-root",
-        "/data_nuevo/repo_grande/data/datos",
+        str(REPO_ROOT),
         "--logs-dir",
-        "/data_nuevo/cobertura_integrada/logs",
+        str(PROJECT_ROOT / "logs"),
         "--state-db",
-        "/data_nuevo/cobertura_integrada/logs/cobertura_repo_sync.sqlite",
+        str(PROJECT_ROOT / "logs" / "cobertura_repo_sync.sqlite"),
         "--apply",
         "--emit-json-events",
         "--batch-ui-size",
@@ -1105,7 +1106,7 @@ def _contar_tramites_en_destino_recientes(ventana_segundos: int = 120) -> dict[s
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(ventana_segundos)))
     eventos: dict[str, dict[str, object]] = {}
 
-    logs_dir = Path("/data_nuevo/cobertura_integrada/logs")
+    logs_dir = PROJECT_ROOT / "logs"
     archivos = sorted(
         logs_dir.glob("cobertura_auto_*.jsonl"),
         key=lambda p: p.stat().st_mtime,
@@ -1198,7 +1199,7 @@ def _resumen_rendimiento_reciente(limit: int = 20, horas: int = 24) -> dict[str,
     - tiempo total
     - trámites por minuto
     """
-    logs_dir = Path("/data_nuevo/cobertura_integrada/logs")
+    logs_dir = PROJECT_ROOT / "logs"
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(horas)))
 
     archivos = sorted(
@@ -1365,9 +1366,9 @@ def _resumen_rendimiento_reciente(limit: int = 20, horas: int = 24) -> dict[str,
 @st.fragment(run_every="5s")
 def _render_monitor_progreso():
     """Muestra el estado real del worker y del watchdog en una sola tarjeta."""
-    state_path = Path("/data_nuevo/cobertura_integrada/logs/cobertura_auto_resume_state.json")
-    watchdog_state_path = Path("/data_nuevo/cobertura_integrada/logs/cobertura_watchdog_state.json")
-    watchdog_log_path = Path("/data_nuevo/cobertura_integrada/logs/cobertura_watchdog.log")
+    state_path = PROJECT_ROOT / "logs" / "cobertura_auto_resume_state.json"
+    watchdog_state_path = PROJECT_ROOT / "logs" / "cobertura_watchdog_state.json"
+    watchdog_log_path = PROJECT_ROOT / "logs" / "cobertura_watchdog.log"
 
     worker = _leer_json_seguro(state_path)
     watchdog = _leer_json_seguro(watchdog_state_path)
@@ -1745,7 +1746,7 @@ def dashboard_page():
                     from src.auto_resume_state import marcar_tramite_sync_pendiente
                     marcar_tramite_sync_pendiente(
                         tramite=dig_tramite_input,
-                        source_dir=f"/data_nuevo/coberturas/{dig_tramite_input}",
+                        source_dir=str(OUTPUT_ROOT / dig_tramite_input),
                     )
                     st.success(f"Trámite {dig_tramite_input} enviado a cola de resincronización.")
                     st.info("El worker lo procesará en la siguiente pasada.")

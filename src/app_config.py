@@ -8,12 +8,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from src.project_paths import OUTPUT_ROOT
 
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 CONFIG_FILE = CONFIG_DIR / "app_config.json"
 
-FIXED_PDF_OUTPUT_DIR = Path("/data_nuevo/coberturas").resolve()
+FIXED_PDF_OUTPUT_DIR = OUTPUT_ROOT.resolve()
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "pdf_output_dir": str(FIXED_PDF_OUTPUT_DIR),

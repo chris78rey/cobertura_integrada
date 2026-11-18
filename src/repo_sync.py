@@ -7,9 +7,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from src.project_paths import PROJECT_ROOT, REPO_ROOT
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
 _INDICE_DESTINOS_CACHE: dict[str, dict[str, list[Path]]] = {}
 
 
@@ -38,7 +38,7 @@ def _ejecutar_sync_repo_subproceso(
     dig_tramite: str = "",
     *,
     project_root: Path | None = None,
-    repo_root: str = "/data_nuevo/repo_grande/data/datos",
+    repo_root: str = str(REPO_ROOT),
     backup_root: str | None = None,
     replace_existing_cc: bool = True,
     timeout_seconds: int = 1800,
@@ -128,7 +128,7 @@ def ejecutar_sync_repo_directo_rapido(
     dig_tramite: str,
     *,
     project_root: Path | None = None,
-    repo_root: str = "/data_nuevo/repo_grande/data/datos",
+    repo_root: str = str(REPO_ROOT),
     backup_root: str | None = None,
     replace_existing_cc: bool = True,
 ) -> dict[str, Any]:
@@ -275,7 +275,7 @@ def ejecutar_sync_repo(
     dig_tramite: str = "",
     *,
     project_root: Path | None = None,
-    repo_root: str = "/data_nuevo/repo_grande/data/datos",
+    repo_root: str = str(REPO_ROOT),
     backup_root: str | None = None,
     replace_existing_cc: bool = True,
     timeout_seconds: int = 1800,

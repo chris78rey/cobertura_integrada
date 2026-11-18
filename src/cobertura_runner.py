@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.cobertura_pdf import generar_coberturas_automaticas_desde_mes
+from src.project_paths import PROJECT_ROOT
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
 LOCK_PATH = PROJECT_ROOT / "logs" / "cobertura_generation.lock"
 
 

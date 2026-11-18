@@ -831,12 +831,12 @@ def main() -> int:
 
     parser.add_argument(
         "--origen-root",
-        default="/data_nuevo/coberturas",
+        default=os.environ.get("COBERTURA_OUTPUT_ROOT") or "/data_nuevo/coberturas",
         help="Carpeta donde están las coberturas generadas. Ejemplo: /data_nuevo/coberturas",
     )
     parser.add_argument(
         "--repo-root",
-        default="/data_nuevo/repo_grande/data/datos",
+        default=os.environ.get("COBERTURA_REPO_ROOT") or "/data_nuevo/repo_grande/data/datos",
         help="Raíz del repositorio oficial donde se buscarán las carpetas por trámite.",
     )
     parser.add_argument(
@@ -846,15 +846,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--logs-dir",
-        default="/data_nuevo/cobertura_integrada/logs",
+        default=str(Path(os.environ.get("COBERTURA_PROJECT_ROOT") or "/data_nuevo/cobertura_integrada") / "logs"),
     )
     parser.add_argument(
         "--state-db",
-        default="/data_nuevo/cobertura_integrada/logs/cobertura_repo_sync.sqlite",
+        default=str(Path(os.environ.get("COBERTURA_PROJECT_ROOT") or "/data_nuevo/cobertura_integrada") / "logs" / "cobertura_repo_sync.sqlite"),
     )
     parser.add_argument(
         "--backup-root",
-        default="/data_nuevo/cobertura_integrada/logs/sync_replaced_cc_backups",
+        default=str(Path(os.environ.get("COBERTURA_PROJECT_ROOT") or "/data_nuevo/cobertura_integrada") / "logs" / "sync_replaced_cc_backups"),
         help="Carpeta raíz para respaldar CC*.pdf cuando se reemplazan en destino.",
     )
     parser.add_argument(

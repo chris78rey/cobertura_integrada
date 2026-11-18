@@ -23,6 +23,7 @@ import psutil
 
 from src.oracle_jdbc import actualizar_cobertura_por_tramite_valor, oracle_connect
 from src.observability import CYCLIC_SUMMARY_LOG, append_cyclic_jsonl
+from src.project_paths import PROJECT_ROOT
 
 
 def _validate_id_generacion(value: str) -> str:
@@ -219,7 +220,7 @@ def _nombre_cc_por_secuencia(indice: int, total: int) -> str:
 
 PDF_CC_REGEX = re.compile(r"^CC(?:_\d{2})?\.pdf$", re.IGNORECASE)
 CC_INPUT_MANIFEST_NAME = ".cobertura_cc_input_manifest.json"
-CC_LOCAL_BACKUP_ROOT = Path("/data_nuevo/cobertura_integrada/logs/backup_cc_locales_por_reproceso")
+CC_LOCAL_BACKUP_ROOT = PROJECT_ROOT / "logs" / "backup_cc_locales_por_reproceso"
 
 
 def _listar_cc_locales(planilla_dir: Path) -> list[Path]:

@@ -4,9 +4,9 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any
+from src.project_paths import PROJECT_ROOT
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
 DB_PATH = PROJECT_ROOT / "logs" / "cobertura_quarantine.sqlite"
 
 

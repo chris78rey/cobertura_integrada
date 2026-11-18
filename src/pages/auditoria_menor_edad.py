@@ -27,11 +27,9 @@ from src.cobertura_pdf import (
 )
 from src.oracle_jdbc import oracle_connect
 from src.repo_sync import ejecutar_sync_repo
+from src.project_paths import PROJECT_ROOT, OUTPUT_ROOT, REPO_ROOT
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
-OUTPUT_ROOT = Path("/data_nuevo/coberturas")
-REPO_ROOT = Path("/data_nuevo/repo_grande/data/datos")
 LOGS_DIR = PROJECT_ROOT / "logs"
 AUDIT_LOG = LOGS_DIR / "auditoria_menor_edad_sync.jsonl"
 BACKUP_CC_ROOT = LOGS_DIR / "backup_auditoria_menor_edad_cc"

@@ -21,11 +21,9 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from src.oracle_jdbc import oracle_connect, actualizar_cobertura_por_tramite_valor
 from src.cobertura_runner import ArchivoLock, LOCK_PATH, ProcesoCoberturaYaEnEjecucion
 from src.cobertura_pdf import generar_coberturas_automaticas_desde_mes
+from src.project_paths import PROJECT_ROOT, OUTPUT_ROOT, REPO_ROOT
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
-OUTPUT_ROOT = Path("/data_nuevo/coberturas")
-REPO_ROOT = Path("/data_nuevo/repo_grande/data/datos")
 LOGS_DIR = PROJECT_ROOT / "logs"
 AUDIT_LOG = LOGS_DIR / "cedulas_tramite_audit.jsonl"
 BACKUP_CC_ROOT = LOGS_DIR / "backup_cc_reemplazados"

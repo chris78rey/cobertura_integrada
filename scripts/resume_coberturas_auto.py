@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
-PROJECT_ROOT = Path("/data_nuevo/cobertura_integrada")
+PROJECT_ROOT = Path(os.environ.get("COBERTURA_PROJECT_ROOT") or "/data_nuevo/cobertura_integrada")
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.auto_resume_state import (  # noqa: E402
@@ -123,7 +123,7 @@ def _run_cycle() -> int:
     fe_pla_aniomes_desde_env = str(os.environ.get("AUTO_FE_PLA_ANIOMES_DESDE", "202605")).strip()
     fe_pla_aniomes_desde = fe_pla_aniomes_desde_estado or fe_pla_aniomes_desde_env
     dig_tramite = str(estado.get("dig_tramite", "") or "").strip()
-    output_dir = "/data_nuevo/coberturas"
+    output_dir = os.environ.get("COBERTURA_OUTPUT_ROOT") or "/data_nuevo/coberturas"
     username = os.environ.get("ORACLE_AUTO_USER", "").strip()
     password = os.environ.get("ORACLE_AUTO_PASSWORD", "").strip()
 
