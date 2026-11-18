@@ -179,6 +179,12 @@ class Descargador {
   async _consultar(cedula, fechaPortal) {
     const page = this.page;
     const inputCedula = page.locator("#cedula");
+    const t0 = Date.now();
+    const marcas = {};
+    const marca = (nombre) => {
+      marcas[nombre] = Date.now() - t0;
+    };
+    this._marcas = marcas;
 
     // Dejar el formulario limpio: cerrar diálogo previo y pulsar "Nueva consulta" si hay resultado en pantalla.
     await this._cerrarDialogo();
@@ -192,6 +198,7 @@ class Descargador {
       );
     }
     await inputCedula.waitFor({ state: "visible", timeout: 15000 });
+    marca("formulario_limpio");
 
     // Campo fecha: por etiqueta "Fecha de consulta", o el 2.º input como respaldo.
     let inputFecha = page.getByLabel(/fecha de consulta/i);
@@ -200,6 +207,7 @@ class Descargador {
 
     await this._escribir(inputCedula, cedula);
     await this._escribir(inputFecha, fechaPortal);
+    marca("escrito");
 
     await page.waitForFunction(
       () => {
@@ -209,6 +217,7 @@ class Descargador {
       null,
       { timeout: 15000 },
     );
+    marca("boton_habilitado");
     const btnConsultar = page.getByRole("button", { name: /^\s*consultar\s*$/i }).first();
     await btnConsultar.click();
 
@@ -229,6 +238,7 @@ class Descargador {
       await page.waitForFunction(hayResultado, null, { timeout: this.resultMs });
     }
 
+    marca("resultado_portal");
     const dialog = page.locator("[role=dialog]");
     if ((await dialog.count()) > 0) {
       const raw = await dialog.first().innerText();
@@ -254,13 +264,26 @@ class Descargador {
     return pdf;
   }
 
+  // Deja en stderr (Python lo guarda en logs/pdf_original_server.log) las consultas que tardan más de 8 s.
+  _avisarSiLenta(inicio, resultado) {
+    const total = Date.now() - inicio;
+    if (total < 8000 && process.env.COBERTURA_PDF_DEBUG !== "1") return;
+    process.stderr.write(
+      `[${new Date().toISOString()}] CONSULTA_LENTA resultado=${resultado} total_ms=${total} pasos_ms=${JSON.stringify(this._marcas || {})}\n`,
+    );
+  }
+
   async descargar(cedula, fechaPortal) {
+    const inicio = Date.now();
     try {
       if (!this.browser || !this.page || this.page.isClosed()) await this.iniciar();
       if (this.consultas >= REFRESCAR_CADA) await this._cargarPortal();
       this.consultas += 1;
-      return await this._consultar(cedula, fechaPortal);
+      const pdf = await this._consultar(cedula, fechaPortal);
+      this._avisarSiLenta(inicio, "ok");
+      return pdf;
     } catch (error) {
+      this._avisarSiLenta(inicio, `error:${String(error.message).split("\n")[0].slice(0, 80)}`);
       if (!(error instanceof PortalError)) await this._recuperar();
       throw error;
     }

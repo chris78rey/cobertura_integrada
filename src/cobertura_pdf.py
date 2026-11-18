@@ -1159,8 +1159,18 @@ class _PdfOriginalWorker:
         q.put({"_eof": True})
 
     def _leer_stderr(self, proc: subprocess.Popen) -> None:
+        # Se conserva en memoria (para diagnosticar caídas) y en logs/pdf_original_server.log
+        # (consultas lentas y errores del servidor Node, útil para observar al portal).
+        log_path = PROJECT_ROOT / "logs" / "pdf_original_server.log"
         for linea in proc.stderr:  # type: ignore[union-attr]
-            self._stderr.append(linea.rstrip())
+            texto = linea.rstrip()
+            self._stderr.append(texto)
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(texto + "\n")
+            except Exception:
+                pass  # el registro nunca debe romper la lectura del servidor
 
     def _detener(self) -> None:
         proc, self._proc = self._proc, None
